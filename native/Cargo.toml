@@ -1,0 +1,141 @@
+[package]
+name = "lvim-db-native"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "lvim-db daemon: an async, out-of-process database backend spoken to over newline-delimited JSON-RPC on stdio"
+
+# A binary (the daemon), NOT a cdylib: DB work needs a tokio runtime, pools, TLS
+# and cancellation, so the backend is a spawned child process (crash-isolated
+# from Neovim) — unlike lvim-fuzzy's in-process FFI matcher.
+[[bin]]
+name = "lvim-db-daemon"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "sync",
+    "time",
+    "process",
+] }
+async-trait = "0.1"
+futures-util = "0.3"
+base64 = "0.22"
+anyhow = "1"
+
+# ── driver crates, each behind a feature so a build can pick its DB set ───────
+# tokio-postgres also backs the cockroachdb registry alias (postgres wire).
+tokio-postgres = { version = "0.7", optional = true }
+tokio-postgres-rustls = { version = "0.13", optional = true }
+
+# ── TLS + SSH tunnel (shared across the network drivers) ──────────────────────
+# rustls everywhere (no OpenSSL). The tunnel forwards ANY TCP driver through an
+# SSH direct-tcpip channel, so tunnelling needs no per-driver code.
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+rustls-pemfile = { version = "2", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+russh = { version = "0.54", optional = true }
+# mysql_async backs BOTH the mariadb and mysql registry kinds. rustls (not
+# native-tls) so the build needs no OpenSSL.
+mysql_async = { version = "0.36", optional = true, default-features = false, features = [
+    "default-rustls",
+] }
+# The official MongoDB driver (tokio + rustls by default; no OpenSSL).
+mongodb = { version = "3", optional = true }
+# Embedded SQL engines (synchronous C libraries, driven on spawn_blocking).
+rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
+duckdb = { version = "1", optional = true, features = ["bundled"] }
+# Redis (tokio async multiplexed connection).
+redis = { version = "0.27", optional = true, features = [
+    "tokio-comp",
+    "connection-manager",
+] }
+# ClickHouse + Snowflake speak HTTP; reqwest with rustls (no OpenSSL) is the seam
+# (the client needs DYNAMIC result columns, which the typed `clickhouse` crate is
+# not built for — the HTTP JSONCompact interface gives them directly).
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+# SQL Server (TDS). tiberius is runtime-agnostic; tokio-util's compat adapts a
+# tokio TcpStream to its futures-io. rustls, no OpenSSL.
+tiberius = { version = "0.12", optional = true, default-features = false, features = [
+    "rustls",
+    "tds73",
+    "chrono",
+] }
+tokio-util = { version = "0.7", optional = true, features = ["compat"] }
+# Cassandra / ScyllaDB (CQL). Production driver, Cassandra-compatible.
+scylla = { version = "1", optional = true }
+# Firebird — PURE-RUST wire protocol (no libfbclient at runtime) so it stays in
+# the standard build; the native-client mode is the opt-in `firebird-native`.
+rsfbclient = { version = "0.25", optional = true, default-features = false, features = [
+    "pure_rust",
+] }
+# Snowflake key-pair JWT (RS256) generation for its HTTP SQL REST API.
+snowflake-jwt = { version = "0.3", optional = true }
+# chrono: used by the SQL Server driver to render TDS date/time cells as text.
+chrono = { version = "0.4", optional = true }
+
+[features]
+# The full standard driver set is enabled by default as each driver module
+# lands. Opt-in drivers that need a system library at runtime (Oracle Instant
+# Client, the Firebird native client) stay OUT of default (see below).
+default = [
+    "tls",
+    "tunnel",
+    "postgres",
+    "cockroachdb",
+    "mariadb",
+    "mysql",
+    "mongodb",
+    "sqlite",
+    "duckdb",
+    "redis",
+    "clickhouse",
+    "sqlserver",
+    "snowflake",
+    "cassandra",
+    "scylla",
+    "firebird",
+]
+# Shared encryption seam: rustls TLS for the network drivers + the russh SSH
+# tunnel (an encrypted channel for any TCP driver, native-TLS or not).
+tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs", "dep:tokio-rustls"]
+tunnel = ["dep:russh", "tls"]
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "tls"]
+cockroachdb = ["postgres"] # registry alias over the postgres wire driver
+mariadb = ["dep:mysql_async", "tls"]
+mysql = ["dep:mysql_async", "tls"] # same impl as mariadb, distinct registry kind
+mongodb = ["dep:mongodb", "tls"]
+sqlite = ["dep:rusqlite"]
+duckdb = ["dep:duckdb"]
+redis = ["dep:redis", "redis/tls-rustls", "redis/tokio-rustls-comp", "tls"]
+clickhouse = ["dep:reqwest", "tls"]
+sqlserver = ["dep:tiberius", "dep:tokio-util", "dep:chrono"]
+cassandra = ["dep:scylla"] # CQL; one impl serves cassandra + scylla kinds
+scylla = ["dep:scylla"]
+firebird = ["dep:rsfbclient"] # pure-Rust wire protocol (self-contained)
+firebird-native = ["firebird", "rsfbclient/linking"] # opt-in: uses libfbclient at runtime
+snowflake = ["dep:reqwest", "dep:snowflake-jwt"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

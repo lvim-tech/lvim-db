@@ -1,0 +1,228 @@
+*lvim-db.txt*        A full database client backed by an out-of-process Rust daemon
+
+==============================================================================
+CONTENTS                                                          *lvim-db*
+
+  1. Introduction ................... |lvim-db-intro|
+  2. Requirements ................... |lvim-db-requirements|
+  3. Install / build ................ |lvim-db-install|
+  4. Setup / configuration .......... |lvim-db-setup|
+  5. Databases ...................... |lvim-db-databases|
+  6. Credentials .................... |lvim-db-credentials|
+  7. Architecture ................... |lvim-db-architecture|
+  8. API ............................ |lvim-db-api|
+  9. Command ........................ |lvim-db-command|
+  10. Health ........................ |lvim-db-health|
+
+==============================================================================
+1. INTRODUCTION                                             *lvim-db-intro*
+
+lvim-db is a database client for Neovim: connections, schema browsing, a query
+editor, a paged results grid and a call log. The database work runs in a
+SEPARATE process — the Rust `lvim-db-daemon` — which Neovim spawns once and
+talks to over newline-delimited JSON-RPC on stdio.
+
+Out-of-process (not an in-editor library) because database drivers need an
+async runtime, connection pools, TLS and query cancellation, and a driver — or
+a native C dependency — crashing must take down the daemon, NOT the editor. If
+the daemon binary is not built the plugin still loads and every action degrades
+gracefully with a single notification.
+
+Database types are PLUGIN TYPES: each driver is one trait + a registry entry in
+the Rust backend, and the Lua side discovers the available drivers (and builds
+each connection form) from the backend at runtime — so a new database type is
+added without touching the core or any Lua.
+
+==============================================================================
+2. REQUIREMENTS                                      *lvim-db-requirements*
+
+  - Neovim 0.10+
+  - lvim-utils   (palette, store, UI helpers)
+  - lvim-ui      (windowed UI primitives)
+  - A Rust toolchain (cargo) to build the daemon
+  - sqlite.lua   (optional) — saved connections + query history
+
+==============================================================================
+3. INSTALL / BUILD                                        *lvim-db-install*
+
+Install with the lvim-tech installer (lvim-installer) or Neovim's native
+|vim.pack|, call setup(), then build the backend once from the plugin dir: >sh
+
+  sh native/build.sh
+<
+This compiles `lvim-db-daemon` into native/build/ (git-ignored). To include an
+opt-in driver that needs a system library at runtime (Oracle Instant Client),
+pass its feature: >sh
+
+  sh native/build.sh --features oracle
+<
+Run `:checkhealth lvim-db` to confirm the backend is found and to see the
+driver set it was built with.
+
+==============================================================================
+4. SETUP / CONFIGURATION                                    *lvim-db-setup*
+
+setup() merges your options into the live config. The full defaults: >lua
+
+  require("lvim-db").setup({
+      daemon_path = nil,              -- nil ⇒ probe $LVIM_DB_DAEMON, native/build,
+                                      --      native/target/release
+      page_size = 200,                -- rows the grid pulls per page
+      layout = "area",               -- "area" | "float" | "bottom"
+      confirm_destructive = true,     -- prompt before a destructive statement
+      destructive_patterns = {        -- case-insensitive Lua patterns
+          "^%s*drop%s",
+          "^%s*truncate%s",
+          "^%s*delete%s+from%s+[^;]-%s*;?%s*$",
+          "^%s*update%s+[^;]-%s+set%s+[^;]-%s*;?%s*$",
+      },
+      notes_dir = nil,                -- nil ⇒ stdpath("state")/lvim-db/notes/<conn>/
+      data_dir = nil,                 -- nil ⇒ stdpath("data")/lvim-db/
+      connect_timeout_ms = 15000,
+      warn_on_missing = true,
+  })
+<
+==============================================================================
+5. DATABASES                                            *lvim-db-databases*
+
+The standard build ships these driver kinds, all behind one uniform trait:
+
+  PostgreSQL, MariaDB, MySQL, MongoDB, SQLite, DuckDB, SQL Server, Redis,
+  ClickHouse, Cassandra / ScyllaDB, CockroachDB, Firebird (pure-Rust wire
+  protocol), Snowflake (HTTP SQL REST API).
+
+Oracle is an opt-in build feature (it needs the Oracle Instant Client at
+runtime, so it is excluded from the self-contained standard build).
+
+==============================================================================
+6a. ENCRYPTION                                         *lvim-db-encryption*
+
+Connections are encrypted by default. Every network driver negotiates real
+rustls TLS (no OpenSSL); the posture is per-connection via `tls.mode`:
+
+  prefer (default)  encrypt when available; a plaintext fallback is SURFACED
+  require           encryption mandatory — a plaintext-only server is REJECTED
+  verify_ca         require + verify the certificate chain against the CA
+  verify_full       require + verify the chain AND hostname (strictest)
+  disable           explicit opt-out — the only unencrypted path
+
+`tls.ca` pins a CA; `tls.client_cert` + `tls.client_key` enable mutual X.509.
+An unencrypted link is always surfaced (a warning, a daemon.log entry, and an
+open-lock marker in the drawer) — never silent.
+
+For engines without native TLS (or as defence in depth), an SSH tunnel
+(`tunnel`, via russh) forwards the connection over an encrypted direct-tcpip
+channel, so even a plaintext database is reached only over an encrypted link
+(key / key+passphrase / password / agent auth). A required tunnel is never
+silently bypassed.
+
+==============================================================================
+6. CREDENTIALS                                        *lvim-db-credentials*
+
+Passwords, key passphrases and tokens are stored as TEMPLATES, resolved by the
+daemon at connect time only — never persisted or logged as plain values:
+
+  {{ env "VAR" }}              the value of an environment variable
+  {{ cmd "pass show db/x" }}   the stdout of a command (trimmed)
+  literal text                 used verbatim
+
+This also covers token-style provider auth, e.g. an AWS RDS IAM token via
+`{{ cmd "aws rds generate-db-auth-token …" }}`.
+
+==============================================================================
+7. ARCHITECTURE                                      *lvim-db-architecture*
+
+  Neovim (Lua)                      lvim-db-daemon (Rust, tokio)
+    lvim-db.daemon  ── JSON-RPC ──►  registry + Driver/Connection traits
+    (spawn, stdio)  ◄── stdout ───   one driver per database type
+                                      connect / schema / execute / page / cancel
+
+Every driver presents results as uniform, paged tables of typed cells, so the
+grid renders any database identically. The whole result is buffered in the
+daemon and paged out to Neovim a page at a time (the editor holds one page).
+
+The protocol is versioned: the Lua side accepts any daemon reporting a protocol
+version >= its minimum, so an additively-grown backend stays compatible.
+
+==============================================================================
+8. API                                                        *lvim-db-api*
+
+All calls are asynchronous (the daemon is spawned + handshaken on first use).
+
+`require("lvim-db").setup(opts)`
+    Merge options into the live config; register :LvimDb.
+
+`require("lvim-db").drivers([cb])`
+    The DriverMeta list the backend was built with. Pass `cb(drivers, err)` to
+    receive it after the handshake.
+
+`require("lvim-db").status()`
+    A snapshot: { binary, running, proto, drivers, store }.
+
+`require("lvim-db").connect(spec, cb)`
+    Open a connection from a spec { driver, params, auth?, tls?, tunnel? }.
+    `cb(conn_id, err)`.
+
+`require("lvim-db").connect_saved(name, cb)`
+    Open a SAVED connection by name. `cb(conn_id, err)`.
+
+`require("lvim-db").disconnect(conn_id[, cb])`
+`require("lvim-db").databases(conn_id, cb)`          cb(databases, err)
+`require("lvim-db").switch_database(conn_id, database[, cb])`
+`require("lvim-db").structure(conn_id, cb)`          cb(nodes, err)
+`require("lvim-db").columns(conn_id, object, cb)`    object = { name, schema? }
+
+`require("lvim-db").is_destructive(statement)`
+    Whether the statement matches the configured destructive patterns.
+
+`require("lvim-db").execute(conn_id, statement, on_state[, cb])`
+    Execute a statement. `cb(call_id, err)` fires immediately; `on_state(state)`
+    fires when it finishes ({ state, ms, affected?, error? }). Does NOT prompt —
+    gate on is_destructive() first.
+
+`require("lvim-db").page(call_id, from, n, cb)`
+    Fetch a result page. cb(page, err); page =
+    { ready, columns, rows, from, has_more, total?, affected? }.
+
+`require("lvim-db").cell(call_id, row, col, cb)`
+    The full, untruncated value of one cell (for yank/export).
+
+`require("lvim-db").cancel(call_id[, cb])`
+    Cancel a running statement (protocol-level where the driver supports it).
+
+==============================================================================
+9. COMMAND                                                *lvim-db-command*
+
+`:LvimDb open`          toggle the connections drawer (side panel)
+`:LvimDb add`           add a saved connection (the DriverMeta-driven tabs form)
+`:LvimDb notes`         open the notes picker for a saved connection
+`:LvimDb log`           show the call-log tab in the result dock
+`:LvimDb close`         close the drawer and the result dock
+`:LvimDb status`        a one-line backend/store status snapshot
+`:LvimDb health`        open :checkhealth lvim-db
+
+Drawer keys: l / <CR> connect-or-expand (a table's <CR> previews its rows),
+h collapse/disconnect, a add, e edit, x delete, r refresh, n notes, q close.
+
+Result dock — two tabs (1/2 or r/L switch):
+  Result: n / p next / previous page, y yank the page as TSV, e export, q close.
+  Call log: one row per call with a state accent; <CR> re-runs a call, x cancels
+  a running one.
+
+Notes: per-connection scratch SQL as real files under
+stdpath("state")/lvim-db/notes/<conn>/ (opened as `sql` buffers). In a note the
+run maps execute SQL against the connection:
+  <Plug>(LvimDbRunBuffer)     run the whole buffer     (default <localleader>r)
+  <Plug>(LvimDbRunSelection)  run the visual selection (default <localleader>r)
+Every free-text run passes the DESTRUCTIVE-STATEMENT GUARD: a DROP / TRUNCATE, or
+a DELETE / UPDATE with no WHERE, prompts a confirm before executing (config
+`confirm_destructive`).
+
+==============================================================================
+10. HEALTH                                                 *lvim-db-health*
+
+`:checkhealth lvim-db` reports whether the daemon binary is built and where it
+was found, the negotiated protocol version, the driver set the backend was
+compiled with, and whether the persistence store (sqlite.lua) is available.
+
+vim:tw=78:ts=8:ft=help:norl:
