@@ -286,19 +286,24 @@ local function open_dock()
         end
         return
     end
-    -- Buffer-local keys: switch tabs (r / L), and in the call-log view re-open a
-    -- call (<CR> re-runs its statement) or cancel a running one (x).
+    -- Buffer-local keys (all from config.keys.result): switch views, and in the
+    -- call-log view re-open a call (re-runs its statement) or cancel a running one.
+    -- A key set to `false` is left unbound.
+    local k = config.keys.result
     local function set_keys(buf)
         local function map(lhs, fn)
+            if not lhs then
+                return
+            end
             vim.keymap.set("n", lhs, fn, { buffer = buf, nowait = true, silent = true })
         end
-        map("r", function()
+        map(k.view_result, function()
             set_view("result")
         end)
-        map("L", function()
+        map(k.view_log, function()
             set_view("log")
         end)
-        map("<CR>", function()
+        map(k.rerun, function()
             if state.view ~= "log" then
                 return
             end
@@ -307,7 +312,7 @@ local function open_dock()
                 M.run(c.conn_id, c.conn, c.driver, c.statement)
             end
         end)
-        map("x", function()
+        map(k.cancel, function()
             if state.view ~= "log" then
                 return
             end
@@ -344,14 +349,14 @@ local function open_dock()
                 surface.bar({ { "result_tab", "log_tab" } }, {
                     result_tab = {
                         name = "result_tab",
-                        key = "1",
+                        key = k.result_tab or nil,
                         run = function()
                             set_view("result")
                         end,
                     },
                     log_tab = {
                         name = "log_tab",
-                        key = "2",
+                        key = k.log_tab or nil,
                         run = function()
                             set_view("log")
                         end,
@@ -364,25 +369,25 @@ local function open_dock()
                 surface.bar({ { "prev", "next", "yank", "export", "close" } }, {
                     prev = {
                         name = "prev",
-                        key = "p",
+                        key = k.prev_page or nil,
                         run = function()
                             goto_page(math.max(0, state.offset - config.page_size))
                         end,
                     },
                     next = {
                         name = "next",
-                        key = "n",
+                        key = k.next_page or nil,
                         run = function()
                             if state.page and state.page.has_more then
                                 goto_page(state.offset + config.page_size)
                             end
                         end,
                     },
-                    yank = { name = "yank", key = "y", run = yank_page },
-                    export = { name = "export", key = "e", run = export_page },
+                    yank = { name = "yank", key = k.yank or nil, run = yank_page },
+                    export = { name = "export", key = k.export or nil, run = export_page },
                     close = {
                         name = "close",
-                        key = "q",
+                        key = k.close or nil,
                         run = function(s)
                             s.close()
                         end,
@@ -390,7 +395,7 @@ local function open_dock()
                 }),
             },
         },
-        close_keys = { "q" },
+        close_keys = k.close and { k.close } or {},
     })
 end
 

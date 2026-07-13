@@ -106,8 +106,49 @@ require("lvim-db").setup({
     connect_timeout_ms = 15000,
     -- Notify once (INFO) the first time an action needs the daemon but it is not built.
     warn_on_missing = true,
+    -- The keys lvim-db binds INSIDE its own panels (buffer-local — nothing global is
+    -- touched). Remap any of them, or set one to `false` to leave it unbound.
+    keys = {
+        -- the connections drawer
+        drawer = {
+            expand = "l", -- expand the row / connect
+            collapse = "h", -- collapse the row / disconnect
+            action = "<CR>", -- connect, expand, or preview a table's first rows
+            add = "a", -- open the connection form (add)
+            edit = "e", -- open the connection form on the focused connection
+            delete = "x", -- delete the focused saved connection (confirmed)
+            refresh = "r", -- re-read the focused connection's schema
+            notes = "n", -- open the notes picker
+            close = "q",
+        },
+        -- the result dock (grid + call log)
+        result = {
+            result_tab = "1", -- header button: the result view
+            log_tab = "2", -- header button: the call-log view
+            view_result = "r", -- body key: switch to the result view
+            view_log = "L", -- body key: switch to the call-log view
+            rerun = "<CR>", -- call log: re-run the focused call
+            cancel = "x", -- call log: cancel the focused running call
+            next_page = "n",
+            prev_page = "p",
+            yank = "y", -- yank the page as TSV
+            export = "e",
+            close = "q",
+        },
+        -- the connection form (one footer band per tab)
+        form = {
+            test = "t", -- test the ACTIVE tab's layer
+            save = "s", -- save the connection (from any tab)
+            close = "q",
+        },
+    },
 })
 ```
+
+The panel keys are deliberately **plain letters**: a key must survive the terminal and
+the multiplexer to reach Neovim at all — a chord like `<C-s>` is tmux's default prefix in
+many setups (and XON/XOFF flow control in others), so it can be swallowed upstream and
+never arrive.
 
 ## Encryption (TLS + SSH tunnel)
 
@@ -172,6 +213,29 @@ This also covers token-style provider auth, e.g. an AWS RDS IAM token:
 - `:LvimDb close` — close the drawer and the result dock
 - `:LvimDb status` — a one-line backend/store status snapshot
 - `:LvimDb health` — open `:checkhealth lvim-db`
+
+### Connection form
+
+`:LvimDb add` (or `a` in the drawer; `e` edits) first picks the driver, then opens one
+`lvim-ui.tabs` panel whose rows are built from that driver's `DriverMeta` — **Connection**,
+**Auth**, and, for a networked engine, **Encryption** and **Tunnel**.
+
+Each tab's footer carries the same two buttons:
+
+- `t` — **test THIS tab's layer**, without saving anything. Every stage runs in the
+  daemon (it owns the network, TLS and SSH), against the real machinery:
+  - _Connection_ → the file is readable (SQLite / DuckDB), or `host:port` answers —
+    dialled **through the SSH tunnel** when the spec configures one
+  - _Auth_ → a full connect, reporting the identity the server accepted
+  - _Encryption_ → a full connect, reporting the encryption posture (native TLS, tunnel,
+    or a plaintext link — which fails the test)
+  - _Tunnel_ → the SSH session authenticates and the local forward comes up on its own,
+    so a bad host / key / passphrase is reported as a **tunnel** error, not a driver one
+- `s` — **save** the connection (from any tab) and close the panel
+- `q` — close without saving
+
+A failing test leaves the panel open with everything typed so far, so it can be fixed and
+retried. Secrets are saved as templates (see [Credentials](#credentials)), never resolved.
 
 ### Drawer keys
 

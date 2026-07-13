@@ -352,26 +352,31 @@ end
 -- ── keymaps ──────────────────────────────────────────────────────────────────
 
 local function set_keys()
+    local k = config.keys.drawer
+    -- `false` on any key leaves it unbound (the user's opt-out), so every map is guarded.
     local function map(lhs, fn)
+        if not lhs then
+            return
+        end
         vim.keymap.set("n", lhs, fn, { buffer = state.buf, nowait = true, silent = true })
     end
-    map("l", function()
+    map(k.expand, function()
         toggle(true)
     end)
-    map("h", function()
+    map(k.collapse, function()
         toggle(false)
     end)
-    map("<CR>", default_action)
-    map("a", function()
+    map(k.action, default_action)
+    map(k.add, function()
         require("lvim-db.ui.form").open()
     end)
-    map("e", function()
+    map(k.edit, function()
         local row = current_row()
         if row and row.kind == "connection" then
             require("lvim-db.ui.form").open(row.conn.name)
         end
     end)
-    map("x", function()
+    map(k.delete, function()
         local row = current_row()
         if row and row.kind == "connection" then
             require("lvim-ui").confirm({
@@ -387,7 +392,7 @@ local function set_keys()
             })
         end
     end)
-    map("r", function()
+    map(k.refresh, function()
         local row = current_row()
         if row and row.conn and row.conn.conn_id then
             require("lvim-db").structure(row.conn.conn_id, function(nodes)
@@ -396,13 +401,13 @@ local function set_keys()
             end)
         end
     end)
-    map("n", function()
+    map(k.notes, function()
         local row = current_row()
         if row and row.conn then
             require("lvim-db.ui.notes").pick(row.conn.name)
         end
     end)
-    map("q", M.close)
+    map(k.close, M.close)
 end
 
 -- ── open / close ─────────────────────────────────────────────────────────────

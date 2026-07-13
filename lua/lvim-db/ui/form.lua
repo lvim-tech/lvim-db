@@ -5,11 +5,20 @@
 -- in the form with no change here. After choosing the driver (a canonical
 -- lvim-ui.select), the whole connection is entered in a SINGLE tabs panel with
 -- typed rows across four tabs — Connection / Auth / Encryption / Tunnel — and the
--- result (a name→value map) is assembled into a store template. Secrets stay as
--- templates (e.g. {{ env "PGPASSWORD" }}); encryption defaults to Prefer.
+-- result is assembled into a store template. Secrets stay as templates (e.g.
+-- {{ env "PGPASSWORD" }}); encryption defaults to Prefer.
+--
+-- Each tab carries its OWN footer band (lvim-ui's per-tab `footer`): a TEST button
+-- that dry-runs exactly the layer that tab configures (the file / the endpoint,
+-- the credentials, the TLS posture, the SSH tunnel — all executed in the daemon,
+-- which owns the network) and the SAVE button that writes the connection. The
+-- footer is the ONLY submit path: a typed-row form has no whole-form <CR> (that
+-- edits the focused row), so the buttons must live in the footer band — action
+-- ROWS would be swallowed by the key-hint legend and never render.
 --
 ---@module "lvim-db.ui.form"
 
+local config = require("lvim-db.config")
 local ui = require("lvim-ui")
 
 local M = {}
@@ -31,6 +40,18 @@ end
 ---@return table
 local function srow(name, label, value)
     return { type = "string", name = name, label = label, value = str(value) }
+end
+
+--- The SSH secret a stored tunnel spec carries, whichever auth method it used.
+--- (Seeding this row empty would silently WIPE the secret on the next save.)
+---@param tun table?
+---@return string
+local function tunnel_secret(tun)
+    local a = tun and tun.auth or nil
+    if not a then
+        return ""
+    end
+    return str(a.passphrase ~= nil and a.passphrase ~= vim.NIL and a.passphrase or a.password)
 end
 
 --- Build and open the tabs panel for `meta`, seeded from an existing connection.
@@ -71,30 +92,14 @@ local function open_tabs(meta, existing)
     }
 
     local tabs = {
-        { label = "Connection", rows = conn_rows },
-        { label = "Auth", rows = auth_rows },
+        { label = "Connection", rows = conn_rows, stage = "endpoint" },
+        { label = "Auth", rows = auth_rows, stage = "auth" },
     }
-
-    -- A typed-row form has no whole-form <CR> (that edits the focused row), so
-    -- each tab ends with a SAVE action row: <CR> on it closes the form with
-    -- confirmed=true, and lvim-ui collects every tab's values into the callback.
-    local save_seq = 0
-    local function save_row()
-        save_seq = save_seq + 1
-        return {
-            type = "action",
-            name = "__save_" .. save_seq,
-            icon = "",
-            label = "Save connection",
-            run = function(_, close)
-                close(true)
-            end,
-        }
-    end
 
     if network then
         tabs[#tabs + 1] = {
             label = "Encryption",
+            stage = "tls",
             rows = {
                 {
                     type = "select",
@@ -110,6 +115,7 @@ local function open_tabs(meta, existing)
         }
         tabs[#tabs + 1] = {
             label = "Tunnel",
+            stage = "tunnel",
             rows = {
                 {
                     type = "select",
@@ -122,15 +128,186 @@ local function open_tabs(meta, existing)
                 srow("k_port", "SSH port", stun and tostring(stun.port) or "22"),
                 srow("k_user", "SSH user", stun and stun.user),
                 srow("k_path", "SSH private key path (key auth)", stun and stun.auth and stun.auth.path),
-                srow("k_secret", 'SSH passphrase/password ({{ env "VAR" }})', ""),
+                srow("k_secret", 'SSH passphrase/password ({{ env "VAR" }})', tunnel_secret(stun)),
             },
         }
     end
 
-    -- Append the Save action row to every tab so the form is submittable from any.
+    --- The LIVE row values, keyed by row name. lvim-ui edits each typed row's
+    --- `value` in place on the very tables built above, so this reads what the
+    --- user has typed so far — across every tab, not just the focused one.
+    ---@return table<string, any>
+    local function values()
+        local v = {}
+        for _, t in ipairs(tabs) do
+            for _, r in ipairs(t.rows) do
+                if r.name then
+                    v[r.name] = r.value
+                end
+            end
+        end
+        return v
+    end
+
+    --- Assemble the connection spec (the store template) from the live values.
+    ---@return table
+    local function build_spec()
+        local result = values()
+
+        local params = {}
+        for _, p in ipairs(meta.params) do
+            local v = result["p_" .. p.key]
+            if v and v ~= "" then
+                params[p.key] = v
+            end
+        end
+
+        -- Auth: only the selected method's fields.
+        local kind = result.a_kind or "none"
+        local auth = { kind = kind }
+        if kind == "password" then
+            auth.user, auth.password = result.a_user or "", result.a_password or ""
+        elseif kind == "client_cert" then
+            auth.cert, auth.key, auth.user = result.a_cert or "", result.a_key or "", result.a_user or ""
+        elseif kind == "provider" then
+            auth.provider, auth.token, auth.user = result.a_provider or "", result.a_token or "", result.a_user or ""
+        elseif kind == "kerberos" then
+            auth.principal = (result.a_user and result.a_user ~= "") and result.a_user or nil
+        end
+
+        local spec = { params = params, auth = auth }
+
+        if network then
+            local tls = { mode = result.t_mode or "prefer" }
+            if result.t_ca and result.t_ca ~= "" then
+                tls.ca = result.t_ca
+            end
+            if result.t_cc and result.t_cc ~= "" then
+                tls.client_cert = result.t_cc
+            end
+            if result.t_ck and result.t_ck ~= "" then
+                tls.client_key = result.t_ck
+            end
+            spec.tls = tls
+
+            local tmode = result.k_mode or "none"
+            if tmode ~= "none" then
+                local tauth = { kind = tmode }
+                if tmode == "key" then
+                    tauth.path = result.k_path or ""
+                    tauth.passphrase = result.k_secret or ""
+                else
+                    tauth.password = result.k_secret or ""
+                end
+                spec.tunnel = {
+                    host = result.k_host or "",
+                    port = tonumber(result.k_port) or 22,
+                    user = result.k_user or "",
+                    auth = tauth,
+                }
+            end
+        end
+
+        return spec
+    end
+
+    --- Dry-run one layer of the spec in the daemon and report the verdict. The
+    --- panel STAYS OPEN (the point is to fix what failed and retry), so the
+    --- outcome is reported as a notification rather than by closing.
+    ---@param stage "endpoint"|"tunnel"|"tls"|"auth"
+    local function test(stage)
+        local db = require("lvim-db")
+        local spec = build_spec()
+        spec.driver = meta.kind
+        vim.notify(("lvim-db: testing %s…"):format(stage), vim.log.levels.INFO)
+        db.test(spec, stage, function(detail, err, ms)
+            if err then
+                vim.notify(("lvim-db: %s test failed — %s"):format(stage, err), vim.log.levels.ERROR)
+                return
+            end
+            vim.notify(("lvim-db: %s ok (%dms) — %s"):format(stage, ms or 0, detail), vim.log.levels.INFO)
+        end)
+    end
+
+    --- Write the connection to the store and refresh the drawer. Returns false
+    --- (and keeps the panel open) when the form is not yet submittable.
+    ---@return boolean
+    local function save()
+        local name = vim.trim(str(values().__name))
+        if name == "" then
+            vim.notify("lvim-db: a connection name is required", vim.log.levels.WARN)
+            return false
+        end
+        local spec = build_spec()
+        local store = require("lvim-db").store
+        -- A failed write must never masquerade as a save: the store degrades to
+        -- `false` when sqlite is absent (or the insert is rejected), and claiming
+        -- success there is how a connection silently vanishes.
+        if not store.save_connection(name, meta.kind, spec) then
+            vim.notify(
+                ("lvim-db: could not save '%s' — the store is %s"):format(
+                    name,
+                    store.available() and "reachable but rejected the write" or "unavailable (sqlite.lua missing?)"
+                ),
+                vim.log.levels.ERROR
+            )
+            return false
+        end
+        local enc = (spec.tls and spec.tls.mode ~= "disable") or spec.tunnel ~= nil
+        vim.notify(
+            ("lvim-db: saved '%s' (%s)"):format(name, enc and "encrypted" or "PLAINTEXT — no TLS/tunnel"),
+            enc and vim.log.levels.INFO or vim.log.levels.WARN
+        )
+        local drawer = require("lvim-db.ui.drawer")
+        if drawer.is_open() then
+            drawer.open()
+            drawer.refresh()
+        end
+        return true
+    end
+
+    -- Per-tab footer band: TEST this tab's layer • SAVE • close (keys from
+    -- config.keys.form; a `false` key drops that button). Every tab can save (the
+    -- form is submittable from wherever the user finishes), while the test button
+    -- is the one thing that differs per tab.
+    --
+    -- The defaults are PLAIN LETTERS, like every other lvim-tech panel footer (q
+    -- close, a add, …): the panel is modal and its body binds only j/k, <CR>, ←/→
+    -- and ⌫, so letters are free — and, unlike a chord such as <C-s>, a letter
+    -- cannot be intercepted upstream (a multiplexer prefix, terminal flow control)
+    -- and never reach Neovim.
+    local fk = config.keys.form
     for _, t in ipairs(tabs) do
-        t.rows[#t.rows + 1] = { type = "spacer" }
-        t.rows[#t.rows + 1] = save_row()
+        -- A file-backed driver has no endpoint to dial — its Connection tab tests the FILE.
+        local test_label = t.stage == "endpoint" and (network and "test endpoint" or "test file")
+            or ("test " .. t.stage)
+        local footer = {}
+        if fk.test then
+            footer[#footer + 1] = {
+                key = fk.test,
+                label = test_label,
+                run = function()
+                    test(t.stage)
+                end,
+            }
+        end
+        if fk.save then
+            footer[#footer + 1] = {
+                key = fk.save,
+                label = "save",
+                run = function(st)
+                    if save() then
+                        st.close()
+                    end
+                end,
+            }
+        end
+        if fk.close then
+            -- Label-only: the frame already closes on this key (a real mapping here
+            -- would only shadow it).
+            footer[#footer + 1] = { key = fk.close, label = "close", no_hotkey = true }
+        end
+        t.footer = footer
     end
 
     ui.tabs({
@@ -141,85 +318,6 @@ local function open_tabs(meta, existing)
         -- A multi-tab typed form is a centred MODAL (canon §2: float), not the
         -- short cmdline/area zone which would clip the rows.
         layout = "float",
-        footer_hints = true,
-        callback = function(confirmed, result)
-            if not confirmed or type(result) ~= "table" then
-                return
-            end
-            local name = vim.trim(result.__name or "")
-            if name == "" then
-                vim.notify("lvim-db: a connection name is required", vim.log.levels.WARN)
-                return
-            end
-
-            -- Params.
-            local params = {}
-            for _, p in ipairs(meta.params) do
-                local v = result["p_" .. p.key]
-                if v and v ~= "" then
-                    params[p.key] = v
-                end
-            end
-
-            -- Auth (only the selected method's fields).
-            local kind = result.a_kind or "none"
-            local auth = { kind = kind }
-            if kind == "password" then
-                auth.user, auth.password = result.a_user or "", result.a_password or ""
-            elseif kind == "client_cert" then
-                auth.cert, auth.key, auth.user = result.a_cert or "", result.a_key or "", result.a_user or ""
-            elseif kind == "provider" then
-                auth.provider, auth.token, auth.user =
-                    result.a_provider or "", result.a_token or "", result.a_user or ""
-            elseif kind == "kerberos" then
-                auth.principal = (result.a_user and result.a_user ~= "") and result.a_user or nil
-            end
-
-            local spec = { params = params, auth = auth }
-
-            if network then
-                local tls = { mode = result.t_mode or "prefer" }
-                if result.t_ca and result.t_ca ~= "" then
-                    tls.ca = result.t_ca
-                end
-                if result.t_cc and result.t_cc ~= "" then
-                    tls.client_cert = result.t_cc
-                end
-                if result.t_ck and result.t_ck ~= "" then
-                    tls.client_key = result.t_ck
-                end
-                spec.tls = tls
-
-                local tmode = result.k_mode or "none"
-                if tmode ~= "none" then
-                    local tauth = { kind = tmode }
-                    if tmode == "key" then
-                        tauth.path = result.k_path or ""
-                        tauth.passphrase = result.k_secret or ""
-                    else
-                        tauth.password = result.k_secret or ""
-                    end
-                    spec.tunnel = {
-                        host = result.k_host or "",
-                        port = tonumber(result.k_port) or 22,
-                        user = result.k_user or "",
-                        auth = tauth,
-                    }
-                end
-            end
-
-            require("lvim-db").store.save_connection(name, meta.kind, spec)
-            local enc = (spec.tls and spec.tls.mode ~= "disable") or spec.tunnel ~= nil
-            vim.notify(
-                ("lvim-db: saved '%s' (%s)"):format(name, enc and "encrypted" or "PLAINTEXT — no TLS/tunnel"),
-                enc and vim.log.levels.INFO or vim.log.levels.WARN
-            )
-            local drawer = require("lvim-db.ui.drawer")
-            if drawer.is_open() then
-                drawer.open()
-                drawer.refresh()
-            end
-        end,
     })
 end
 

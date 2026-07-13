@@ -80,8 +80,28 @@ setup() merges your options into the live config. The full defaults: >lua
       data_dir = nil,                 -- nil ⇒ stdpath("data")/lvim-db/
       connect_timeout_ms = 15000,
       warn_on_missing = true,
+      keys = {                        -- the keys lvim-db binds in its OWN panels
+          drawer = {                  -- (buffer-local; nothing global is touched).
+              expand = "l", collapse = "h", action = "<CR>",
+              add = "a", edit = "e", delete = "x",
+              refresh = "r", notes = "n", close = "q",
+          },
+          result = {
+              result_tab = "1", log_tab = "2",
+              view_result = "r", view_log = "L",
+              rerun = "<CR>", cancel = "x",
+              next_page = "n", prev_page = "p",
+              yank = "y", export = "e", close = "q",
+          },
+          form = { test = "t", save = "s", close = "q" },
+      },
   })
 <
+Remap any key, or set it to `false` to leave it unbound. The defaults are plain
+LETTERS on purpose: a key must survive the terminal and the multiplexer to reach
+Neovim at all — a chord like <C-s> is tmux's default prefix in many setups (and
+XON/XOFF flow control in others), so it can be swallowed upstream and never
+arrive.
 ==============================================================================
 5. DATABASES                                            *lvim-db-databases*
 
@@ -166,6 +186,17 @@ All calls are asynchronous (the daemon is spawned + handshaken on first use).
 `require("lvim-db").connect_saved(name, cb)`
     Open a SAVED connection by name. `cb(conn_id, err)`.
 
+`require("lvim-db").test(spec, stage, cb)`
+    Dry-run ONE layer of a spec without leaving anything open — what the
+    connection form's per-tab test button calls. Every stage runs in the daemon
+    (it owns the network, TLS and SSH), against the real machinery:
+        "endpoint"  the file is readable, or host:port answers (dialled THROUGH
+                    the SSH tunnel when the spec configures one)
+        "tunnel"    the SSH session authenticates and the local forward comes up
+        "tls"       a full connect, reporting the encryption posture
+        "auth"      a full connect, reporting the accepted identity
+    `cb(detail, err, ms)` — on success `detail` is the human-readable outcome.
+
 `require("lvim-db").disconnect(conn_id[, cb])`
 `require("lvim-db").databases(conn_id, cb)`          cb(databases, err)
 `require("lvim-db").switch_database(conn_id, database[, cb])`
@@ -203,6 +234,30 @@ All calls are asynchronous (the daemon is spawned + handshaken on first use).
 
 Drawer keys: l / <CR> connect-or-expand (a table's <CR> previews its rows),
 h collapse/disconnect, a add, e edit, x delete, r refresh, n notes, q close.
+
+CONNECTION FORM                                              *lvim-db-form*
+
+:LvimDb add (or `a` in the drawer; `e` edits) first picks the driver, then opens
+ONE lvim-ui.tabs panel whose rows come from that driver's DriverMeta —
+Connection, Auth, and, for a networked engine, Encryption and Tunnel. Each tab's
+footer carries the same two buttons:
+
+  t       test THIS tab's layer, saving nothing (see |lvim-db-api| .test()):
+            Connection  the file is readable, or host:port answers (through the
+                        SSH tunnel when one is configured)
+            Auth        a full connect — the identity the server accepted
+            Encryption  a full connect — the encryption posture (a plaintext
+                        link FAILS the test)
+            Tunnel      the SSH session + local forward on their own, so a bad
+                        host / key / passphrase is a TUNNEL error, not a driver
+                        one
+  s       save the connection (from any tab) and close the panel
+  q       close without saving
+
+All of these keys are configurable — see `keys` in |lvim-db-setup|.
+
+A failing test leaves the panel open with everything typed so far, so it can be
+fixed and retried. Secrets are saved as TEMPLATES (|lvim-db-credentials|).
 
 Result dock — two tabs (1/2 or r/L switch):
   Result: n / p next / previous page, y yank the page as TSV, e export, q close.

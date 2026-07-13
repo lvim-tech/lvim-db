@@ -18,6 +18,44 @@
 ---@field data_dir         string?                 Base dir for lvim-db's own store (connections/history); nil = stdpath("data")/lvim-db
 ---@field connect_timeout_ms integer               How long a connect / handshake may take before it is abandoned
 ---@field warn_on_missing  boolean                 Notify once (INFO) when the daemon binary is not built
+---@field keys             LvimDbKeys              Every key lvim-db binds in its own UI surfaces
+
+--- The keys lvim-db binds inside its OWN windows (the drawer, the result dock, the
+--- connection form) — buffer-local to those panels, so they never touch the editor's
+--- global maps. Each is a single `lhs`; set one to `false` to leave that key unbound.
+---@class LvimDbKeys
+---@field drawer LvimDbDrawerKeys
+---@field result LvimDbResultKeys
+---@field form   LvimDbFormKeys
+
+---@class LvimDbDrawerKeys
+---@field expand   string|false  Expand the row / connect the connection
+---@field collapse string|false  Collapse the row / disconnect the connection
+---@field action   string|false  Default action (connect, expand, or preview a table's first rows)
+---@field add      string|false  Open the connection form to ADD a connection
+---@field edit     string|false  Open the connection form on the focused connection
+---@field delete   string|false  Delete the focused saved connection (confirmed)
+---@field refresh  string|false  Re-read the focused connection's schema
+---@field notes    string|false  Open the notes picker for the focused connection
+---@field close    string|false  Close the drawer
+
+---@class LvimDbResultKeys
+---@field result_tab string|false  Show the RESULT view (header button)
+---@field log_tab    string|false  Show the CALL LOG view (header button)
+---@field view_result string|false Switch to the result view (body key)
+---@field view_log   string|false  Switch to the call-log view (body key)
+---@field rerun      string|false  Call log: re-run the focused call
+---@field cancel     string|false  Call log: cancel the focused running call
+---@field next_page  string|false  Result: next page
+---@field prev_page  string|false  Result: previous page
+---@field yank       string|false  Result: yank the page as TSV
+---@field export     string|false  Result: export the page
+---@field close      string|false  Close the dock
+
+---@class LvimDbFormKeys
+---@field test  string|false  Test the ACTIVE tab's layer (endpoint / auth / tls / tunnel)
+---@field save  string|false  Save the connection (from any tab) and close the form
+---@field close string|false  Close the form without saving
 
 ---@type LvimDbConfig
 return {
@@ -53,4 +91,40 @@ return {
     -- Emit a single INFO notification the first time an action needs the daemon but the
     -- binary is not built (so a user without a Rust toolchain knows to run native/build.sh).
     warn_on_missing = true,
+    -- The keys lvim-db binds INSIDE its own panels (buffer-local — nothing global is
+    -- touched). Any of them may be remapped, or set to `false` to leave it unbound.
+    -- They are deliberately plain letters: a panel key must survive the terminal and the
+    -- multiplexer, and a chord like <C-s> can be swallowed upstream (it is tmux's default
+    -- prefix in many setups) and never reach Neovim at all.
+    keys = {
+        drawer = {
+            expand = "l",
+            collapse = "h",
+            action = "<CR>",
+            add = "a",
+            edit = "e",
+            delete = "x",
+            refresh = "r",
+            notes = "n",
+            close = "q",
+        },
+        result = {
+            result_tab = "1",
+            log_tab = "2",
+            view_result = "r",
+            view_log = "L",
+            rerun = "<CR>",
+            cancel = "x",
+            next_page = "n",
+            prev_page = "p",
+            yank = "y",
+            export = "e",
+            close = "q",
+        },
+        form = {
+            test = "t",
+            save = "s",
+            close = "q",
+        },
+    },
 }

@@ -22,9 +22,26 @@ use crate::driver::{CancelHandle, Connection, ResultStream};
 use crate::net::NetContext;
 use crate::registry::Registry;
 use crate::rpc::{self, Request};
-use crate::spec::{Column, ConnSpec, ObjRef, Value};
+use crate::spec::{AuthSpec, Column, ConnSpec, DriverMeta, ObjRef, ParamType, Value};
 
 type Conn = Arc<AsyncMutex<Box<dyn Connection>>>;
+
+/// How long `conn.test`'s endpoint stage waits for a TCP socket before calling
+/// the host unreachable — long enough for a slow remote, short enough that a
+/// blackholed address does not hang the form's Test button.
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Expand a leading `~` in a file-param path. The daemon is the one that opens
+/// the file, so it — not the Lua form — resolves the shorthand the user typed.
+fn expand_tilde(path: &str) -> String {
+    match path.strip_prefix("~") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => match std::env::var("HOME") {
+            Ok(home) => format!("{home}{rest}"),
+            Err(_) => path.to_string(),
+        },
+        _ => path.to_string(),
+    }
+}
 
 /// A live connection plus the NetContext that owns its SSH tunnel (if any) — the
 /// tunnel stays up as long as this entry lives, and is torn down on disconnect.
@@ -139,6 +156,7 @@ impl Server {
         match method {
             "rpc.hello" => self.hello(),
             "conn.connect" => self.connect(params).await,
+            "conn.test" => self.test(params).await,
             "conn.disconnect" => self.disconnect(params).await,
             "conn.databases" => self.databases(params).await,
             "conn.switch_database" => self.switch_database(params).await,
@@ -191,6 +209,154 @@ impl Server {
             ));
         }
         Ok(json!({ "conn_id": id, "encrypted": encrypted, "tunneled": tunneled }))
+    }
+
+    /// Dry-run ONE stage of a connection spec, without keeping anything open —
+    /// what the form's per-tab Test button calls. Each stage exercises the REAL
+    /// machinery of the layer it names (no simulation): the endpoint stage dials
+    /// the TCP socket (through the SSH tunnel when one is configured), the tunnel
+    /// stage stands the SSH forward up on its own, and the tls/auth stages open a
+    /// full driver connection and close it again. An unusable spec surfaces as an
+    /// RPC error carrying the underlying message — the client shows it verbatim.
+    async fn test(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            stage: String,
+            spec: ConnSpec,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let meta = self
+            .inner
+            .registry
+            .metas()
+            .into_iter()
+            .find(|m| m.kind == p.spec.driver)
+            .ok_or_else(|| anyhow::anyhow!("unknown driver '{}'", p.spec.driver))?;
+
+        let started = Instant::now();
+        let detail = match p.stage.as_str() {
+            "endpoint" => Self::test_endpoint(&p.spec, meta).await?,
+            "tunnel" => Self::test_tunnel(&p.spec, meta).await?,
+            "tls" | "auth" => self.test_connect(&p.spec, &p.stage).await?,
+            other => return Err(anyhow::anyhow!("unknown test stage '{other}'")),
+        };
+        Ok(json!({
+            "ok": true,
+            "ms": started.elapsed().as_millis() as u64,
+            "detail": detail,
+        }))
+    }
+
+    /// Endpoint stage — is the thing we would dial actually there? A file-backed
+    /// driver (its meta declares a `File` param) checks the path; a TCP driver
+    /// opens a socket to host:port, THROUGH the tunnel when one is configured (so
+    /// a green endpoint on a tunnelled spec means the whole path is up). A driver
+    /// with neither (an HTTPS API like Snowflake) has nothing to probe short of a
+    /// real connect, and says so.
+    async fn test_endpoint(spec: &ConnSpec, meta: &'static DriverMeta) -> anyhow::Result<String> {
+        if let Some(fp) = meta.params.iter().find(|p| matches!(p.kind, ParamType::File)) {
+            let raw = spec.param(fp.key)?;
+            let path = expand_tilde(raw);
+            let md = std::fs::metadata(&path).map_err(|e| anyhow::anyhow!("cannot stat '{path}': {e}"))?;
+            if !md.is_file() {
+                return Err(anyhow::anyhow!("'{path}' is not a regular file"));
+            }
+            std::fs::File::open(&path).map_err(|e| anyhow::anyhow!("cannot open '{path}' for reading: {e}"))?;
+            return Ok(format!("{path} — readable, {} bytes", md.len()));
+        }
+
+        let Some(host) = spec.param_opt("host") else {
+            return Err(anyhow::anyhow!(
+                "'{}' has no TCP endpoint to probe — use the Auth tab's test (a full connect)",
+                meta.kind
+            ));
+        };
+        let port = spec.port(meta.default_port.unwrap_or(0));
+        if port == 0 {
+            return Err(anyhow::anyhow!("no port set and '{}' declares no default", meta.kind));
+        }
+        let net = NetContext::new(spec.tunnel.clone());
+        let addr = net.resolve(host, port).await?;
+        tokio::time::timeout(DIAL_TIMEOUT, tokio::net::TcpStream::connect(&addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out dialling {host}:{port} after {}s", DIAL_TIMEOUT.as_secs()))?
+            .map_err(|e| anyhow::anyhow!("cannot reach {host}:{port}: {e}"))?;
+        Ok(if net.tunneled() {
+            format!("{host}:{port} reachable through the SSH tunnel (local {addr})")
+        } else {
+            format!("{host}:{port} reachable (plain TCP)")
+        })
+    }
+
+    /// Tunnel stage — stand the SSH session + local forward up on their own, so a
+    /// tunnel problem (host, user, key, passphrase) is reported as a TUNNEL error
+    /// rather than hiding behind a driver connect failure. The forward is torn
+    /// down when `net` drops at the end of this call.
+    async fn test_tunnel(spec: &ConnSpec, meta: &'static DriverMeta) -> anyhow::Result<String> {
+        let Some(t) = spec.tunnel.clone() else {
+            return Err(anyhow::anyhow!("no SSH tunnel configured on this connection"));
+        };
+        // The forward needs a target: the DB endpoint the tunnel would front.
+        let host = spec
+            .param_opt("host")
+            .ok_or_else(|| anyhow::anyhow!("a tunnel needs a host to forward to — fill the Connection tab first"))?;
+        let port = spec.port(meta.default_port.unwrap_or(0));
+        if port == 0 {
+            return Err(anyhow::anyhow!("no port set and '{}' declares no default", meta.kind));
+        }
+        let user = t.user.clone();
+        let (shost, sport) = (t.host.clone(), t.port);
+        let net = NetContext::new(Some(t));
+        let addr = net.resolve(host, port).await?;
+        Ok(format!(
+            "ssh {user}@{shost}:{sport} authenticated — forwarding {addr} → {host}:{port}"
+        ))
+    }
+
+    /// TLS / auth stages — a REAL driver connect (tunnel, TLS handshake and
+    /// credentials all exercised end to end), closed again immediately. The two
+    /// stages differ only in what they report: the encryption posture, or the
+    /// accepted identity.
+    async fn test_connect(&self, spec: &ConnSpec, stage: &str) -> anyhow::Result<String> {
+        let driver = self.inner.registry.get(&spec.driver)?;
+        let net = NetContext::new(spec.tunnel.clone());
+        let conn = driver.connect(spec, net.clone()).await?;
+        let native = conn.encrypted();
+        let tunneled = net.tunneled();
+        let _ = conn.close().await;
+
+        if stage == "tls" {
+            return Ok(match (native, tunneled) {
+                (true, true) => "encrypted — native TLS negotiated, and the link also rides the SSH tunnel".into(),
+                (true, false) => "encrypted — native TLS negotiated".into(),
+                (false, true) => "encrypted — no native TLS, but the link rides the SSH tunnel".into(),
+                (false, false) => {
+                    return Err(anyhow::anyhow!(
+                        "connected but the link is PLAINTEXT — no TLS negotiated and no SSH tunnel"
+                    ))
+                }
+            });
+        }
+        let who = match &spec.auth {
+            AuthSpec::None => "no credentials (anonymous)".to_string(),
+            AuthSpec::Password { user, .. } => format!("password auth accepted for '{user}'"),
+            AuthSpec::ClientCert { user, .. } if !user.is_empty() => {
+                format!("client-certificate auth accepted for '{user}'")
+            }
+            AuthSpec::ClientCert { .. } => "client-certificate auth accepted".to_string(),
+            AuthSpec::Provider { provider, user, .. } if !user.is_empty() => {
+                format!("{provider} token accepted for '{user}'")
+            }
+            AuthSpec::Provider { provider, .. } => format!("{provider} token accepted"),
+            AuthSpec::Kerberos { principal } => match principal {
+                Some(p) => format!("kerberos accepted for '{p}'"),
+                None => "kerberos accepted".to_string(),
+            },
+        };
+        Ok(format!(
+            "connected — {who}; link {}",
+            if native || tunneled { "encrypted" } else { "PLAINTEXT" }
+        ))
     }
 
     async fn disconnect(&self, params: Json) -> anyhow::Result<Json> {

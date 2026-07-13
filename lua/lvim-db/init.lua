@@ -136,6 +136,28 @@ function M.connect_saved(name, cb)
     M.connect(spec, cb)
 end
 
+--- Dry-run ONE layer of a spec without opening anything that stays open — what
+--- the connection form's per-tab Test button calls. The daemon owns the network,
+--- TLS and SSH, so every stage is exercised THERE, against the real machinery:
+---   • "endpoint" — the file is readable, or host:port answers (through the SSH
+---                  tunnel when the spec carries one)
+---   • "tunnel"   — the SSH session authenticates and the local forward comes up
+---   • "tls"      — a full connect, reporting the encryption posture
+---   • "auth"     — a full connect, reporting the accepted identity
+--- `cb(detail, err, ms)`: on success `detail` is the human-readable outcome.
+---@param spec table
+---@param stage "endpoint"|"tunnel"|"tls"|"auth"
+---@param cb fun(detail: string?, err: string?, ms: integer?)
+function M.test(spec, stage, cb)
+    daemon.request("conn.test", { stage = stage, spec = spec }, function(result, err)
+        if err or type(result) ~= "table" then
+            cb(nil, err or "test failed")
+            return
+        end
+        cb(result.detail or "ok", nil, result.ms)
+    end)
+end
+
 --- Close a connection.
 ---@param conn_id integer
 ---@param cb? fun(err: string?)
