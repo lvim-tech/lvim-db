@@ -82,11 +82,13 @@ setup() merges your options into the live config. The full defaults: >lua
       warn_on_missing = true,
       keys = {                        -- the keys lvim-db binds in its OWN panels
           drawer = {                  -- (buffer-local; nothing global is touched).
+              help = "g?",            -- the keymap CHEATSHEET
               expand = "l", collapse = "h", action = "<CR>",
               add = "a", edit = "e", delete = "x",
               refresh = "r", notes = "n", close = "q",
           },
           result = {
+              help = "g?",            -- the keymap CHEATSHEET
               result_tab = "1", log_tab = "2",
               view_result = "r", view_log = "L",
               rerun = "<CR>", cancel = "x",
@@ -234,6 +236,10 @@ All calls are asynchronous (the daemon is spawned + handshaken on first use).
 
 Drawer keys: l / <CR> connect-or-expand (a table's <CR> previews its rows),
 h collapse/disconnect, a add, e edit, x delete, r refresh, n notes, q close.
+
+The drawer AND the result dock each carry a `help` chip on their bottom bar
+(`g?`) — the keymap CHEATSHEET of that panel, built from the live `keys` config,
+so a rebind shows up in it. `q` / `<Esc>` / `g?` close it.
 
 CONNECTION FORM                                              *lvim-db-form*
 

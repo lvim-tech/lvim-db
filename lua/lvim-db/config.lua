@@ -29,6 +29,7 @@
 ---@field form   LvimDbFormKeys
 
 ---@class LvimDbDrawerKeys
+---@field help     string|false  Open the drawer's keymap cheatsheet
 ---@field expand   string|false  Expand the row / connect the connection
 ---@field collapse string|false  Collapse the row / disconnect the connection
 ---@field action   string|false  Default action (connect, expand, or preview a table's first rows)
@@ -40,6 +41,7 @@
 ---@field close    string|false  Close the drawer
 
 ---@class LvimDbResultKeys
+---@field help       string|false  Open the result dock's keymap cheatsheet
 ---@field result_tab string|false  Show the RESULT view (header button)
 ---@field log_tab    string|false  Show the CALL LOG view (header button)
 ---@field view_result string|false Switch to the result view (body key)
@@ -98,6 +100,7 @@ return {
     -- prefix in many setups) and never reach Neovim at all.
     keys = {
         drawer = {
+            help = "g?", -- the set-wide cheatsheet chord (the panel owns the `g` prefix — see lvim-ui)
             expand = "l",
             collapse = "h",
             action = "<CR>",
@@ -109,6 +112,7 @@ return {
             close = "q",
         },
         result = {
+            help = "g?", -- the set-wide cheatsheet chord
             result_tab = "1",
             log_tab = "2",
             view_result = "r",

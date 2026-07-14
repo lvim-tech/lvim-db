@@ -349,17 +349,59 @@ local function default_action()
     end
 end
 
+-- ── the help window (the canonical cheatsheet) ───────────────────────────────
+
+-- Key id → description, in display order. Built from the LIVE `config.keys.drawer`, so a rebind shows up
+-- and a key the user set to `false` drops its row.
+---@type { [1]: string, [2]: string }[]
+local HELP = {
+    { "action", "connect / expand / preview the row" },
+    { "expand", "expand (connect the connection)" },
+    { "collapse", "collapse (disconnect)" },
+    { "add", "add a connection" },
+    { "edit", "edit the focused connection" },
+    { "delete", "delete the focused connection" },
+    { "refresh", "re-read the schema" },
+    { "notes", "open the notes picker" },
+    { "help", "this help" },
+    { "close", "close the drawer" },
+}
+
+--- The drawer's keymap cheatsheet — the shared `lvim-ui.help` component owns the rows, the striping, the
+--- colours and the window; this only supplies the plugin's LIVE keys.
+local function show_help()
+    local k = config.keys.drawer
+    local items = {}
+    for _, e in ipairs(HELP) do
+        local lhs = k[e[1]]
+        if lhs then
+            items[#items + 1] = { lhs, e[2] }
+        end
+    end
+    require("lvim-ui").help({
+        title = "Databases keymaps",
+        items = items,
+        close_keys = { "q", "<Esc>", k.help or "g?" },
+    })
+end
+
 -- ── keymaps ──────────────────────────────────────────────────────────────────
 
-local function set_keys()
+--- Bind the drawer's keys THROUGH the chassis `map` (the provider's `keys` hook), never with a raw
+--- `vim.keymap.set`: only the keys the chassis binds itself land in its `used` set, and that set is what
+--- makes the panel OWN a chord PREFIX (the `g` of `g?`) — otherwise a `g?` typed at human speed falls
+--- through to the builtin `g` once `timeoutlen` expires.
+---@param chassis_map fun(lhs: string|string[], fn: fun())
+local function set_keys(chassis_map)
     local k = config.keys.drawer
     -- `false` on any key leaves it unbound (the user's opt-out), so every map is guarded.
     local function map(lhs, fn)
         if not lhs then
             return
         end
-        vim.keymap.set("n", lhs, fn, { buffer = state.buf, nowait = true, silent = true })
+        chassis_map(lhs, fn)
     end
+    map(k.help, show_help)
     map(k.expand, function()
         toggle(true)
     end)
@@ -435,9 +477,9 @@ function M.open(enter)
             vim.bo[pan.buf].buftype = "nofile"
             render()
         end,
-        keys = function(_, pan)
+        keys = function(map, pan)
             state.buf, state.win = pan.buf, pan.win
-            set_keys()
+            set_keys(map)
         end,
         on_close = function()
             state.surface, state.win, state.buf, state.rows = nil, nil, nil, {}
@@ -455,6 +497,30 @@ function M.open(enter)
         size = { width = { fixed = config.drawer_width or 36 } },
         content = { blocks = { { id = "drawer", provider = provider } } },
         close_keys = {},
+        -- A key-hint bar pinned to the drawer's bottom row: the panel had NONE, so its keys — and the
+        -- cheatsheet itself — were undiscoverable. Real `surface.button`s, no ● separators (the drawer is 36
+        -- columns wide and they would cost the chips their place).
+        footer = {
+            bars = {
+                {
+                    align = "center",
+                    items = {
+                        surface.button(
+                            { name = "help", key = config.keys.drawer.help or "g?", style = "action", run = show_help },
+                            "action"
+                        ),
+                        surface.button({
+                            name = "close",
+                            key = config.keys.drawer.close or "q",
+                            style = "action",
+                            run = function()
+                                M.close()
+                            end,
+                        }, "action"),
+                    },
+                },
+            },
+        },
     })
 end
 

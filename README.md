@@ -111,6 +111,7 @@ require("lvim-db").setup({
     keys = {
         -- the connections drawer
         drawer = {
+            help = "g?", -- the keymap CHEATSHEET (also a `help` chip on the drawer's bar)
             expand = "l", -- expand the row / connect
             collapse = "h", -- collapse the row / disconnect
             action = "<CR>", -- connect, expand, or preview a table's first rows
@@ -123,6 +124,7 @@ require("lvim-db").setup({
         },
         -- the result dock (grid + call log)
         result = {
+            help = "g?", -- the keymap CHEATSHEET (also a `help` chip on the dock's bar)
             result_tab = "1", -- header button: the result view
             log_tab = "2", -- header button: the call-log view
             view_result = "r", -- body key: switch to the result view
@@ -144,6 +146,10 @@ require("lvim-db").setup({
     },
 })
 ```
+
+Both panels carry a **`help` chip** on their bottom bar (`g?`): it opens the keymap CHEATSHEET —
+every key of that panel, built from the live `keys` config above (rebind one and the cheatsheet
+follows). `q` / `<Esc>` / `g?` close it.
 
 The panel keys are deliberately **plain letters**: a key must survive the terminal and
 the multiplexer to reach Neovim at all — a chord like `<C-s>` is tmux's default prefix in

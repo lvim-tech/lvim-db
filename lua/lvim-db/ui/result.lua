@@ -277,6 +277,44 @@ local function export_page()
     vim.notify("lvim-db: exported to " .. path, vim.log.levels.INFO)
 end
 
+-- ── the help window (the canonical cheatsheet) ───────────────────────────────
+
+-- Key id → description, in display order. Built from the LIVE `config.keys.result`, so a rebind shows up
+-- and a key the user set to `false` drops its row.
+---@type { [1]: string, [2]: string }[]
+local HELP = {
+    { "result_tab", "show the RESULT view (header tab)" },
+    { "log_tab", "show the CALL LOG view (header tab)" },
+    { "view_result", "switch to the result view" },
+    { "view_log", "switch to the call-log view" },
+    { "rerun", "call log: re-run the focused call" },
+    { "cancel", "call log: cancel the running call" },
+    { "next_page", "result: next page" },
+    { "prev_page", "result: previous page" },
+    { "yank", "result: yank the page as TSV" },
+    { "export", "result: export the page" },
+    { "help", "this help" },
+    { "close", "close the dock" },
+}
+
+--- The result dock's keymap cheatsheet — the shared `lvim-ui.help` component owns the rows, the striping,
+--- the colours and the window; this only supplies the plugin's LIVE keys.
+local function show_help()
+    local k = config.keys.result
+    local items = {}
+    for _, e in ipairs(HELP) do
+        local lhs = k[e[1]]
+        if lhs then
+            items[#items + 1] = { lhs, e[2] }
+        end
+    end
+    require("lvim-ui").help({
+        title = "Result keymaps",
+        items = items,
+        close_keys = { "q", "<Esc>", k.help or "g?" },
+    })
+end
+
 --- Open (or refresh) the dock with the current result.
 local function open_dock()
     if is_open() then
@@ -290,13 +328,19 @@ local function open_dock()
     -- call-log view re-open a call (re-runs its statement) or cancel a running one.
     -- A key set to `false` is left unbound.
     local k = config.keys.result
-    local function set_keys(buf)
+    -- Bind THROUGH the chassis `map` (the provider's `keys` hook), never with a raw `vim.keymap.set`: only
+    -- the keys the chassis binds itself land in its `used` set, and that set is what makes the panel OWN a
+    -- chord PREFIX (the `g` of `g?`) — otherwise a `g?` typed at human speed falls through to the builtin
+    -- `g` once `timeoutlen` expires.
+    ---@param chassis_map fun(lhs: string|string[], fn: fun())
+    local function set_keys(chassis_map)
         local function map(lhs, fn)
             if not lhs then
                 return
             end
-            vim.keymap.set("n", lhs, fn, { buffer = buf, nowait = true, silent = true })
+            chassis_map(lhs, fn)
         end
+        map(k.help, show_help)
         map(k.view_result, function()
             set_view("result")
         end)
@@ -331,8 +375,8 @@ local function open_dock()
             vim.bo[pan.buf].buftype = "nofile"
             render()
         end,
-        keys = function(_, pan)
-            set_keys(pan.buf)
+        keys = function(map)
+            set_keys(map)
         end,
         on_close = function()
             state.surface, state.buf = nil, nil
@@ -366,7 +410,7 @@ local function open_dock()
         },
         footer = {
             bars = {
-                surface.bar({ { "prev", "next", "yank", "export", "close" } }, {
+                surface.bar({ { "prev", "next", "yank", "export" }, { "help", "close" } }, {
                     prev = {
                         name = "prev",
                         key = k.prev_page or nil,
@@ -385,6 +429,9 @@ local function open_dock()
                     },
                     yank = { name = "yank", key = k.yank or nil, run = yank_page },
                     export = { name = "export", key = k.export or nil, run = export_page },
+                    -- The dock's keys are not discoverable from the grid, so the bar has to say where the
+                    -- cheatsheet is (the key itself is bound in `set_keys`, through the chassis).
+                    help = { name = "help", key = k.help or nil, run = show_help },
                     close = {
                         name = "close",
                         key = k.close or nil,
