@@ -23,19 +23,60 @@ end
 ---@return table<string, table>
 function M.build()
     return {
-        -- drawer node kinds (the tree lead icon + label colour per kind)
-        LvimDbConnection = { fg = c.purple, bold = true }, -- a saved connection
-        LvimDbConnectionOpen = { fg = c.green, bold = true }, -- a connected connection
-        LvimDbSchema = { fg = c.blue, bold = true },
-        LvimDbTable = { fg = c.green },
-        LvimDbView = { fg = c.cyan },
-        LvimDbCollection = { fg = c.cyan },
-        LvimDbColumn = { fg = hl.blend(c.fg, c.bg, 0.7) },
-        LvimDbKey = { fg = c.orange }, -- a redis key
+        -- Drawer node kinds — the FOUR tree LEVELS are each a clearly distinct, readable hue so
+        -- connection ⇄ database ⇄ object ⇄ field read apart at a glance (no two kinds that can appear
+        -- in the SAME tree share a colour):
+        --   CONNECTION  magenta when disconnected → green (live) once connected — state also in the icon
+        --   DATABASE    schema is blue
+        --   OBJECTS     table yellow · view cyan · collection orange (all distinct from each other)
+        --   FIELDS      columns take the full foreground (a real readable colour, not the old near-bg dim)
+        LvimDbConnection = { fg = c.magenta, bold = true }, -- a saved, DISCONNECTED connection
+        LvimDbConnectionOpen = { fg = c.green, bold = true }, -- a CONNECTED (live) connection
+        LvimDbSchema = { fg = c.blue, bold = true }, -- a schema / database
+        LvimDbTable = { fg = c.yellow }, -- a table
+        LvimDbView = { fg = c.cyan }, -- a view
+        LvimDbCollection = { fg = c.orange }, -- a (mongo) collection
+        LvimDbColumn = { fg = c.fg }, -- a column / field — readable, not dim
+        LvimDbKey = { fg = c.orange }, -- a redis key (its own driver context)
+        -- Saved queries — PURPLE, a hue used by no other drawer kind (so a connection's Queries branch and
+        -- its query leaves read apart from schemas/objects/columns that can sit in the same tree).
+        LvimDbQueries = { fg = c.purple, bold = true }, -- the saved-queries BRANCH
+        LvimDbQuery = { fg = c.purple }, -- one saved query leaf
+
+        -- Drawer full-row WASH per node kind — BACKGROUND-ONLY (no fg): a `line_hl_group` carrying a fg would
+        -- override the node's label colour, so each row is tinted only in the bg with ITS OWN accent (the
+        -- "тинт" canon) while the distinct node-type fg + devicon read intact over it. Container rows
+        -- (connection / schema / objects) get the wash; OBJECT rows additionally alternate two depths (a
+        -- zebra) so adjacent same-type objects stay apart; COLUMN/field rows stay plain (the leaf tier, so the
+        -- washed containers stand out). The SELECTED row of ANY kind gets the stronger `LvimDbRowSel` bg as
+        -- its cursor marker. Tint depths sit in the ecosystem-list range (~0.08 base / 0.13 alt / 0.16 sel,
+        -- blended toward the accent); override any bg to retint.
+        LvimDbBgConnection = { bg = mtint(c.magenta, 0.08) }, -- a disconnected connection row
+        LvimDbBgConnectionOpen = { bg = mtint(c.green, 0.08) }, -- a connected connection row
+        LvimDbBgSchema = { bg = mtint(c.blue, 0.08) }, -- a schema / database row
+        LvimDbBgTable = { bg = mtint(c.yellow, 0.08) }, -- an object row: table (odd)
+        LvimDbBgTableAlt = { bg = mtint(c.yellow, 0.13) }, -- table (even, the zebra alt)
+        LvimDbBgView = { bg = mtint(c.cyan, 0.08) }, -- view (odd)
+        LvimDbBgViewAlt = { bg = mtint(c.cyan, 0.13) }, -- view (even)
+        LvimDbBgCollection = { bg = mtint(c.orange, 0.08) }, -- collection (odd)
+        LvimDbBgCollectionAlt = { bg = mtint(c.orange, 0.13) }, -- collection (even)
+        LvimDbBgKey = { bg = mtint(c.orange, 0.08) }, -- a redis key row (odd)
+        LvimDbBgKeyAlt = { bg = mtint(c.orange, 0.13) }, -- a redis key row (even)
+        LvimDbBgQueries = { bg = mtint(c.purple, 0.08) }, -- the saved-queries branch row (a container)
+        LvimDbBgQuery = { bg = mtint(c.purple, 0.08) }, -- a saved-query leaf (odd)
+        LvimDbBgQueryAlt = { bg = mtint(c.purple, 0.13) }, -- a saved-query leaf (even, the zebra alt)
+        LvimDbRowSel = { bg = mtint(c.blue, 0.16) }, -- the cursor row (any kind) — bg-only marker
         LvimDbGuide = { fg = hl.blend(c.fg_dark, c.bg, 0.6) }, -- tree guides / carets
         LvimDbCount = { fg = c.comment }, -- a "(12)" child count
         LvimDbEmpty = { fg = c.comment, italic = true },
         LvimDbDriver = { fg = c.yellow }, -- a driver-kind badge
+
+        -- SQL editor winbar ("editor → <conn>"): the icon, the "editor" label, the bound connection name
+        -- (green — matches a live connection), and the "(no connection)" placeholder when nothing is bound.
+        LvimDbEditorIcon = { fg = c.blue },
+        LvimDbEditorLabel = { fg = c.fg_dark },
+        LvimDbEditorConn = { fg = c.green, bold = true },
+        LvimDbEditorNone = { fg = c.comment, italic = true },
 
         -- result grid
         LvimDbHeader = { fg = c.blue, bg = mtint(c.blue, 0.2), bold = true }, -- column header row

@@ -382,12 +382,23 @@ local function open_dock()
             state.surface, state.buf = nil, nil
         end,
     }
+    -- Dock FULL WIDTH at the bottom of the tab (the chassis splits the far tabpage edge → the result spans
+    -- under BOTH the tree and the editor). This wraps the existing top row `[tree | editor]` into
+    -- `[ [tree | editor] / result ]`, so the tree shrinks to the top-left and its footer stays visible ABOVE
+    -- the result. The docked split keeps the full chrome (header tabs · grid · footer) and its own `<C-j/k>`
+    -- sector nav, whose TOP-edge `<C-k>` steps back up to the tree or editor above the cursor column
+    -- (escape_to_neighbor). A `<C-j>` from either top window descends onto the result (the chassis WinEnter
+    -- hook enters the docked panel).
     state.surface = surface.open({
-        mode = "float",
-        position = "bottom",
+        mode = "split",
+        dock = "below",
         title = title(),
         size = { height = { fixed = math.max(8, math.floor(vim.o.lines * 0.35)) } },
-        content = { blocks = { { id = "result", provider = provider } } },
+        -- Blank " " ring on the result panel (no drawn border): the CONTENT_BORDER marker resolves at open
+        -- time to the LIVE `config.content_border` (the shared { " ", … } ring), so the dock gets a 1-cell
+        -- breathing inset with no glyph — matching every other content panel — instead of the default rounded
+        -- ring a block with no border falls back to. A theme/border change to that one key flows through here.
+        content = { blocks = { { id = "result", provider = provider, border = surface.CONTENT_BORDER } } },
         header = {
             bars = {
                 surface.bar({ { "result_tab", "log_tab" } }, {
@@ -444,6 +455,18 @@ local function open_dock()
         },
         close_keys = k.close and { k.close } or {},
     })
+end
+
+--- Re-open the dock over a preserved session (used when the workspace tab is re-opened): if a result page
+--- or any call log survives in the module state, rebuild the dock and re-render it so the last result — or
+--- at least the call log — comes back exactly as it was. A no-op when nothing has run yet, so the dock only
+--- appears once there is something to show.
+function M.reopen()
+    if state.page == nil and #state.calls == 0 then
+        return
+    end
+    open_dock()
+    render()
 end
 
 --- Execute `statement` on `conn_id` and show its first page in the dock. Records
@@ -522,7 +545,7 @@ end
 --- Execute `statement`, first applying the destructive-statement guard: a DROP /
 --- TRUNCATE / unqualified DELETE|UPDATE prompts a confirm (config
 --- `confirm_destructive`) before it runs. This is THE entry point for free-text
---- statements (notes, ad-hoc run); the drawer preview (a SELECT) may use it too.
+--- statements (the SQL editor, ad-hoc runs); the drawer preview (a SELECT) may use it too.
 ---@param conn_id integer
 ---@param conn_name string
 ---@param driver string

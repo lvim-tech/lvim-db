@@ -76,7 +76,13 @@ function M.setup(opts)
     if ok_hl and hl.bind then
         hl.bind(require("lvim-db.highlights").build)
     end
-    require("lvim-db.ui.notes").setup()
+    -- Self-register the plugin's PANELS with the shared cursor module as `panel_ft` (persistent side
+    -- panels: the hardware cursor is hidden ONLY while the drawer / result dock is the CURRENT window, and
+    -- shown again in the code beside it) — so the user's central cursor config need not name our filetypes.
+    local ok_cursor, cursor = pcall(require, "lvim-utils.cursor")
+    if ok_cursor and cursor.register then
+        cursor.register({ panel_ft = { "lvim-db-drawer", "lvim-db-result" } })
+    end
     require("lvim-db.commands").setup()
 end
 

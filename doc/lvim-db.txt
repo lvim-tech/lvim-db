@@ -83,8 +83,8 @@ setup() merges your options into the live config. The full defaults: >lua
       keys = {                        -- the keys lvim-db binds in its OWN panels
           drawer = {                  -- (buffer-local; nothing global is touched).
               help = "g?",            -- the keymap CHEATSHEET
-              expand = "l", collapse = "h", action = "<CR>",
-              add = "a", edit = "e", delete = "x",
+              expand = "l", collapse = "h", disconnect = "<C-q>",
+              action = "<CR>", add = "a", edit = "e", delete = "x",
               refresh = "r", notes = "n", close = "q",
           },
           result = {
@@ -226,16 +226,62 @@ All calls are asynchronous (the daemon is spawned + handshaken on first use).
 ==============================================================================
 9. COMMAND                                                *lvim-db-command*
 
-`:LvimDb open`          toggle the connections drawer (side panel)
+`:LvimDb open`          open the db WORKSPACE — the whole client moves into its
+                        own dedicated tabpage (top row: drawer top-left + query
+                        editor top-right; a FULL-WIDTH result docked along the
+                        bottom), never over your code; a second `open` switches
+`:LvimDb toggle`        toggle the workspace tab, keeping the session state
+`:LvimDb close`         close the workspace tab, returning to where you were —
+                        the session (expanded/connected connections, the current
+                        result / call log) is PRESERVED for the next open/toggle
 `:LvimDb add`           add a saved connection (the DriverMeta-driven tabs form)
 `:LvimDb notes`         open the notes picker for a saved connection
 `:LvimDb log`           show the call-log tab in the result dock
-`:LvimDb close`         close the drawer and the result dock
 `:LvimDb status`        a one-line backend/store status snapshot
 `:LvimDb health`        open :checkhealth lvim-db
 
+THE WORKSPACE TAB                                        *lvim-db-workspace*
+
+:LvimDb open hosts the client in its OWN tabpage (marked internally so it is
+always found again, never over your buffers). Its three regions are REAL tiled
+windows in a two-row layout — a top row of the tree (top-left) and the query
+editor (top-right), and a FULL-WIDTH result docked along the bottom (spanning
+under both, so the tree shrinks to the top row and its footer stays visible
+above the result). They navigate as ONE set:
+
+  <C-j> / <C-k>   move between the top row and the result — from EITHER the tree
+                  or the editor <C-j> DESCENDS onto the full-width result, and
+                  <C-k> from the result's top steps back up.
+  <C-h> / <C-l>   move between the tree and the editor in the top row.
+
+Inside it the drawer's `q` tears the WHOLE workspace down — so an empty tab is
+never stranded — while the result dock's `q` closes just the result panel and
+keeps you in the workspace. The live database connections live in the daemon
+process, so closing and re-opening the workspace never re-connects.
+
 Drawer keys: l / <CR> connect-or-expand (a table's <CR> previews its rows),
-h collapse/disconnect, a add, e edit, x delete, r refresh, n notes, q close.
+h collapse the row (VISUAL only), <C-q> DISCONNECT the live connection, a add,
+e edit, x delete, r refresh, n notes, q close.
+
+The bottom key-hint bar is CONTEXT-AWARE: on a disconnected connection it shows a
+`<CR> connect` chip, on a connected one a `<C-q> disconnect` chip (plus the
+always-present help / close chips), swapping as the cursor moves.
+
+The tree carries a Nerd Font glyph per node kind — a plug for a disconnected
+connection that becomes a database once connected (with a lock / open-lock
+suffix for the link's encryption posture), a sitemap for a schema, and a
+table / eye (view) / cubes (collection) plus per-type glyphs for Redis keys.
+The FOUR levels are each a distinct, readable colour — connection (magenta →
+green when live), database/schema (blue), objects (table yellow / view cyan /
+collection orange), and columns/fields (full foreground) — so they read apart at
+a glance. Every CONTAINER row is also washed in a subtle BACKGROUND tint of its
+OWN colour (connection magenta/green, schema blue, objects in their object colour
+with an odd/even ZEBRA depth so adjacent same-type objects stay apart);
+column/field rows stay plain (the leaf tier). The wash is BACKGROUND-ONLY (the
+LvimDbBg* groups), so each row's fg + devicon read intact over it. The cursor row
+is marked on every kind by a stronger background-only tint (LvimDbRowSel) — all
+groups are config-overridable. The hardware cursor is hidden while the panel is
+focused (shown again in the code beside it).
 
 The drawer AND the result dock each carry a `help` chip on their bottom bar
 (`g?`) — the keymap CHEATSHEET of that panel, built from the live `keys` config,
@@ -265,7 +311,8 @@ All of these keys are configurable — see `keys` in |lvim-db-setup|.
 A failing test leaves the panel open with everything typed so far, so it can be
 fixed and retried. Secrets are saved as TEMPLATES (|lvim-db-credentials|).
 
-Result dock — two tabs (1/2 or r/L switch):
+Result dock — a bottom dock with NO drawn border (a blank breathing inset, the
+shared content_border ring, not a box) — two tabs (1/2 or r/L switch):
   Result: n / p next / previous page, y yank the page as TSV, e export, q close.
   Call log: one row per call with a state accent; <CR> re-runs a call, x cancels
   a running one.

@@ -30,9 +30,14 @@ local subcommands = {
         vim.cmd("checkhealth lvim-db")
     end,
 
-    --- Toggle the connections drawer (side panel).
+    --- Open the db workspace: move the whole client into its OWN tabpage (drawer + result + editor). Idempotent.
     open = function()
-        require("lvim-db.ui.drawer").toggle()
+        require("lvim-db.ui.workspace").open()
+    end,
+
+    --- Toggle the db workspace tab (open ⇄ close, keeping the session state).
+    toggle = function()
+        require("lvim-db.ui.workspace").toggle()
     end,
 
     --- Add a new saved connection (the DriverMeta-driven form).
@@ -40,37 +45,14 @@ local subcommands = {
         require("lvim-db.ui.form").open()
     end,
 
-    --- Close the result dock and the drawer.
+    --- Close the db workspace tab, returning to where you were (the session state is preserved for a re-open).
     close = function()
-        require("lvim-db.ui.result").close()
-        require("lvim-db.ui.drawer").close()
+        require("lvim-db.ui.workspace").close()
     end,
 
     --- Show the call-log tab in the result dock.
     log = function()
         require("lvim-db.ui.result").show_log()
-    end,
-
-    --- Open the notes picker for a saved connection (chosen via lvim-ui.select).
-    notes = function()
-        local conns = require("lvim-db").store.list_connections()
-        if #conns == 0 then
-            vim.notify("lvim-db: no saved connections — add one with :LvimDb add", vim.log.levels.WARN)
-            return
-        end
-        local items = {}
-        for _, c in ipairs(conns) do
-            items[#items + 1] = { label = ("  %s (%s)"):format(c.name, c.driver), name = c.name }
-        end
-        require("lvim-ui").select({
-            title = "Notes for connection",
-            items = items,
-            callback = function(confirmed, idx)
-                if confirmed then
-                    require("lvim-db.ui.notes").pick(items[idx].name)
-                end
-            end,
-        })
     end,
 }
 

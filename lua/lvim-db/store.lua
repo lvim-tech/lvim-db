@@ -15,13 +15,20 @@ local config = require("lvim-db.config")
 
 local M = {}
 
--- Bump on any schema change; `migrations` (below) transforms an older on-disk db.
-local SCHEMA_VERSION = 1
+-- Bump on any schema change; `migrations` (below) transforms an older on-disk db. v2 ADDED the
+-- `queries` table — a brand-new table needs no data transform (its sqlite.tbl handle CREATEs it on
+-- open), so there is no migration step for it; the bump only stamps the user_version.
+local SCHEMA_VERSION = 2
 
 -- A saved connection. `spec` is the JSON connection template the form produced.
 local CONNECTIONS = "connections"
 -- One executed statement, for the call-log / history tab.
 local HISTORY = "history"
+-- A saved query, scoped PER CONNECTION (the `conn` column is the connection name). Replaces the
+-- old file-based per-connection notes: the editor saves/loads SQL here and the drawer lists them
+-- under each connection's "Queries" branch. Column names avoid SQL reserved words (`sql` is fine;
+-- `name`/`conn` are already used by the other tables without issue).
+local QUERIES = "queries"
 
 local TABLES = {
     [CONNECTIONS] = {
@@ -40,6 +47,13 @@ local TABLES = {
         ms = { "integer" },
         rows = { "integer" },
         ts = { "integer" },
+    },
+    [QUERIES] = {
+        id = { "integer", primary = true, autoincrement = true },
+        conn = { "text", required = true }, -- connection name — the per-connection scope
+        name = { "text", required = true }, -- the saved query's name (unique WITHIN a conn; enforced by upsert)
+        sql = { "text", required = true }, -- the SQL body
+        updated_at = { "integer" }, -- last save (unix seconds)
     },
 }
 
@@ -163,6 +177,78 @@ function M.remove_connection(name)
         return false
     end
     return s:remove(CONNECTIONS, { name = name })
+end
+
+-- ─── saved queries (per connection) ──────────────────────────────────────────
+
+---@class LvimDbSavedQuery
+---@field id integer
+---@field conn string       the connection name this query is scoped to
+---@field name string
+---@field sql string
+---@field updated_at integer?
+
+--- All saved queries for a connection, ordered by name (stable for the tree listing).
+---@param conn string  connection name
+---@return LvimDbSavedQuery[]
+function M.list_queries(conn)
+    local s = open()
+    if not s then
+        return {}
+    end
+    local rows = s:find(QUERIES, { conn = conn })
+    if type(rows) ~= "table" then
+        return {}
+    end
+    table.sort(rows, function(a, b)
+        return (a.name or "") < (b.name or "")
+    end)
+    return rows
+end
+
+--- One saved query by (conn, name), or nil.
+---@param conn string
+---@param name string
+---@return LvimDbSavedQuery?
+function M.get_query(conn, name)
+    local s = open()
+    if not s then
+        return nil
+    end
+    local rows = s:find(QUERIES, { conn = conn, name = name })
+    if type(rows) == "table" and rows[1] then
+        return rows[1]
+    end
+    return nil
+end
+
+--- Insert or update a saved query (keyed by the (conn, name) pair). Returns success.
+---@param conn string
+---@param name string
+---@param sql string
+---@return boolean
+function M.save_query(conn, name, sql)
+    local s = open()
+    if not s then
+        return false
+    end
+    local existing = s:find(QUERIES, { conn = conn, name = name })
+    if type(existing) == "table" and existing[1] then
+        return s:update(QUERIES, { conn = conn, name = name }, { sql = sql, updated_at = os.time() })
+    end
+    return s:insert(QUERIES, { conn = conn, name = name, sql = sql, updated_at = os.time() }) ~= false
+end
+
+--- Delete a saved query by (conn, name). Returns success.
+---@param conn string
+---@param name string
+---@return boolean
+function M.delete_query(conn, name)
+    local s = open()
+    if not s then
+        return false
+    end
+    return s:remove(QUERIES, { conn = conn, name = name })
 end
 
 -- ─── history ─────────────────────────────────────────────────────────────────

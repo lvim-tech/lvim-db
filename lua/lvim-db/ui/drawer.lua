@@ -4,10 +4,12 @@
 -- lvim-files' tree — never a raw nvim_open_win), pinned to one edge and
 -- registered as a `panel_ft` so lvim-utils.cursor hides the cursor while it is
 -- the current window. The tree is three levels: saved CONNECTION → SCHEMA →
--- TABLE/VIEW/COLLECTION (a table expands once more to its COLUMNS). Per-node
--- actions: connect/expand (l or <CR>), collapse/disconnect (h), run a preview
--- select on a table (<CR>), add/edit/delete a connection, refresh. All schema
--- data comes from the daemon through the client API — the drawer holds no SQL.
+-- TABLE/VIEW/COLLECTION (a table expands once more to its COLUMNS). Each connection also carries a
+-- "Queries" BRANCH listing its saved queries from lvim-db's own store (metadata, so it shows even when
+-- the connection is disconnected); <CR> on a query loads it into the SQL editor, the delete key removes
+-- it. Per-node actions: connect/expand (l or <CR>), collapse/disconnect (h), run a preview select on a
+-- table (<CR>), add/edit/delete a connection, refresh. All schema data comes from the daemon through the
+-- client API — the drawer holds no SQL.
 --
 ---@module "lvim-db.ui.drawer"
 
@@ -19,22 +21,24 @@ local M = {}
 
 -- kind → { icon, highlight } for the lead glyph + label (Nerd Font, single width).
 local KIND = {
-    connection = { icon = "", hl = "LvimDbConnection" },
-    connection_open = { icon = "", hl = "LvimDbConnectionOpen" },
-    schema = { icon = "", hl = "LvimDbSchema" },
-    table = { icon = "", hl = "LvimDbTable" },
-    view = { icon = "", hl = "LvimDbView" },
-    collection = { icon = "", hl = "LvimDbCollection" },
-    column = { icon = "", hl = "LvimDbColumn" },
-    key = { icon = "", hl = "LvimDbKey" },
-    string = { icon = "", hl = "LvimDbKey" },
-    list = { icon = "", hl = "LvimDbKey" },
-    hash = { icon = "", hl = "LvimDbKey" },
-    set = { icon = "", hl = "LvimDbKey" },
-    zset = { icon = "", hl = "LvimDbKey" },
+    connection = { icon = "", hl = "LvimDbConnection" }, -- saved, disconnected (nf-fa-plug U+F1E6)
+    connection_open = { icon = "", hl = "LvimDbConnectionOpen" }, -- connected, live (nf-fa-database U+F1C0)
+    schema = { icon = "", hl = "LvimDbSchema" }, -- nf-fa-sitemap U+F0E8
+    queries = { icon = "", hl = "LvimDbQueries" }, -- saved-queries BRANCH (nf-fa-bookmark U+F02E)
+    query = { icon = "", hl = "LvimDbQuery" }, -- one saved query (nf-fa-file-code-o U+F1C9)
+    table = { icon = "", hl = "LvimDbTable" }, -- nf-fa-table U+F0CE
+    view = { icon = "", hl = "LvimDbView" }, -- nf-fa-eye U+F06E
+    collection = { icon = "", hl = "LvimDbCollection" }, -- nf-fa-cubes U+F1B3
+    column = { icon = "", hl = "LvimDbColumn" }, -- nf-fa-columns U+F0DB
+    key = { icon = "", hl = "LvimDbKey" }, -- redis key (nf-fa-key U+F084)
+    string = { icon = "", hl = "LvimDbKey" }, -- redis string (nf-fa-quote-left U+F10D)
+    list = { icon = "", hl = "LvimDbKey" }, -- redis list (nf-fa-list-ul U+F0CA)
+    hash = { icon = "", hl = "LvimDbKey" }, -- redis hash (nf-fa-hashtag U+F292)
+    set = { icon = "", hl = "LvimDbKey" }, -- redis set (nf-fa-th U+F00A)
+    zset = { icon = "", hl = "LvimDbKey" }, -- redis sorted set (nf-fa-sort-numeric-asc U+F162)
 }
-local CARET_OPEN = ""
-local CARET_CLOSED = ""
+local CARET_OPEN = "" -- nf-fa-caret_down U+F0D7
+local CARET_CLOSED = "" -- nf-fa-caret_right U+F0DA
 
 ---@class LvimDbDrawerState
 local state = {
@@ -45,6 +49,9 @@ local state = {
     ---@type table<string, LvimDbDrawerConn>  connection name → live drawer state
     conns = {},
     ns = api.nvim_create_namespace("LvimDbDrawer"),
+    content_hls = {}, ---@type table[]  the last render's fg spans ({line, col_start, col_end, group}); re-applied by paint()
+    nrows = 0, ---@type integer  how many rows the last render wrote (so paint() can stripe them)
+    footer_ctx = nil, ---@type "connected"|"disconnected"|"none"|nil  the focused row's state the footer was last built for
 }
 
 ---@class LvimDbDrawerConn
@@ -54,6 +61,7 @@ local state = {
 ---@field encrypted boolean?  whether the live link negotiated TLS
 ---@field tunneled boolean?   whether the live link rides an SSH tunnel
 ---@field expanded boolean
+---@field queries_open boolean?  whether the connection's saved-queries branch is expanded
 ---@field nodes table[]?      schema tree from the daemon (schema → children)
 ---@field open table<string, boolean>  expand state keyed by "schema" / "schema.table"
 
@@ -63,7 +71,7 @@ local function ns()
 end
 
 --- The live daemon conn_id for a saved connection name, if it is connected in
---- the drawer right now (so notes / ad-hoc runs reuse the open connection).
+--- the drawer right now (so the editor / ad-hoc runs reuse the open connection).
 ---@param name string
 ---@return integer? conn_id
 ---@return string? driver
@@ -116,6 +124,99 @@ local function push_row(lines, hls, descr, depth, caret, icon, icon_hl, label, l
     state.rows[lineno + 1] = descr
 end
 
+-- object `obj.kind` → its bg WASH group base (the "Alt" variant is the zebra even-row). Redis key kinds all
+-- share the key wash. Anything unmapped falls back to the table wash.
+local OBJ_BG = {
+    table = "LvimDbBgTable",
+    view = "LvimDbBgView",
+    collection = "LvimDbBgCollection",
+    key = "LvimDbBgKey",
+    string = "LvimDbBgKey",
+    list = "LvimDbBgKey",
+    hash = "LvimDbBgKey",
+    set = "LvimDbBgKey",
+    zset = "LvimDbBgKey",
+}
+
+--- The full-row bg WASH group for a row descriptor — its OWN accent tint (bg-only). Object rows alternate a
+--- base/"Alt" pair (the zebra, keyed by `alt`); connection rows switch on the live link; column / empty rows
+--- get no wash (nil → plain panel bg). The colour is bg-only so the node's label fg still reads over it.
+---@param descr table?  the row descriptor from render()
+---@param alt boolean   the zebra even-row (object rows only)
+---@return string?
+local function wash_group(descr, alt)
+    if not descr then
+        return nil
+    end
+    local kind = descr.kind
+    if kind == "connection" then
+        return (descr.conn and descr.conn.conn_id) and "LvimDbBgConnectionOpen" or "LvimDbBgConnection"
+    elseif kind == "schema" then
+        return "LvimDbBgSchema"
+    elseif kind == "queries" then
+        return "LvimDbBgQueries" -- the saved-queries BRANCH (a container row)
+    elseif kind == "query" then
+        return alt and "LvimDbBgQueryAlt" or "LvimDbBgQuery" -- saved-query leaves zebra like objects
+    elseif kind == "object" then
+        local base = OBJ_BG[descr.obj and descr.obj.kind] or "LvimDbBgTable"
+        return alt and (base .. "Alt") or base
+    end
+    return nil -- column / empty → plain
+end
+
+--- Paint the drawer buffer: the full-row bg WASH per node kind UNDER the content fg spans the last
+--- `render()` produced. Split out from `render()` because it must also run on CursorMoved so the selected
+--- marker follows the cursor WITHOUT rebuilding the lines — and because a re-render rewrites the buffer and
+--- wipes every extmark, the wash has to be (re)applied here, never set once on the side.
+---
+--- Wash policy (why bg-only, why per-kind colour):
+---   • Every CONTAINER row (connection / schema / object) is tinted in ITS OWN accent (the "тинт" canon) so
+---     the colour reads on both the label AND the row bg; COLUMN/field rows stay plain (leaf tier).
+---   • The tint is bg-ONLY — a `line_hl_group` carrying a fg (as the shared msgarea groups do) would
+---     override every label's colour, which is exactly why distinct colours would not read.
+---   • OBJECT rows additionally alternate two depths (a zebra), keyed by OBJECT-row index (not absolute line
+---     parity) so a run of sibling objects alternates cleanly even across an expanded table's column rows.
+---   • The SELECTED row of ANY kind takes the stronger bg-only `LvimDbRowSel` as its cursor marker, so the
+---     cursor is visible on a connection / schema / column row too — without wiping that row's node colour.
+local function paint()
+    if not (state.buf and api.nvim_buf_is_valid(state.buf)) then
+        return
+    end
+    api.nvim_buf_clear_namespace(state.buf, ns(), 0, -1)
+    local sel
+    if state.win and api.nvim_win_is_valid(state.win) then
+        sel = api.nvim_win_get_cursor(state.win)[1]
+    end
+    local obj_i, q_i = 0, 0
+    for lineno = 0, state.nrows - 1 do
+        local descr = state.rows[lineno + 1]
+        local alt = false
+        if descr and descr.kind == "object" then
+            obj_i = obj_i + 1 -- advance for EVERY object row (even a selected one) so the zebra stays stable
+            alt = (obj_i % 2) == 0
+        elseif descr and descr.kind == "query" then
+            q_i = q_i + 1 -- the saved-query leaves get their OWN zebra counter
+            alt = (q_i % 2) == 0
+        end
+        local group = (sel == lineno + 1) and "LvimDbRowSel" or wash_group(descr, alt)
+        if group then
+            pcall(api.nvim_buf_set_extmark, state.buf, ns(), lineno, 0, { line_hl_group = group })
+        end
+    end
+    for _, h in ipairs(state.content_hls) do
+        pcall(api.nvim_buf_set_extmark, state.buf, ns(), h[1], h[2], {
+            end_col = h[3],
+            hl_group = h[4],
+            priority = 220,
+        })
+    end
+end
+
+-- Forward declaration: the footer is rebuilt context-aware (connect ⇄ disconnect chip) from CursorMoved
+-- and after a connect/disconnect flips a row's state — both of which run through code defined above this
+-- point (M.refresh, render callbacks), so the name has to exist before them.
+local update_footer
+
 --- Rebuild the flat row list + render into the drawer buffer.
 local function render()
     if not (state.buf and api.nvim_buf_is_valid(state.buf)) then
@@ -141,7 +242,7 @@ local function render()
         -- or tunnelled) or an open-lock warning (plaintext) — never silent.
         local lock = ""
         if connected then
-            lock = (conn.encrypted or conn.tunneled) and " " or "  "
+            lock = (conn.encrypted or conn.tunneled) and " " or " " -- lock (nf-fa-lock U+F023) when encrypted/tunnelled, open lock (nf-fa-unlock U+F09C) plaintext
         end
         local suffix = ("(%s)%s"):format(conn.driver, lock)
         push_row(
@@ -156,6 +257,40 @@ local function render()
             KIND[kind].hl,
             suffix
         )
+
+        -- The saved-queries BRANCH — metadata, so it shows under an expanded connection REGARDLESS of the
+        -- live link (even disconnected). Its leaves come from lvim-db's own store, scoped to this connection.
+        if conn.expanded then
+            local queries = require("lvim-db").store.list_queries(name)
+            local qcaret = (#queries > 0) and (conn.queries_open and CARET_OPEN or CARET_CLOSED) or ""
+            push_row(
+                lines,
+                hls,
+                { kind = "queries", conn = conn },
+                1,
+                qcaret,
+                KIND.queries.icon,
+                KIND.queries.hl,
+                "Queries",
+                KIND.queries.hl,
+                ("(%d)"):format(#queries)
+            )
+            if conn.queries_open then
+                for _, q in ipairs(queries) do
+                    push_row(
+                        lines,
+                        hls,
+                        { kind = "query", conn = conn, query = q },
+                        2,
+                        "",
+                        KIND.query.icon,
+                        KIND.query.hl,
+                        q.name,
+                        KIND.query.hl
+                    )
+                end
+            end
+        end
 
         if conn.expanded and conn.nodes then
             for _, schema in ipairs(conn.nodes) do
@@ -215,19 +350,24 @@ local function render()
     vim.bo[state.buf].modifiable = true
     api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
     vim.bo[state.buf].modifiable = false
-    api.nvim_buf_clear_namespace(state.buf, ns(), 0, -1)
-    for _, h in ipairs(hls) do
-        pcall(api.nvim_buf_set_extmark, state.buf, ns(), h[1], h[2], {
-            end_col = h[3],
-            hl_group = h[4],
-        })
-    end
+    -- Hand the fg spans + row count to paint(), which lays the stripes down and re-applies these on top —
+    -- the same code path CursorMoved uses, so the render and the cursor-follow selection never diverge.
+    state.content_hls = hls
+    state.nrows = #lines
+    paint()
 end
 
---- Public: re-render if open (used after an async data fetch resolves).
+--- Public: re-render if open (used after an async data fetch resolves). Also refreshes the context footer,
+--- since an async resolve (a connect completing) flips the focused row's connect-state under a stationary
+--- cursor — so the connect chip must become the disconnect chip without a cursor move.
 function M.refresh()
     if M.is_open() then
-        vim.schedule(render)
+        vim.schedule(function()
+            render()
+            if update_footer then
+                update_footer()
+            end
+        end)
     end
 end
 
@@ -264,13 +404,17 @@ local function current_row()
     return state.rows[line]
 end
 
---- Connect (if needed) then fetch + expand a connection's schema.
+--- Expand a connection (connecting + fetching its schema if needed). Expanding a connection also SELECTS it:
+--- it becomes the SQL editor's active connection. The row expands IMMEDIATELY (so the saved-queries branch
+--- shows at once — it needs no live link); the schema tree fills in asynchronously once the connect resolves.
 ---@param conn LvimDbDrawerConn
 local function expand_connection(conn)
     local db = require("lvim-db")
+    -- Selecting/connecting a connection binds it as the editor's active connection.
+    require("lvim-db.ui.editor").set_active(conn.name)
+    conn.expanded = true
+    render()
     if conn.conn_id then
-        conn.expanded = true
-        render()
         return
     end
     db.connect_saved(conn.name, function(conn_id, err, info)
@@ -287,7 +431,6 @@ local function expand_connection(conn)
                 return
             end
             conn.nodes = nodes or {}
-            conn.expanded = true
             M.refresh()
         end)
     end)
@@ -306,6 +449,13 @@ local function toggle(open)
         else
             row.conn.expanded = false
             render()
+        end
+    elseif row.kind == "queries" then
+        row.conn.queries_open = open or nil
+        render()
+    elseif row.kind == "query" then
+        if open then
+            require("lvim-db.ui.editor").load_query(row.conn.name, row.query.name)
         end
     elseif row.kind == "schema" then
         row.conn.open[row.schema.name] = open or nil
@@ -337,6 +487,11 @@ local function default_action()
     end
     if row.kind == "connection" then
         expand_connection(row.conn)
+    elseif row.kind == "queries" then
+        toggle(not row.conn.queries_open)
+    elseif row.kind == "query" then
+        -- Load the saved query into the editor (replacing its content) and focus the editor window.
+        require("lvim-db.ui.editor").load_query(row.conn.name, row.query.name)
     elseif row.kind == "schema" then
         toggle(not row.conn.open[row.schema.name])
     elseif row.kind == "object" then
@@ -357,12 +512,12 @@ end
 local HELP = {
     { "action", "connect / expand / preview the row" },
     { "expand", "expand (connect the connection)" },
-    { "collapse", "collapse (disconnect)" },
+    { "collapse", "collapse the row (visual)" },
+    { "disconnect", "disconnect the connection" },
     { "add", "add a connection" },
     { "edit", "edit the focused connection" },
     { "delete", "delete the focused connection" },
     { "refresh", "re-read the schema" },
-    { "notes", "open the notes picker" },
     { "help", "this help" },
     { "close", "close the drawer" },
 }
@@ -387,6 +542,99 @@ end
 
 -- ── keymaps ──────────────────────────────────────────────────────────────────
 
+--- The drawer's `close` action. When the drawer lives inside the db workspace tab (the normal case), `q`
+--- must tear the WHOLE workspace down — otherwise closing the drawer would strand an empty tab. Routed
+--- through `workspace.close()`, which teardown-calls `M.close()` (the surface path) directly, so there is
+--- no recursion back into this handler. Outside a workspace it just closes the drawer.
+local function request_close()
+    local ws = require("lvim-db.ui.workspace")
+    if ws.is_open() then
+        ws.close()
+    else
+        M.close()
+    end
+end
+
+--- Close the LIVE connection on the focused connection row (a real disconnect, not the visual `collapse`).
+--- Tells the daemon to drop the link, then optimistically clears the drawer's live state for that
+--- connection so it flips straight back to the disconnected icon/colour (the daemon closes async and we
+--- never reuse the stale id). A no-op unless the cursor is on a CONNECTED connection row.
+local function disconnect_row()
+    local row = current_row()
+    if not (row and row.kind == "connection" and row.conn and row.conn.conn_id) then
+        return
+    end
+    local conn = row.conn
+    require("lvim-db").disconnect(conn.conn_id, function(err)
+        if err then
+            vim.schedule(function()
+                vim.notify("lvim-db: disconnect '" .. conn.name .. "' failed: " .. tostring(err), vim.log.levels.ERROR)
+            end)
+        end
+    end)
+    -- Drop the live link + schema tree, but KEEP the connection expanded: its saved-queries branch is
+    -- metadata (not a live thing), so it stays visible after a disconnect. Re-expand/connect refills schema.
+    conn.conn_id, conn.nodes = nil, nil
+    conn.encrypted, conn.tunneled = nil, nil
+    render()
+    if update_footer then
+        update_footer() -- the row flipped connected → disconnected under a stationary cursor
+    end
+end
+
+--- The focused row's connect-state, for the context footer: a DISCONNECTED / CONNECTED connection row, or
+--- "none" for anything else (a schema / object / column / the empty state).
+---@return "connected"|"disconnected"|"none"
+local function focused_ctx()
+    local row = current_row()
+    if not (row and row.kind == "connection" and row.conn) then
+        return "none"
+    end
+    return row.conn.conn_id and "connected" or "disconnected"
+end
+
+--- Build the drawer footer band for a given focused-row context: the CONTEXT chip first (⏎ connect on a
+--- disconnected connection, C-q disconnect on a connected one, nothing otherwise), then the always-present
+--- help + close chips. Returns the `surface.open` `footer` spec.
+---@param ctx "connected"|"disconnected"|"none"
+---@return table
+local function build_footer(ctx)
+    local k = config.keys.drawer
+    local items = {}
+    if ctx == "disconnected" and k.action then
+        items[#items + 1] =
+            surface.button({ name = "connect", key = k.action, style = "action", run = default_action }, "action")
+    elseif ctx == "connected" and k.disconnect then
+        items[#items + 1] = surface.button(
+            { name = "disconnect", key = k.disconnect, style = "action", run = disconnect_row },
+            "action"
+        )
+    end
+    items[#items + 1] =
+        surface.button({ name = "help", key = k.help or "g?", style = "action", run = show_help }, "action")
+    items[#items + 1] =
+        surface.button({ name = "close", key = k.close or "q", style = "action", run = request_close }, "action")
+    -- LEFT-aligned (not centered): the leading CONTEXT chip is the priority action, so on the narrow 36-col
+    -- drawer it stays fully readable and the responsive bar overflows only the trailing help/close hints (their
+    -- keys still work) — instead of a centered bar clipping the important chip's own key badge to "q>".
+    return { bars = { { align = "left", items = items } } }
+end
+
+--- Rebuild the context footer IF the focused row's connect-state changed since the last build (so it is not
+--- rebuilt on every cursor move, only when the connect/disconnect chip actually needs to swap). Reused by the
+--- CursorMoved autocmd (alongside the stripe repaint) and after a connect/disconnect flips a row.
+update_footer = function()
+    if not (M.is_open() and state.surface and state.surface.set_footer) then
+        return
+    end
+    local ctx = focused_ctx()
+    if ctx == state.footer_ctx then
+        return
+    end
+    state.footer_ctx = ctx
+    state.surface.set_footer(build_footer(ctx))
+end
+
 --- Bind the drawer's keys THROUGH the chassis `map` (the provider's `keys` hook), never with a raw
 --- `vim.keymap.set`: only the keys the chassis binds itself land in its `used` set, and that set is what
 --- makes the panel OWN a chord PREFIX (the `g` of `g?`) — otherwise a `g?` typed at human speed falls
@@ -408,6 +656,7 @@ local function set_keys(chassis_map)
     map(k.collapse, function()
         toggle(false)
     end)
+    map(k.disconnect, disconnect_row)
     map(k.action, default_action)
     map(k.add, function()
         require("lvim-db.ui.form").open()
@@ -432,6 +681,17 @@ local function set_keys(chassis_map)
                     end
                 end,
             })
+        elseif row and row.kind == "query" then
+            require("lvim-ui").confirm({
+                title = "Delete query",
+                message = ("Delete saved query '%s' (connection '%s')?"):format(row.query.name, row.conn.name),
+                callback = function(yes)
+                    if yes then
+                        require("lvim-db").store.delete_query(row.conn.name, row.query.name)
+                        render()
+                    end
+                end,
+            })
         end
     end)
     map(k.refresh, function()
@@ -443,13 +703,16 @@ local function set_keys(chassis_map)
             end)
         end
     end)
-    map(k.notes, function()
-        local row = current_row()
-        if row and row.conn then
-            require("lvim-db.ui.notes").pick(row.conn.name)
-        end
-    end)
-    map(k.close, M.close)
+    map(k.close, request_close)
+    -- Region navigation: the tree, the editor and the full-width result are one coherent set of tiled
+    -- windows, so `<C-h/j/k/l>` move between them (directional `<C-w>` nav — the tree is top-left, so `<C-l>`
+    -- reaches the editor and `<C-j>` descends onto the result below). `h`/`l` remain the tree's own
+    -- collapse/expand — only the Ctrl chords navigate. Matches the lvim-ui chassis sector-nav convention.
+    for lhs, nav in pairs({ ["<C-h>"] = "h", ["<C-j>"] = "j", ["<C-k>"] = "k", ["<C-l>"] = "l" }) do
+        chassis_map(lhs, function()
+            pcall(vim.cmd, "wincmd " .. nav)
+        end)
+    end
 end
 
 -- ── open / close ─────────────────────────────────────────────────────────────
@@ -466,7 +729,10 @@ function M.open(enter)
     load_connections()
 
     local provider = {
-        cursorline = true,
+        -- No 'cursorline': the SELECTED-row look is the shared `LvimUiMsgAreaSel*` tint painted by paint(),
+        -- moved by the CursorMoved autocmd below — a themed selection that matches the rest of the ecosystem
+        -- instead of the plain CursorLine bar (and never doubles a bg with the stripes).
+        cursorline = false,
         filetype = "lvim-db-drawer",
         size = function()
             local width = config.drawer_width or 36
@@ -475,6 +741,20 @@ function M.open(enter)
         update = function(pan)
             state.buf, state.win = pan.buf, pan.win
             vim.bo[pan.buf].buftype = "nofile"
+            -- On every cursor move: repaint the stripes/selection so the selected tint tracks the cursor row
+            -- (paint() only re-lays extmarks — no line rebuild), AND refresh the context footer so its
+            -- connect/disconnect chip matches the focused row (update_footer no-ops unless the state changed).
+            -- Buffer-scoped + cleared first so a re-open on a fresh buffer never stacks duplicate autocmds.
+            local aug = api.nvim_create_augroup("LvimDbDrawerPaint", { clear = false })
+            api.nvim_clear_autocmds({ group = aug, buffer = pan.buf })
+            api.nvim_create_autocmd("CursorMoved", {
+                group = aug,
+                buffer = pan.buf,
+                callback = function()
+                    paint()
+                    update_footer()
+                end,
+            })
             render()
         end,
         keys = function(map, pan)
@@ -497,31 +777,17 @@ function M.open(enter)
         size = { width = { fixed = config.drawer_width or 36 } },
         content = { blocks = { { id = "drawer", provider = provider } } },
         close_keys = {},
-        -- A key-hint bar pinned to the drawer's bottom row: the panel had NONE, so its keys — and the
-        -- cheatsheet itself — were undiscoverable. Real `surface.button`s, no ● separators (the drawer is 36
-        -- columns wide and they would cost the chips their place).
-        footer = {
-            bars = {
-                {
-                    align = "center",
-                    items = {
-                        surface.button(
-                            { name = "help", key = config.keys.drawer.help or "g?", style = "action", run = show_help },
-                            "action"
-                        ),
-                        surface.button({
-                            name = "close",
-                            key = config.keys.drawer.close or "q",
-                            style = "action",
-                            run = function()
-                                M.close()
-                            end,
-                        }, "action"),
-                    },
-                },
-            },
-        },
+        -- A key-hint bar pinned to the drawer's bottom row (the panel had NONE, so its keys were
+        -- undiscoverable). CONTEXT-AWARE: `build_footer` prepends a `⏎ connect` / `C-q disconnect` chip for
+        -- the focused connection row before the always-present help + close chips; the CursorMoved autocmd
+        -- swaps it via `set_footer` when the focused row's connect-state changes.
+        footer = build_footer("none"),
     })
+    state.footer_ctx = "none"
+    -- The cursor opens on the first row (often a connection) — sync the chip to it once the surface exists.
+    if update_footer then
+        vim.schedule(update_footer)
+    end
 end
 
 --- Close the drawer. Idempotent.

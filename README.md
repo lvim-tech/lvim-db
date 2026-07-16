@@ -113,7 +113,8 @@ require("lvim-db").setup({
         drawer = {
             help = "g?", -- the keymap CHEATSHEET (also a `help` chip on the drawer's bar)
             expand = "l", -- expand the row / connect
-            collapse = "h", -- collapse the row / disconnect
+            collapse = "h", -- collapse the row (visual only — keeps the live link)
+            disconnect = "<C-q>", -- close the live connection on the focused connection row
             action = "<CR>", -- connect, expand, or preview a table's first rows
             add = "a", -- open the connection form (add)
             edit = "e", -- open the connection form on the focused connection
@@ -212,13 +213,36 @@ This also covers token-style provider auth, e.g. an AWS RDS IAM token:
 
 ## Commands
 
-- `:LvimDb open` — toggle the connections drawer (side panel)
+- `:LvimDb open` — open the db **workspace**: the whole client moves into its own dedicated
+  tabpage — a top row of the connections drawer (top-left) and the query editor (top-right), with
+  the result as a **full-width** dock along the bottom — never drawn over your code.
+  Idempotent — a second `open` just switches to the tab.
+- `:LvimDb toggle` — toggle the workspace tab (open ⇄ close), keeping the session state.
+- `:LvimDb close` — close the workspace tab and return to where you were. The in-memory session
+  (the drawer's expanded/connected connections and the current result/call log) is **preserved**,
+  so the next `open`/`toggle` restores the workspace exactly as you left it.
 - `:LvimDb add` — add a saved connection (the DriverMeta-driven `lvim-ui.tabs` form)
 - `:LvimDb notes` — open the notes picker for a saved connection
 - `:LvimDb log` — show the call-log tab in the result dock
-- `:LvimDb close` — close the drawer and the result dock
 - `:LvimDb status` — a one-line backend/store status snapshot
 - `:LvimDb health` — open `:checkhealth lvim-db`
+
+### The workspace tab
+
+`:LvimDb open` hosts the client in its OWN tabpage (marked internally so it is always found again,
+never over your buffers). Its three regions are **real tiled windows** in a two-row layout — a top
+row of the tree (top-left) and the query editor (top-right), and a **full-width result** docked
+along the bottom (spanning under both, so the tree shrinks to the top row and its footer stays
+visible above the result). They navigate as **one coherent set**:
+
+- `<C-j>` / `<C-k>` move between the top row and the result — from **either** the tree or the editor
+  `<C-j>` **descends** onto the full-width result, and `<C-k>` from the result's top steps back up.
+- `<C-h>` / `<C-l>` move between the tree and the editor in the top row.
+
+Inside the drawer, `q` (close) tears the **whole workspace** down — so you never strand an empty
+tab — while the result dock's `q` closes just the result panel and leaves you in the workspace.
+The live database connections live in the daemon process, so closing and re-opening the workspace
+never re-connects.
 
 ### Connection form
 
@@ -246,12 +270,34 @@ retried. Secrets are saved as templates (see [Credentials](#credentials)), never
 ### Drawer keys
 
 - `l` / `<CR>` — connect / expand a node (a table's `<CR>` previews its first rows)
-- `h` — collapse / disconnect
+- `h` — collapse the row (visual only — does **not** drop the live link)
+- `<C-q>` — **disconnect** the focused connection (closes the live link; the row flips back to
+  the disconnected icon/colour)
 - `a` — add · `e` — edit · `x` — delete · `r` — refresh schema · `n` — notes · `q` — close
+
+The bottom **key-hint bar is context-aware**: on a disconnected connection it shows a `⏎ connect`
+chip, on a connected one a `C-q disconnect` chip (plus the always-present help / close chips),
+swapping as the cursor moves.
+
+The tree carries a Nerd Font glyph per node kind — a **plug** for a disconnected connection that
+becomes a **database** once connected (with a **lock** / **open-lock** suffix for the link's
+encryption posture), a **sitemap** for a schema, a **table** / **eye** (view) / **cubes**
+(collection) for its objects, and per-type glyphs for Redis keys. The four levels are each a
+**distinct, readable colour** — connection (magenta → green when live), database/schema (blue),
+objects (table yellow · view cyan · collection orange), and columns/fields (full foreground) — so
+they read apart at a glance. Every **container row** is also washed in a subtle **background tint of
+its own colour** (connection magenta/green, schema blue, objects in their object colour with an
+odd/even **zebra** depth so adjacent same-type objects stay apart); column/field rows stay plain (the
+leaf tier, so the washed containers stand out). The wash is **background-only** (`LvimDbBg*` groups),
+so each row's fg + devicon read intact over it. The **cursor row** is marked on every kind by a
+stronger background-only tint (`LvimDbRowSel`) — all groups are config-overridable. The hardware
+cursor is hidden while the panel is focused (shown again in the code beside it).
 
 ### Result dock
 
-Two tabs — the **result grid** and the **call log** — switchable with `1`/`2` (or `r`/`L`):
+A bottom dock with **no drawn border** — a blank breathing inset (the shared `content_border`
+ring) rather than a box. Two tabs — the **result grid** and the **call log** — switchable with
+`1`/`2` (or `r`/`L`):
 
 - Result: `n` / `p` — next / previous page · `y` — yank the page as TSV · `e` — export · `q` — close
 - Call log: one row per call with a state accent (running / done / failed); `<CR>` re-runs a call,
