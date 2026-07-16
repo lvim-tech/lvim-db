@@ -82,8 +82,6 @@ require("lvim-db").setup({
     -- Rows the result grid pulls per page. The daemon buffers the whole result and
     -- serves slices, so this only bounds how much Neovim holds/redraws at once.
     page_size = 200,
-    -- Default window layout for lvim-db's UI surfaces: "area" | "float" | "bottom".
-    layout = "area",
     -- Width (columns) of the connections drawer side panel.
     drawer_width = 36,
     -- Prompt before running a statement that matches destructive_patterns.

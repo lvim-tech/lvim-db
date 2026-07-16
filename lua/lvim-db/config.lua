@@ -10,7 +10,6 @@
 ---@class LvimDbConfig
 ---@field daemon_path      string?                 Explicit path to the lvim-db-daemon binary; nil = auto-probe
 ---@field page_size        integer                 Rows fetched per result page (the pagination band's page)
----@field layout           "area"|"float"|"bottom" Default window layout for lvim-db's UI surfaces
 ---@field drawer_width     integer                 Width (columns) of the connections drawer side panel
 ---@field confirm_destructive boolean              Confirm before running a statement matching `destructive_patterns`
 ---@field destructive_patterns string[]            Lua patterns (case-insensitive) that trigger the destructive guard
@@ -77,8 +76,6 @@ return {
     -- Rows the result grid pulls per page. The daemon buffers the whole result and
     -- serves slices, so this only bounds how much Neovim holds/redraws at once.
     page_size = 200,
-    -- Default layout token for lvim-db's windows; a command may override per-invocation.
-    layout = "area",
     -- Width (columns) of the connections drawer side panel.
     drawer_width = 36,
     -- Guard destructive statements: prompt via lvim-ui.confirm before executing one

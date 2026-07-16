@@ -21,11 +21,6 @@ local function check_config(h)
         h.error("config.page_size must be a number > 0")
         ok = false
     end
-    local layouts = { area = true, float = true, bottom = true }
-    if not layouts[config.layout] then
-        h.error(("config.layout must be 'area'|'float'|'bottom' (got %s)"):format(vim.inspect(config.layout)))
-        ok = false
-    end
     if type(config.confirm_destructive) ~= "boolean" then
         h.error("config.confirm_destructive must be a boolean")
         ok = false

@@ -68,7 +68,6 @@ setup() merges your options into the live config. The full defaults: >lua
       daemon_path = nil,              -- nil ⇒ probe $LVIM_DB_DAEMON, native/build,
                                       --      native/target/release
       page_size = 200,                -- rows the grid pulls per page
-      layout = "area",               -- "area" | "float" | "bottom"
       confirm_destructive = true,     -- prompt before a destructive statement
       destructive_patterns = {        -- case-insensitive Lua patterns
           "^%s*drop%s",
