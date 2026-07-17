@@ -15,7 +15,7 @@ use duckdb::Connection as DuckConn;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
-use crate::spec::{AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value};
+use crate::spec::{AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value};
 
 const PARAMS: &[ParamSpec] = &[ParamSpec {
     key: "file",
@@ -217,33 +217,33 @@ impl Connection for DuckdbConnection {
         Ok(schemas)
     }
 
-    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
-        let schema_pred = match &obj.schema {
-            Some(s) => format!("AND table_schema = '{}'", s.replace('\'', "''")),
-            None => String::new(),
+    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
+        // DuckDB implements sqlite's PRAGMA table_info, which is the only one of its catalogs that reports
+        // the primary key per column (duckdb_columns() does not).
+        let qname = match &obj.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s.replace('"', "\"\""), obj.name.replace('"', "\"\"")),
+            None => format!("\"{}\"", obj.name.replace('"', "\"\"")),
         };
-        let sql = format!(
-            "SELECT column_name, data_type FROM information_schema.columns \
-             WHERE table_name = '{}' {} ORDER BY ordinal_position",
-            obj.name.replace('\'', "''"),
-            schema_pred
-        );
-        let (_c, rows, _a) = self.run(sql).await?;
+        let (_c, rows, _a) = self.run(format!("PRAGMA table_info({qname})")).await?;
         Ok(rows
             .into_iter()
-            .map(|r| Column {
-                name: match r.first() {
+            .map(|r| TableColumn {
+                name: match r.get(1) {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
                 },
-                type_name: match r.get(1) {
+                type_name: match r.get(2) {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
+                },
+                primary: match r.get(5) {
+                    Some(Value::Bool(b)) => *b,
+                    Some(Value::Int(i)) => *i > 0,
+                    _ => false,
                 },
             })
             .collect())
     }
-
     async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
         // duckdb_indexes() is the catalog view; it exposes the index's SQL rather than a column vector, so
         // the column list is not reconstructed here — `expressions` is a duckdb-internal rendering, and

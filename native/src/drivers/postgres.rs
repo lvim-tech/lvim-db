@@ -15,7 +15,7 @@ use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use crate::driver::{CancelHandle, Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value,
 };
 
 // ── driver metadata ──────────────────────────────────────────────────────────
@@ -361,36 +361,51 @@ impl Connection for PgConnection {
         Ok(schemas)
     }
 
-    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
-        // Bindable params aren't available on the simple protocol; the identifiers
-        // come from our own schema tree (not user free-text), and are quoted.
+    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
+        // Bindable params aren't available on the simple protocol; the identifiers come from our own schema
+        // tree (not user free-text), and are quoted. The primary flag joins pg_index — information_schema
+        // does not carry it.
         let schema_pred = match &obj.schema {
-            Some(s) => format!("AND table_schema = '{}'", s.replace('\'', "''")),
+            Some(s) => format!("AND c.table_schema = '{}'", s.replace('\'', "''")),
             None => String::new(),
         };
+        let qual = match &obj.schema {
+            Some(s) => format!("{}.{}", s.replace('\'', "''"), obj.name.replace('\'', "''")),
+            None => obj.name.replace('\'', "''"),
+        };
         let sql = format!(
-            "SELECT column_name, data_type FROM information_schema.columns \
-             WHERE table_name = '{}' {} ORDER BY ordinal_position",
+            "SELECT c.column_name, c.data_type, (pk.col IS NOT NULL) AS is_pk \
+             FROM information_schema.columns c \
+             LEFT JOIN ( \
+               SELECT a.attname AS col FROM pg_index i \
+               JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+               WHERE i.indrelid = '{}'::regclass AND i.indisprimary \
+             ) pk ON pk.col = c.column_name \
+             WHERE c.table_name = '{}' {} ORDER BY c.ordinal_position",
+            qual,
             obj.name.replace('\'', "''"),
             schema_pred
         );
         let (_c, rows, _a) = self.simple(&sql).await?;
         Ok(rows
             .into_iter()
-            .map(|r| {
-                let name = match r.first() {
+            .map(|r| TableColumn {
+                name: match r.first() {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
-                };
-                let ty = match r.get(1) {
+                },
+                type_name: match r.get(1) {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
-                };
-                Column { name, type_name: ty }
+                },
+                primary: match r.get(2) {
+                    Some(Value::Bool(b)) => *b,
+                    Some(Value::Text(s)) => s == "t" || s == "true",
+                    _ => false,
+                },
             })
             .collect())
     }
-
     async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
         // pg_index is the catalog's own truth. `indkey` is the ordered attribute vector, so unnesting it
         // WITH ORDINALITY keeps the index's COLUMN ORDER (which matters — an index on (a,b) is not (b,a));

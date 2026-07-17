@@ -268,6 +268,27 @@ pub struct Column {
     pub type_name: String,
 }
 
+/// One column of a browsable OBJECT — what the drawer's `Columns` facet lists.
+///
+/// Deliberately NOT the same type as `Column` above, which is a RESULT column: a query result has no primary
+/// key (its rows may come from a join, an aggregate, an expression), so carrying `primary` there would put a
+/// permanently-false field on every result set and invite someone to trust it. They are two different
+/// questions — "what did this query return" and "how is this object defined" — and only the second has an
+/// answer here.
+///
+/// `primary` is load-bearing, not decoration: it is what lets the result grid address ONE row for an edit.
+/// It must come from the COLUMNS and not from the primary INDEX, because the two disagree — sqlite makes no
+/// index at all for `id INTEGER PRIMARY KEY` (that column is the rowid alias), so an index-derived key calls
+/// an obviously-keyed table unaddressable.
+#[derive(Debug, Clone, Serialize)]
+pub struct TableColumn {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// Part of the object's identifying key (a PK column; mongo's `_id`; a CQL partition/clustering key).
+    pub primary: bool,
+}
+
 /// A schema-tree node (schema → table/view/collection). `kind` drives the icon.
 #[derive(Debug, Clone, Serialize)]
 pub struct Node {

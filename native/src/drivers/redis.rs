@@ -14,7 +14,7 @@ use serde_json::json;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
-use crate::spec::{AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, Value};
+use crate::spec::{AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value};
 
 const PARAMS: &[ParamSpec] = &[
     ParamSpec {
@@ -318,7 +318,8 @@ impl Connection for RedisConnection {
         }])
     }
 
-    async fn columns(&mut self, _obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
+    async fn columns(&mut self, _obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
+        // A key/value store has no columns to describe, and therefore no key to address a "row" by.
         Ok(Vec::new())
     }
 

@@ -16,7 +16,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -248,21 +248,31 @@ impl Connection for MssqlConnection {
         Ok(schemas)
     }
 
-    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
+    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
+        // The primary flag comes from sys.indexes/index_columns: INFORMATION_SCHEMA.COLUMNS has no key info.
         let schema_pred = match &obj.schema {
-            Some(s) => format!("AND TABLE_SCHEMA = '{}'", s.replace('\'', "''")),
+            Some(s) => format!("AND s.name = '{}'", s.replace('\'', "''")),
             None => String::new(),
         };
         let sql = format!(
-            "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS \
-             WHERE TABLE_NAME = '{}' {} ORDER BY ORDINAL_POSITION",
+            "SELECT c.name, TYPE_NAME(c.user_type_id), \
+                    CASE WHEN pk.column_id IS NULL THEN 0 ELSE 1 END \
+             FROM sys.columns c \
+             JOIN sys.tables t ON t.object_id = c.object_id \
+             JOIN sys.schemas s ON s.schema_id = t.schema_id \
+             LEFT JOIN ( \
+               SELECT ic.object_id, ic.column_id FROM sys.index_columns ic \
+               JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
+               WHERE i.is_primary_key = 1 \
+             ) pk ON pk.object_id = c.object_id AND pk.column_id = c.column_id \
+             WHERE t.name = '{}' {} ORDER BY c.column_id",
             obj.name.replace('\'', "''"),
             schema_pred
         );
         let (_c, rows) = self.run(&sql).await?;
         Ok(rows
             .into_iter()
-            .map(|r| Column {
+            .map(|r| TableColumn {
                 name: match r.first() {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
@@ -271,10 +281,10 @@ impl Connection for MssqlConnection {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
                 },
+                primary: matches!(r.get(2), Some(Value::Int(i)) if *i != 0),
             })
             .collect())
     }
-
     async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
         // sys.index_columns is the per-column table, ordered by key_ordinal — the fold shape. A heap has an
         // unnamed index_id 0 row, which is not an index and is excluded.

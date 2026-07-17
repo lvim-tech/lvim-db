@@ -15,7 +15,7 @@ use rusqlite::Connection as SqliteConn;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
-use crate::spec::{AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value};
+use crate::spec::{AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value};
 
 const PARAMS: &[ParamSpec] = &[ParamSpec {
     key: "file",
@@ -187,13 +187,16 @@ impl Connection for SqliteConnection {
         }])
     }
 
-    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
+    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
         let sql = format!("PRAGMA table_info('{}')", obj.name.replace('\'', "''"));
         let (_c, rows, _a) = self.run(sql).await?;
-        // table_info → (cid, name, type, notnull, dflt, pk); name=1, type=2.
+        // table_info → (cid, name, type, notnull, dflt, pk); name=1, type=2, pk=5.
+        // `pk` is the 1-based position within the primary key (0 = not in it), which is ALSO how an
+        // `INTEGER PRIMARY KEY` reports — and that column has no index at all (it is the rowid alias), so
+        // this PRAGMA is the only place sqlite admits to having a key.
         Ok(rows
             .into_iter()
-            .map(|r| Column {
+            .map(|r| TableColumn {
                 name: match r.get(1) {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
@@ -202,10 +205,10 @@ impl Connection for SqliteConnection {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
                 },
+                primary: matches!(r.get(5), Some(Value::Int(i)) if *i > 0),
             })
             .collect())
     }
-
     async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
         let esc = obj.name.replace('\'', "''");
         // index_list → (seq, name, unique, origin, partial). `origin` is 'pk' for the implicit primary-key

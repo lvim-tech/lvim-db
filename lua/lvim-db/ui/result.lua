@@ -30,6 +30,12 @@ local state = {
     ---@type table[]  the session CALL LOG (newest last): { call_id, conn_id, conn, driver, statement, state, ms, rows }
     calls = {},
     log_rows = {}, ---@type table[]  line → call descriptor for the log view
+    ---@type table?  where the current rows CAME FROM — `{ schema, object, key }` — set only when the run was
+    --- a single-OBJECT preview (the drawer's `Data` facet). nil for an ad-hoc statement, and that is not a
+    --- gap: an arbitrary query has no answer to "which table is this cell", so its rows are not addressable
+    --- and the grid stays read-only. `key` is the object's identifying columns, resolved lazily (see
+    --- `resolve_key`): the PRIMARY-key index's columns for SQL, `_id` for mongo.
+    origin = nil,
 }
 
 ---@return boolean
@@ -469,6 +475,60 @@ function M.reopen()
     render()
 end
 
+-- ── addressing a row (what makes editing possible at all) ────────────────────
+--
+-- To change or delete ONE row, the grid must be able to name that row and no other. Two things are needed
+-- and BOTH can be absent, in which case the honest answer is "read-only", not a best guess:
+--
+--   1. an ORIGIN — these rows are one object's. An arbitrary JOIN has no answer to "which table does this
+--      cell belong to", so only the drawer's `Data` facet marks a result as addressable.
+--   2. a KEY — the object's identifying columns. Without one, `UPDATE … WHERE question = '…'` could match
+--      several rows and quietly rewrite them all; that is data loss wearing a helpful face.
+--
+-- The key comes from the COLUMNS (`Column.primary`), not from the primary INDEX. They disagree, and the
+-- disagreement is not exotic: sqlite makes NO index for `id INTEGER PRIMARY KEY` — that column is the rowid
+-- alias — so an index-derived key calls an obviously-keyed table unaddressable (measured; it was the first
+-- design here and it failed on the user's own database). Every engine reports the key per column instead:
+-- sqlite/duckdb `PRAGMA table_info.pk`, mysql `COLUMN_KEY='PRI'`, postgres `pg_index.indisprimary`, mssql
+-- `sys.indexes.is_primary_key`, CQL `kind IN (partition_key, clustering)`, mongo `_id`.
+
+--- Resolve the current origin's KEY columns, then call `cb(key|nil)`. Cached on the origin: it is a property
+--- of the object, and re-asking on every keystroke would put a round-trip in the edit path.
+---@param cb fun(key: string[]?)
+local function resolve_key(cb)
+    local o = state.origin
+    if not (o and state.conn_id) then
+        return cb(nil)
+    end
+    if o.key then
+        return cb(#o.key > 0 and o.key or nil)
+    end
+    require("lvim-db").columns(state.conn_id, { name = o.object, schema = o.schema }, function(cols)
+        local key = {}
+        for _, c in ipairs(cols or {}) do
+            if c.primary then
+                key[#key + 1] = c.name
+            end
+        end
+        o.key = key -- remember even when EMPTY: "this object has no key" is an answer worth not re-asking
+        cb(#key > 0 and key or nil)
+    end)
+end
+
+--- Why the current result cannot be edited, or nil when it can. A sentence, not a boolean: the user should
+--- learn WHY a grid is read-only instead of finding the keys silently inert.
+---@return string?
+local function readonly_reason()
+    local o = state.origin
+    if not o then
+        return "this result is not one object's rows — open a table's Data facet to edit"
+    end
+    if o.key and #o.key == 0 then
+        return ("'%s' has no primary key — a row cannot be addressed uniquely"):format(o.object)
+    end
+    return nil
+end
+
 --- Execute `statement` on `conn_id` and show its first page in the dock. Records
 --- the call in both the session call log and the persisted history. Does NOT
 --- apply the destructive guard — use `M.run_guarded` for that.
@@ -476,10 +536,15 @@ end
 ---@param conn_name string
 ---@param driver string
 ---@param statement string
-function M.run(conn_id, conn_name, driver, statement)
+---@param origin? table  `{ schema, object }` when these rows ARE one object's — the drawer's `Data` facet
+---       passes it; an ad-hoc statement passes nothing and its result stays read-only.
+function M.run(conn_id, conn_name, driver, statement, origin)
     local db = require("lvim-db")
     state.conn, state.driver, state.conn_id, state.call_id, state.page, state.offset =
         conn_name, driver, conn_id, nil, nil, 0
+    -- Rebound on EVERY run: a result is only editable while it is showing the object it came from, so a
+    -- later ad-hoc query must clear this rather than inherit the last preview's identity.
+    state.origin = origin and { schema = origin.schema, object = origin.object } or nil
 
     -- A pending entry in the session call log (accent = running until it resolves).
     local entry = {
@@ -550,7 +615,7 @@ end
 ---@param conn_name string
 ---@param driver string
 ---@param statement string
-function M.run_guarded(conn_id, conn_name, driver, statement)
+function M.run_guarded(conn_id, conn_name, driver, statement, origin)
     local db = require("lvim-db")
     if db.is_destructive(statement) then
         require("lvim-ui").confirm({
@@ -560,12 +625,12 @@ function M.run_guarded(conn_id, conn_name, driver, statement)
                 .. "\n\nRun it anyway?",
             callback = function(yes)
                 if yes then
-                    M.run(conn_id, conn_name, driver, statement)
+                    M.run(conn_id, conn_name, driver, statement, origin)
                 end
             end,
         })
     else
-        M.run(conn_id, conn_name, driver, statement)
+        M.run(conn_id, conn_name, driver, statement, origin)
     end
 end
 

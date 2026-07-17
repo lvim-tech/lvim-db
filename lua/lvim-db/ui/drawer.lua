@@ -554,7 +554,12 @@ local function helper_action(row)
         -- The bounded preview, through the guarded runner for consistency (a SELECT never trips the guard).
         local q = require("lvim-db.query")
         local stmt = q.preview_statement(conn.driver, row.schema.name, obj.name, config.page_size)
-        require("lvim-db.ui.result").run_guarded(conn.conn_id, conn.name, conn.driver, stmt)
+        -- Pass the ORIGIN: these rows ARE this object's, so the result dock can address them (and only then
+        -- offer to edit them). An ad-hoc statement from the editor passes none and stays read-only.
+        require("lvim-db.ui.result").run_guarded(conn.conn_id, conn.name, conn.driver, stmt, {
+            schema = row.schema.name,
+            object = obj.name,
+        })
     elseif row.helper.id == "ddl" then
         require("lvim-db").ddl(conn.conn_id, { name = obj.name, schema = row.schema.name }, function(sql, err)
             if err or not sql or sql == "" then

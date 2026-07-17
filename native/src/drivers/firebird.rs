@@ -16,7 +16,7 @@ use rsfbclient::{Column, Queryable, Row, SimpleConnection, SqlType};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column as SpecColumn, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType,
+    AuthKind, AuthSpec, Caps, Column as SpecColumn, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType,
     Value,
 };
 
@@ -215,25 +215,41 @@ impl Connection for FirebirdConnection {
         }])
     }
 
-    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<SpecColumn>> {
+    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
+        // The primary flag joins the PRIMARY KEY constraint's index segments — RDB$RELATION_FIELDS alone
+        // has no key marker. Catalog CHARs are padded, so every name is TRIMmed.
+        let rel = obj.name.to_uppercase().replace('\'', "''");
         let sql = format!(
-            "SELECT TRIM(RF.RDB$FIELD_NAME) FROM RDB$RELATION_FIELDS RF \
-             WHERE RF.RDB$RELATION_NAME = '{}' ORDER BY RF.RDB$FIELD_POSITION",
-            obj.name.to_uppercase().replace('\'', "''")
+            "SELECT TRIM(RF.RDB$FIELD_NAME), \
+                    CASE WHEN PK.F IS NULL THEN 0 ELSE 1 END \
+             FROM RDB$RELATION_FIELDS RF \
+             LEFT JOIN ( \
+               SELECT TRIM(S.RDB$FIELD_NAME) AS F \
+               FROM RDB$RELATION_CONSTRAINTS RC \
+               JOIN RDB$INDEX_SEGMENTS S ON S.RDB$INDEX_NAME = RC.RDB$INDEX_NAME \
+               WHERE TRIM(RC.RDB$RELATION_NAME) = '{rel}' AND RC.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY' \
+             ) PK ON PK.F = TRIM(RF.RDB$FIELD_NAME) \
+             WHERE TRIM(RF.RDB$RELATION_NAME) = '{rel}' ORDER BY RF.RDB$FIELD_POSITION"
         );
         let (_c, rows) = self.run(sql).await?;
         Ok(rows
             .into_iter()
-            .map(|r| SpecColumn {
+            .map(|r| TableColumn {
                 name: match r.first() {
-                    Some(Value::Text(s)) => s.clone(),
+                    Some(Value::Text(s)) => s.trim().to_string(),
                     _ => String::new(),
                 },
+                // RDB$RELATION_FIELDS points at a DOMAIN for the type; the previous impl did not resolve it
+                // either, so the type stays unreported rather than newly guessed here.
                 type_name: String::new(),
+                primary: match r.get(1) {
+                    Some(Value::Int(i)) => *i != 0,
+                    Some(Value::Text(s)) => s.trim() == "1",
+                    _ => false,
+                },
             })
             .collect())
     }
-
     async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
         // RDB$INDEX_SEGMENTS is the per-column table ordered by RDB$FIELD_POSITION — the fold shape.
         // Firebird pads catalog CHAR columns, so every name is TRIMmed. A primary key is read from

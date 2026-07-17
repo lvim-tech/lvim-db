@@ -16,7 +16,7 @@ use scylla::value::{CqlValue, Row};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -254,10 +254,12 @@ impl Connection for CqlConnection {
         Ok(schemas)
     }
 
-    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
+    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
+        // In CQL a row is identified by its PARTITION KEY plus its CLUSTERING columns — together the
+        // PRIMARY KEY. `kind` names each one, so both count; a plain `regular` column does not.
         let ks = obj.schema.clone().or_else(|| self.keyspace.clone()).unwrap_or_default();
         let sql = format!(
-            "SELECT column_name, type FROM system_schema.columns \
+            "SELECT column_name, type, kind FROM system_schema.columns \
              WHERE keyspace_name = '{}' AND table_name = '{}'",
             ks.replace('\'', "''"),
             obj.name.replace('\'', "''")
@@ -265,7 +267,7 @@ impl Connection for CqlConnection {
         let (_c, rows) = self.run(&sql).await?;
         Ok(rows
             .into_iter()
-            .map(|r| Column {
+            .map(|r| TableColumn {
                 name: match r.first() {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
@@ -274,10 +276,10 @@ impl Connection for CqlConnection {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
                 },
+                primary: matches!(r.get(2), Some(Value::Text(k)) if k == "partition_key" || k == "clustering"),
             })
             .collect())
     }
-
     async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
         // system_schema.indexes is the cluster's own catalog. A CQL secondary index has exactly ONE target
         // (options['target']) and is never unique nor primary — the partition key is not an index — so those

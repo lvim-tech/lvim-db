@@ -15,7 +15,7 @@ use mysql_async::{Conn, Opts, OptsBuilder, Row};
 use crate::driver::{CancelHandle, Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -327,13 +327,15 @@ impl Connection for MysqlConnection {
         Ok(schemas)
     }
 
-    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
+    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
+        // COLUMN_KEY = 'PRI' is mysql's own per-column primary-key marker.
         let schema_pred = match &obj.schema {
             Some(s) => format!("AND table_schema = '{}'", s.replace('\'', "''")),
             None => String::new(),
         };
         let sql = format!(
-            "SELECT column_name, column_type FROM information_schema.columns \
+            "SELECT column_name, column_type, IF(column_key = 'PRI', 1, 0) \
+             FROM information_schema.columns \
              WHERE table_name = '{}' {} ORDER BY ordinal_position",
             obj.name.replace('\'', "''"),
             schema_pred
@@ -341,7 +343,7 @@ impl Connection for MysqlConnection {
         let (_c, rows, _a) = self.run(&sql).await?;
         Ok(rows
             .into_iter()
-            .map(|r| Column {
+            .map(|r| TableColumn {
                 name: match r.first() {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
@@ -350,10 +352,14 @@ impl Connection for MysqlConnection {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
                 },
+                primary: match r.get(2) {
+                    Some(Value::Int(i)) => *i != 0,
+                    Some(Value::Text(s)) => s == "1",
+                    _ => false,
+                },
             })
             .collect())
     }
-
     async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
         // information_schema.STATISTICS yields one row per index COLUMN in SEQ_IN_INDEX order — the shape
         // `group_indexes` folds. NON_UNIQUE is inverted (0 = unique), and mysql has no is_primary column:

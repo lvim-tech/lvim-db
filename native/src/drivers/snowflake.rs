@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
-use crate::spec::{AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, Value};
+use crate::spec::{AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value};
 
 const PARAMS: &[ParamSpec] = &[
     ParamSpec {
@@ -298,7 +298,7 @@ impl Connection for SnowflakeConnection {
         Ok(schemas)
     }
 
-    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
+    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
         let schema_pred = match &obj.schema {
             Some(s) => format!("AND TABLE_SCHEMA = '{}'", s.replace('\'', "''")),
             None => String::new(),
@@ -306,25 +306,50 @@ impl Connection for SnowflakeConnection {
         let sql = format!(
             "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS \
              WHERE TABLE_NAME = '{}' {} ORDER BY ORDINAL_POSITION",
-            obj.name.replace('\'', "''"),
+            obj.name.to_uppercase().replace('\'', "''"),
             schema_pred
         );
         let (_c, rows) = self.query(&sql).await?;
+
+        // INFORMATION_SCHEMA.COLUMNS carries no key marker on Snowflake; `SHOW PRIMARY KEYS` is the
+        // documented source. NOT VERIFIED (cloud-only, no account): if it errors or answers in a shape we do
+        // not recognise, the columns still list — just unflagged. An unflagged key means the grid calls the
+        // object read-only, which is the safe direction to be wrong in.
+        let qname = match &obj.schema {
+            Some(s) => format!("{}.{}", s.replace('\'', "''"), obj.name.replace('\'', "''")),
+            None => obj.name.replace('\'', "''"),
+        };
+        let mut pk: Vec<String> = Vec::new();
+        if let Ok((cols, prows)) = self.query(&format!("SHOW PRIMARY KEYS IN TABLE {qname}")).await {
+            // SHOW returns a wide row; find the column-name field by NAME rather than by position, since a
+            // SHOW's layout is not part of Snowflake's documented contract.
+            if let Some(i) = cols.iter().position(|c| c.name.eq_ignore_ascii_case("column_name")) {
+                for r in prows {
+                    if let Some(Value::Text(s)) = r.get(i) {
+                        pk.push(s.to_ascii_uppercase());
+                    }
+                }
+            }
+        }
+
         Ok(rows
             .into_iter()
-            .map(|r| Column {
-                name: match r.first() {
+            .map(|r| {
+                let name = match r.first() {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
-                },
-                type_name: match r.get(1) {
-                    Some(Value::Text(s)) => s.clone(),
-                    _ => String::new(),
-                },
+                };
+                TableColumn {
+                    primary: pk.iter().any(|k| k.eq_ignore_ascii_case(&name)),
+                    name,
+                    type_name: match r.get(1) {
+                        Some(Value::Text(s)) => s.clone(),
+                        _ => String::new(),
+                    },
+                }
             })
             .collect())
     }
-
     async fn ddl(&mut self, obj: &ObjRef) -> anyhow::Result<Option<String>> {
         // GET_DDL is Snowflake's OWN generator, so this is the engine's answer, not a reconstruction.
         // NOT VERIFIED against a live server: Snowflake is cloud-only and there is no account to test with.

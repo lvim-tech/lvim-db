@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -286,17 +286,21 @@ impl Connection for ClickhouseConnection {
         Ok(schemas)
     }
 
-    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
+    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
+        // system.columns.is_in_primary_key marks the MergeTree ORDER BY / primary key columns — the closest
+        // thing ClickHouse has to a row key (it has no unique constraint, so this identifies a row only if
+        // the table's key happens to be unique; the grid gates on that separately).
         let db = obj.schema.clone().unwrap_or_else(|| self.database.clone());
         let sql = format!(
-            "SELECT name, type FROM system.columns WHERE table = '{}' AND database = '{}' ORDER BY position",
+            "SELECT name, type, is_in_primary_key FROM system.columns \
+             WHERE table = '{}' AND database = '{}' ORDER BY position",
             obj.name.replace('\'', "''"),
             db.replace('\'', "''")
         );
         let (_c, rows) = self.query_json(&sql).await?;
         Ok(rows
             .into_iter()
-            .map(|r| Column {
+            .map(|r| TableColumn {
                 name: match r.first() {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
@@ -305,10 +309,15 @@ impl Connection for ClickhouseConnection {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
                 },
+                primary: match r.get(2) {
+                    Some(Value::Int(i)) => *i != 0,
+                    Some(Value::Text(s)) => s == "1",
+                    Some(Value::Bool(b)) => *b,
+                    _ => false,
+                },
             })
             .collect())
     }
-
     async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
         // ClickHouse has no b-tree indexes: what it calls an index is a DATA-SKIPPING index, in
         // system.data_skipping_indices. `expr` is the indexed EXPRESSION, not a column vector, so it is shown

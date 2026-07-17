@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 
 use crate::net::NetContext;
-use crate::spec::{Column, ConnSpec, DriverMeta, Index, Node, ObjRef, Value};
+use crate::spec::{Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, Value};
 
 /// A registered database type. Immutable, cheap; holds the static metadata and
 /// knows how to open a connection.
@@ -40,8 +40,8 @@ pub trait Connection: Send {
     /// The schema → object tree (schemas, tables, views, collections …).
     async fn structure(&mut self) -> anyhow::Result<Vec<Node>>;
 
-    /// The columns of one object.
-    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>>;
+    /// The columns of one object, each flagged when it is part of the identifying key.
+    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>>;
 
     /// The indexes on one object (`Caps::indexes`). Defaults to "this engine has none to show" so a driver
     /// opts IN by implementing it — the same shape as `cancel_token` — rather than every driver being forced

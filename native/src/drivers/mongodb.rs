@@ -20,7 +20,7 @@ use mongodb::{Client, Cursor};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -364,19 +364,27 @@ impl Connection for MongoConnection {
         }])
     }
 
-    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
-        // Schemaless: sample one document and expose its top-level fields.
+    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
+        // Schemaless: sample one document and expose its top-level fields. `_id` is mongo's primary key —
+        // every document has one, it is unique, and it is immutable — so it is the field the grid addresses
+        // a row by. That is a property of the STORE, not of this sample, hence the flat name check.
         let coll = self.client.database(&self.db).collection::<Document>(&obj.name);
         let sample = coll
             .find_one(Document::new())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         match sample {
-            Some(doc) => Ok(columns_for(&column_order(&doc))),
+            Some(doc) => Ok(columns_for(&column_order(&doc))
+                .into_iter()
+                .map(|c| TableColumn {
+                    primary: c.name == "_id",
+                    name: c.name,
+                    type_name: c.type_name,
+                })
+                .collect()),
             None => Ok(Vec::new()),
         }
     }
-
     async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
         // `listIndexes` is the engine's own answer, so a compound/unique index reads exactly as the server
         // holds it. The key DOCUMENT preserves field order, which IS the index order — so the keys are taken
