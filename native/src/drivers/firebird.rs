@@ -16,8 +16,8 @@ use rsfbclient::{Column, Queryable, Row, SimpleConnection, SqlType};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column as SpecColumn, ConnSpec, DriverMeta, Index, Node, ObjRef,
-    ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column as SpecColumn, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType,
+    Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -81,11 +81,7 @@ impl Driver for FirebirdDriver {
         &META
     }
 
-    async fn connect(
-        &self,
-        spec: &ConnSpec,
-        net: NetContext,
-    ) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
         let host = spec.param("host")?.to_string();
         let port = spec.port(3050);
         let db = spec.param("database")?.to_string();
@@ -183,9 +179,7 @@ impl Connection for FirebirdConnection {
     }
 
     async fn switch_database(&mut self, _db: &str) -> anyhow::Result<()> {
-        Err(anyhow::anyhow!(
-            "Firebird has a single database per connection"
-        ))
+        Err(anyhow::anyhow!("Firebird has a single database per connection"))
     }
 
     async fn structure(&mut self) -> anyhow::Result<Vec<Node>> {
@@ -261,9 +255,7 @@ impl Connection for FirebirdConnection {
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows) = self.run(stmt.to_string()).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(
-            columns, rows, None,
-        )))
+        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, None)))
     }
 
     async fn close(self: Box<Self>) -> anyhow::Result<()> {

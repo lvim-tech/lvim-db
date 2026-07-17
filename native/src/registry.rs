@@ -25,13 +25,9 @@ impl Registry {
 
         #[cfg(feature = "postgres")]
         {
-            reg.add(Arc::new(
-                crate::drivers::postgres::PostgresDriver::postgres(),
-            ));
+            reg.add(Arc::new(crate::drivers::postgres::PostgresDriver::postgres()));
             #[cfg(feature = "cockroachdb")]
-            reg.add(Arc::new(
-                crate::drivers::postgres::PostgresDriver::cockroachdb(),
-            ));
+            reg.add(Arc::new(crate::drivers::postgres::PostgresDriver::cockroachdb()));
         }
 
         #[cfg(feature = "mariadb")]

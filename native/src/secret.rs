@@ -42,9 +42,9 @@ impl Secret {
         if let Some(inner) = strip_template(raw) {
             let (verb, arg) = split_verb(&inner)?;
             return match verb.as_str() {
-                "env" => std::env::var(&arg).map_err(|_| {
-                    anyhow::anyhow!("secret: environment variable '{arg}' is not set")
-                }),
+                "env" => {
+                    std::env::var(&arg).map_err(|_| anyhow::anyhow!("secret: environment variable '{arg}' is not set"))
+                }
                 "cmd" => run_cmd(&arg).await,
                 other => Err(anyhow::anyhow!("secret: unknown template verb '{other}'")),
             };
@@ -93,9 +93,7 @@ async fn run_cmd(cmd: &str) -> anyhow::Result<String> {
         .await
         .map_err(|e| anyhow::anyhow!("secret: command failed to spawn: {e}"))?;
     if !out.status.success() {
-        return Err(anyhow::anyhow!(
-            "secret: command exited with a non-zero status"
-        ));
+        return Err(anyhow::anyhow!("secret: command exited with a non-zero status"));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -129,10 +127,7 @@ mod tests {
     #[tokio::test]
     async fn cmd_template_resolves_trimmed() {
         assert_eq!(
-            Secret::new("{{ cmd \"printf secret\" }}")
-                .resolve()
-                .await
-                .unwrap(),
+            Secret::new("{{ cmd \"printf secret\" }}").resolve().await.unwrap(),
             "secret"
         );
     }

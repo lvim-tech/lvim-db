@@ -15,8 +15,7 @@ use mysql_async::{Conn, Opts, OptsBuilder, Row};
 use crate::driver::{CancelHandle, Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec,
-    ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -86,9 +85,7 @@ pub struct MysqlDriver {
 impl MysqlDriver {
     #[cfg(feature = "mariadb")]
     pub fn mariadb() -> Self {
-        Self {
-            meta: &MARIADB_META,
-        }
+        Self { meta: &MARIADB_META }
     }
 
     #[cfg(feature = "mysql")]
@@ -100,9 +97,7 @@ impl MysqlDriver {
 /// Derive (user, password) from a spec's auth, resolving the password template.
 async fn credentials(spec: &ConnSpec) -> anyhow::Result<(String, Option<String>)> {
     match &spec.auth {
-        AuthSpec::Password { user, password } => {
-            Ok((user.clone(), Some(password.resolve().await?)))
-        }
+        AuthSpec::Password { user, password } => Ok((user.clone(), Some(password.resolve().await?))),
         AuthSpec::ClientCert { user, .. } => Ok((user.clone(), None)),
         _ => Ok((spec.param_opt("user").unwrap_or("root").to_string(), None)),
     }
@@ -146,11 +141,7 @@ async fn build_opts(spec: &ConnSpec, net: &NetContext, with_tls: bool) -> anyhow
     if let Some(db) = spec.param_opt("database") {
         b = b.db_name(Some(db.to_string()));
     }
-    b = b.ssl_opts(if with_tls {
-        Some(ssl_opts_for(&spec.tls))
-    } else {
-        None
-    });
+    b = b.ssl_opts(if with_tls { Some(ssl_opts_for(&spec.tls)) } else { None });
     Ok(Opts::from(b))
 }
 
@@ -187,11 +178,7 @@ impl Driver for MysqlDriver {
         self.meta
     }
 
-    async fn connect(
-        &self,
-        spec: &ConnSpec,
-        net: NetContext,
-    ) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
         let tls = &spec.tls;
         // Explicit opt-out → plaintext.
         if !tls.wanted() {
@@ -245,15 +232,8 @@ struct MysqlConnection {
 
 impl MysqlConnection {
     /// Run a statement, collecting text-rendered rows + columns + affected count.
-    async fn run(
-        &mut self,
-        sql: &str,
-    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>, Option<u64>)> {
-        let mut result = self
-            .conn
-            .query_iter(sql)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    async fn run(&mut self, sql: &str) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>, Option<u64>)> {
+        let mut result = self.conn.query_iter(sql).await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let mut columns: Vec<Column> = Vec::new();
         if let Some(cols) = result.columns() {
@@ -397,11 +377,7 @@ impl Connection for MysqlConnection {
         // SHOW CREATE is the server's own answer; the statement is column 1. A view answers only to
         // SHOW CREATE VIEW, so both are tried rather than assuming the object's kind.
         let qname = match &obj.schema {
-            Some(sc) => format!(
-                "`{}`.`{}`",
-                sc.replace('`', "``"),
-                obj.name.replace('`', "``")
-            ),
+            Some(sc) => format!("`{}`.`{}`", sc.replace('`', "``"), obj.name.replace('`', "``")),
             None => format!("`{}`", obj.name.replace('`', "``")),
         };
         for kind in ["TABLE", "VIEW"] {
@@ -416,9 +392,7 @@ impl Connection for MysqlConnection {
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows, affected) = self.run(stmt).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(
-            columns, rows, affected,
-        )))
+        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, affected)))
     }
 
     fn cancel_token(&self) -> Option<Box<dyn CancelHandle>> {

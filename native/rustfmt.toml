@@ -1,0 +1,7 @@
+# The Rust crate's style declaration — the equivalent of the plugin's stylua.toml, and the same 120 columns,
+# so one width holds across the whole plugin instead of the Lua being 120 and the Rust silently 100.
+#
+# It exists because without it `cargo fmt` uses its 100-column default and FIGHTS this codebase: it rewraps
+# files nobody touched, so a feature diff silently carries a reformat of unrelated code (which is exactly
+# what happened in e8cd9ab).
+max_width = 120

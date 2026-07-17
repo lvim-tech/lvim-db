@@ -14,10 +14,7 @@ use serde_json::json;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
-use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType,
-    Value,
-};
+use crate::spec::{AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, Value};
 
 const PARAMS: &[ParamSpec] = &[
     ParamSpec {
@@ -80,11 +77,7 @@ impl Driver for RedisDriver {
         &META
     }
 
-    async fn connect(
-        &self,
-        spec: &ConnSpec,
-        net: NetContext,
-    ) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
         let host = spec.param("host")?;
         let port = spec.port(6379);
         let db = spec.param_opt("db").unwrap_or("0");
@@ -118,8 +111,7 @@ impl Driver for RedisDriver {
         let url = format!("{scheme}://{auth}{rhost}:{rport}/{db}{frag}");
 
         async fn open_con(url: &str) -> anyhow::Result<MultiplexedConnection> {
-            let client = redis::Client::open(url.to_string())
-                .map_err(|e| anyhow::anyhow!("redis url invalid: {e}"))?;
+            let client = redis::Client::open(url.to_string()).map_err(|e| anyhow::anyhow!("redis url invalid: {e}"))?;
             client
                 .get_multiplexed_async_connection()
                 .await
@@ -133,15 +125,10 @@ impl Driver for RedisDriver {
             }));
         }
         match open_con(&url).await {
-            Ok(con) => Ok(Box::new(RedisConnection {
-                con,
-                encrypted: true,
-            })),
+            Ok(con) => Ok(Box::new(RedisConnection { con, encrypted: true })),
             Err(e) => {
                 if tls.required() {
-                    Err(anyhow::anyhow!(
-                        "redis: TLS is required but the connection failed: {e}"
-                    ))
+                    Err(anyhow::anyhow!("redis: TLS is required but the connection failed: {e}"))
                 } else {
                     let plain = format!("redis://{auth}{rhost}:{rport}/{db}");
                     Ok(Box::new(RedisConnection {
@@ -170,9 +157,7 @@ fn rvalue_to_json(v: &RValue) -> serde_json::Value {
         RValue::BulkString(b) => json!(String::from_utf8_lossy(b)),
         RValue::SimpleString(s) => json!(s),
         RValue::Okay => json!("OK"),
-        RValue::Array(a) | RValue::Set(a) => {
-            serde_json::Value::Array(a.iter().map(rvalue_to_json).collect())
-        }
+        RValue::Array(a) | RValue::Set(a) => serde_json::Value::Array(a.iter().map(rvalue_to_json).collect()),
         RValue::Map(m) => {
             let mut obj = serde_json::Map::new();
             for (k, val) in m {
@@ -236,9 +221,7 @@ impl RedisConnection {
             c.arg(a);
         }
         let mut con = self.con.clone();
-        c.query_async(&mut con)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        c.query_async(&mut con).await.map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 
@@ -249,9 +232,7 @@ fn render(v: RValue) -> (Vec<Column>, Vec<Vec<Value>>) {
         type_name: String::new(),
     }];
     match v {
-        RValue::Array(a) | RValue::Set(a) => {
-            (value_col, a.iter().map(|e| vec![scalar(e)]).collect())
-        }
+        RValue::Array(a) | RValue::Set(a) => (value_col, a.iter().map(|e| vec![scalar(e)]).collect()),
         RValue::Map(m) => {
             let cols = vec![
                 Column {
@@ -263,10 +244,7 @@ fn render(v: RValue) -> (Vec<Column>, Vec<Vec<Value>>) {
                     type_name: String::new(),
                 },
             ];
-            let rows = m
-                .iter()
-                .map(|(k, val)| vec![scalar(k), scalar(val)])
-                .collect();
+            let rows = m.iter().map(|(k, val)| vec![scalar(k), scalar(val)]).collect();
             (cols, rows)
         }
         scalar_v => (value_col, vec![vec![scalar(&scalar_v)]]),
@@ -285,9 +263,7 @@ impl Connection for RedisConnection {
             Some(RValue::Array(a)) => a
                 .get(1)
                 .and_then(|v| match v {
-                    RValue::BulkString(b) => std::str::from_utf8(b)
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok()),
+                    RValue::BulkString(b) => std::str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()),
                     RValue::Int(i) => Some(*i as usize),
                     _ => None,
                 })
@@ -350,9 +326,7 @@ impl Connection for RedisConnection {
         let tokens = tokenize(stmt);
         let reply = self.command(&tokens).await?;
         let (columns, rows) = render(reply);
-        Ok(Box::new(super::buffered::BufferedStream::new(
-            columns, rows, None,
-        )))
+        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, None)))
     }
 
     fn encrypted(&self) -> bool {

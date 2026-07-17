@@ -24,11 +24,7 @@ pub trait Driver: Send + Sync {
 
     /// Open one connection. `net` has already resolved any SSH tunnel, so the
     /// driver dials the address `net` hands it — tunnelling is transparent.
-    async fn connect(
-        &self,
-        spec: &ConnSpec,
-        net: NetContext,
-    ) -> anyhow::Result<Box<dyn Connection>>;
+    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>>;
 }
 
 /// A live connection. Held server-side behind a mutex and addressed by a numeric

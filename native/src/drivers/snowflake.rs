@@ -12,10 +12,7 @@ use serde::Deserialize;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
-use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType,
-    Value,
-};
+use crate::spec::{AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, Value};
 
 const PARAMS: &[ParamSpec] = &[
     ParamSpec {
@@ -103,11 +100,7 @@ impl Driver for SnowflakeDriver {
         &META
     }
 
-    async fn connect(
-        &self,
-        spec: &ConnSpec,
-        _net: NetContext,
-    ) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(&self, spec: &ConnSpec, _net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
         let account = spec.param("account")?.to_string();
         let user = spec.param("user")?.to_string();
 
@@ -123,11 +116,7 @@ impl Driver for SnowflakeDriver {
                 (jwt, "KEYPAIR_JWT")
             }
             AuthSpec::Provider { token, .. } => (token.resolve().await?, "OAUTH"),
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "Snowflake requires key-pair (JWT) or OAuth auth"
-                ))
-            }
+            _ => return Err(anyhow::anyhow!("Snowflake requires key-pair (JWT) or OAuth auth")),
         };
 
         let conn = SnowflakeConnection {
@@ -260,10 +249,8 @@ impl SnowflakeConnection {
 #[async_trait]
 impl Connection for SnowflakeConnection {
     async fn databases(&mut self) -> anyhow::Result<Vec<String>> {
-        self.string_column(
-            "SELECT DATABASE_NAME FROM INFORMATION_SCHEMA.DATABASES ORDER BY DATABASE_NAME",
-        )
-        .await
+        self.string_column("SELECT DATABASE_NAME FROM INFORMATION_SCHEMA.DATABASES ORDER BY DATABASE_NAME")
+            .await
     }
 
     async fn switch_database(&mut self, db: &str) -> anyhow::Result<()> {
@@ -344,11 +331,7 @@ impl Connection for SnowflakeConnection {
         // Written from the documented signature GET_DDL('TABLE', '<qualified name>'); it follows the same
         // "first column of the first row" shape as every other driver's ddl() here.
         let qname = match &obj.schema {
-            Some(sc) => format!(
-                "{}.{}",
-                sc.replace('\'', "''"),
-                obj.name.replace('\'', "''")
-            ),
+            Some(sc) => format!("{}.{}", sc.replace('\'', "''"), obj.name.replace('\'', "''")),
             None => obj.name.replace('\'', "''"),
         };
         let sql = format!("SELECT GET_DDL('TABLE', '{qname}')");
@@ -361,9 +344,7 @@ impl Connection for SnowflakeConnection {
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows) = self.query(stmt).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(
-            columns, rows, None,
-        )))
+        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, None)))
     }
 
     fn encrypted(&self) -> bool {

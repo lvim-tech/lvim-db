@@ -115,17 +115,12 @@ impl ConnSpec {
 
     /// An optional string param.
     pub fn param_opt(&self, key: &str) -> Option<&str> {
-        self.params
-            .get(key)
-            .map(String::as_str)
-            .filter(|s| !s.is_empty())
+        self.params.get(key).map(String::as_str).filter(|s| !s.is_empty())
     }
 
     /// An optional param parsed as a port, falling back to `default`.
     pub fn port(&self, default: u16) -> u16 {
-        self.param_opt("port")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default)
+        self.param_opt("port").and_then(|s| s.parse().ok()).unwrap_or(default)
     }
 }
 
@@ -196,10 +191,7 @@ impl Default for TlsSpec {
 impl TlsSpec {
     /// Whether TLS must be negotiated (a plaintext-only server is rejected).
     pub fn required(&self) -> bool {
-        matches!(
-            self.mode,
-            TlsMode::Require | TlsMode::VerifyCa | TlsMode::VerifyFull
-        )
+        matches!(self.mode, TlsMode::Require | TlsMode::VerifyCa | TlsMode::VerifyFull)
     }
 
     /// Whether TLS should be attempted at all.
@@ -350,18 +342,12 @@ mod tests {
     fn value_serializes_as_plain_json() {
         assert_eq!(serde_json::to_string(&Value::Null).unwrap(), "null");
         assert_eq!(serde_json::to_string(&Value::Int(7)).unwrap(), "7");
-        assert_eq!(
-            serde_json::to_string(&Value::Text("hi".into())).unwrap(),
-            "\"hi\""
-        );
+        assert_eq!(serde_json::to_string(&Value::Text("hi".into())).unwrap(), "\"hi\"");
         let b = Value::Bytes {
             b64: "AA==".into(),
             len: 1,
         };
-        assert_eq!(
-            serde_json::to_string(&b).unwrap(),
-            "{\"__bytes\":\"AA==\",\"len\":1}"
-        );
+        assert_eq!(serde_json::to_string(&b).unwrap(), "{\"__bytes\":\"AA==\",\"len\":1}");
     }
 
     #[test]

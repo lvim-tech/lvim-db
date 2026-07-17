@@ -16,8 +16,7 @@ use scylla::value::{CqlValue, Row};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec,
-    ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -87,9 +86,7 @@ pub struct CqlDriver {
 impl CqlDriver {
     #[cfg(feature = "cassandra")]
     pub fn cassandra() -> Self {
-        Self {
-            meta: &CASSANDRA_META,
-        }
+        Self { meta: &CASSANDRA_META }
     }
 
     #[cfg(feature = "scylla")]
@@ -104,11 +101,7 @@ impl Driver for CqlDriver {
         self.meta
     }
 
-    async fn connect(
-        &self,
-        spec: &ConnSpec,
-        net: NetContext,
-    ) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
         // Native CQL TLS is not yet wired (scylla's rustls TLS context). Rather
         // than silently send credentials in the clear, a REQUIRED-encryption
         // connection is refused — use an SSH tunnel for an encrypted CQL link
@@ -187,10 +180,7 @@ impl CqlConnection {
             })
             .collect();
         let mut out: Vec<Vec<Value>> = Vec::new();
-        for row in rows_result
-            .rows::<Row>()
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-        {
+        for row in rows_result.rows::<Row>().map_err(|e| anyhow::anyhow!("{e}"))? {
             let row = row.map_err(|e| anyhow::anyhow!("{e}"))?;
             let cells = row
                 .columns
@@ -209,9 +199,7 @@ impl CqlConnection {
 #[async_trait]
 impl Connection for CqlConnection {
     async fn databases(&mut self) -> anyhow::Result<Vec<String>> {
-        let (_c, rows) = self
-            .run("SELECT keyspace_name FROM system_schema.keyspaces")
-            .await?;
+        let (_c, rows) = self.run("SELECT keyspace_name FROM system_schema.keyspaces").await?;
         Ok(rows
             .into_iter()
             .filter_map(|r| match r.into_iter().next() {
@@ -267,11 +255,7 @@ impl Connection for CqlConnection {
     }
 
     async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
-        let ks = obj
-            .schema
-            .clone()
-            .or_else(|| self.keyspace.clone())
-            .unwrap_or_default();
+        let ks = obj.schema.clone().or_else(|| self.keyspace.clone()).unwrap_or_default();
         let sql = format!(
             "SELECT column_name, type FROM system_schema.columns \
              WHERE keyspace_name = '{}' AND table_name = '{}'",
@@ -322,13 +306,11 @@ impl Connection for CqlConnection {
                 // exactly the failure a "looks like a string, split it" approach earns.
                 // So: find the `target` key, then take the NEXT quoted run — its value.
                 let target = match r.get(1) {
-                    Some(Value::Text(s)) => {
-                        s.split_once("Text(\"target\")").and_then(|(_, rest)| {
-                            rest.split_once("Text(\"")
-                                .and_then(|(_, v)| v.split_once('"'))
-                                .map(|(v, _)| v.to_string())
-                        })
-                    }
+                    Some(Value::Text(s)) => s.split_once("Text(\"target\")").and_then(|(_, rest)| {
+                        rest.split_once("Text(\"")
+                            .and_then(|(_, v)| v.split_once('"'))
+                            .map(|(v, _)| v.to_string())
+                    }),
                     _ => None,
                 };
                 Some(Index {
@@ -343,9 +325,7 @@ impl Connection for CqlConnection {
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows) = self.run(stmt).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(
-            columns, rows, None,
-        )))
+        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, None)))
     }
 
     async fn close(self: Box<Self>) -> anyhow::Result<()> {

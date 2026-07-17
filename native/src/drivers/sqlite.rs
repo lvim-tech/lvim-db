@@ -15,9 +15,7 @@ use rusqlite::Connection as SqliteConn;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
-use crate::spec::{
-    AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
-};
+use crate::spec::{AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value};
 
 const PARAMS: &[ParamSpec] = &[ParamSpec {
     key: "file",
@@ -62,11 +60,7 @@ impl Driver for SqliteDriver {
         &META
     }
 
-    async fn connect(
-        &self,
-        spec: &ConnSpec,
-        _net: NetContext,
-    ) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(&self, spec: &ConnSpec, _net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
         let file = spec.param("file")?.to_string();
         let conn = tokio::task::spawn_blocking(move || {
             if file == ":memory:" {
@@ -106,10 +100,7 @@ struct SqliteConnection {
 impl SqliteConnection {
     /// Run one statement on a blocking thread. A statement that returns no columns
     /// (DDL/DML) reports its changed-row count as `affected`.
-    async fn run(
-        &self,
-        sql: String,
-    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>, Option<u64>)> {
+    async fn run(&self, sql: String) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>, Option<u64>)> {
         let arc = self.conn.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let conn = arc.lock().unwrap();
@@ -158,9 +149,7 @@ impl Connection for SqliteConnection {
     }
 
     async fn switch_database(&mut self, _db: &str) -> anyhow::Result<()> {
-        Err(anyhow::anyhow!(
-            "SQLite has a single database per connection"
-        ))
+        Err(anyhow::anyhow!("SQLite has a single database per connection"))
     }
 
     async fn structure(&mut self) -> anyhow::Result<Vec<Node>> {
@@ -269,9 +258,7 @@ impl Connection for SqliteConnection {
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows, affected) = self.run(stmt.to_string()).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(
-            columns, rows, affected,
-        )))
+        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, affected)))
     }
 
     async fn close(self: Box<Self>) -> anyhow::Result<()> {

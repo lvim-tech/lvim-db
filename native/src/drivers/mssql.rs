@@ -16,8 +16,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec,
-    ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -81,11 +80,7 @@ impl Driver for MssqlDriver {
         &META
     }
 
-    async fn connect(
-        &self,
-        spec: &ConnSpec,
-        net: NetContext,
-    ) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
         let host = spec.param("host")?;
         let port = spec.port(1433);
         let addr = net.resolve(host, port).await?;
@@ -95,11 +90,7 @@ impl Driver for MssqlDriver {
 
         let (user, password) = match &spec.auth {
             AuthSpec::Password { user, password } => (user.clone(), password.resolve().await?),
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "SQL Server requires password authentication"
-                ))
-            }
+            _ => return Err(anyhow::anyhow!("SQL Server requires password authentication")),
         };
 
         let mut config = Config::new();
@@ -174,15 +165,8 @@ fn render_cell(row: &tiberius::Row, i: usize) -> Value {
 
 impl MssqlConnection {
     async fn run(&mut self, sql: &str) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>)> {
-        let stream = self
-            .client
-            .query(sql, &[])
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let rows = stream
-            .into_first_result()
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let stream = self.client.query(sql, &[]).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let rows = stream.into_first_result().await.map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut columns = Vec::new();
         if let Some(r0) = rows.first() {
             columns = r0
@@ -206,9 +190,7 @@ impl MssqlConnection {
 #[async_trait]
 impl Connection for MssqlConnection {
     async fn databases(&mut self) -> anyhow::Result<Vec<String>> {
-        let (_c, rows) = self
-            .run("SELECT name FROM sys.databases ORDER BY name")
-            .await?;
+        let (_c, rows) = self.run("SELECT name FROM sys.databases ORDER BY name").await?;
         Ok(rows
             .into_iter()
             .filter_map(|r| match r.into_iter().next() {
@@ -318,9 +300,7 @@ impl Connection for MssqlConnection {
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows) = self.run(stmt).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(
-            columns, rows, None,
-        )))
+        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, None)))
     }
 
     fn encrypted(&self) -> bool {

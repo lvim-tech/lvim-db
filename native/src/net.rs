@@ -97,12 +97,9 @@ mod tunnel {
         /// local port to `(db_host, db_port)` over the tunnel.
         pub async fn open(spec: &TunnelSpec, db_host: &str, db_port: u16) -> anyhow::Result<Self> {
             let config = Arc::new(client::Config::default());
-            let mut session =
-                client::connect(config, (spec.host.as_str(), spec.port), ClientHandler)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("ssh connect to {}:{} failed: {e}", spec.host, spec.port)
-                    })?;
+            let mut session = client::connect(config, (spec.host.as_str(), spec.port), ClientHandler)
+                .await
+                .map_err(|e| anyhow::anyhow!("ssh connect to {}:{} failed: {e}", spec.host, spec.port))?;
 
             // Authenticate with the chosen method.
             let authed = match &spec.auth {
@@ -116,11 +113,7 @@ mod tunnel {
                 }
                 TunnelAuth::Key { path, passphrase } => {
                     let pass = passphrase.resolve().await?;
-                    let pass_opt = if pass.is_empty() {
-                        None
-                    } else {
-                        Some(pass.as_str())
-                    };
+                    let pass_opt = if pass.is_empty() { None } else { Some(pass.as_str()) };
                     let key = russh::keys::load_secret_key(path, pass_opt)
                         .map_err(|e| anyhow::anyhow!("cannot load ssh key '{path}': {e}"))?;
                     let with_hash = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None);
@@ -204,10 +197,7 @@ mod tunnel {
     impl Handler for ClientHandler {
         type Error = russh::Error;
 
-        async fn check_server_key(
-            &mut self,
-            _server_public_key: &PublicKey,
-        ) -> Result<bool, Self::Error> {
+        async fn check_server_key(&mut self, _server_public_key: &PublicKey) -> Result<bool, Self::Error> {
             Ok(true)
         }
     }

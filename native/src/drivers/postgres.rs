@@ -15,8 +15,7 @@ use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use crate::driver::{CancelHandle, Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec,
-    ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
 };
 
 // ── driver metadata ──────────────────────────────────────────────────────────
@@ -65,7 +64,7 @@ const PG_META: DriverMeta = DriverMeta {
         multi_db: true,
         kv: false,
         indexes: true, // pg_index + pg_attribute
-        ddl: false, // postgres has NO server-side CREATE TABLE (pg_dump is a client) — see the trait doc
+        ddl: false,    // postgres has NO server-side CREATE TABLE (pg_dump is a client) — see the trait doc
     },
 };
 
@@ -134,10 +133,7 @@ async fn credentials(spec: &ConnSpec) -> anyhow::Result<(String, String)> {
             };
             Ok((u, String::new()))
         }
-        _ => Ok((
-            spec.param_opt("user").unwrap_or("postgres").to_string(),
-            String::new(),
-        )),
+        _ => Ok((spec.param_opt("user").unwrap_or("postgres").to_string(), String::new())),
     }
 }
 
@@ -172,11 +168,7 @@ impl Driver for PostgresDriver {
         self.meta
     }
 
-    async fn connect(
-        &self,
-        spec: &ConnSpec,
-        net: NetContext,
-    ) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
         let cfg = build_config(spec, &net).await?;
         let conn = PgConnection::open(cfg, spec.tls.clone()).await?;
         Ok(Box::new(conn))
@@ -242,11 +234,7 @@ impl PgConnection {
     }
 
     /// Open a plaintext connection (Disable, or a Prefer fallback).
-    async fn open_plain(
-        config: Config,
-        tls: crate::spec::TlsSpec,
-        encrypted: bool,
-    ) -> anyhow::Result<Self> {
+    async fn open_plain(config: Config, tls: crate::spec::TlsSpec, encrypted: bool) -> anyhow::Result<Self> {
         let (client, connection) = config
             .connect(NoTls)
             .await
@@ -264,10 +252,7 @@ impl PgConnection {
     }
 
     /// Run a statement via the simple (text) protocol, collecting typed-as-text rows.
-    async fn simple(
-        &self,
-        sql: &str,
-    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>, Option<u64>)> {
+    async fn simple(&self, sql: &str) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>, Option<u64>)> {
         let msgs = self.client.simple_query(sql).await.map_err(pg_error)?;
         let mut columns: Vec<Column> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -401,10 +386,7 @@ impl Connection for PgConnection {
                     Some(Value::Text(s)) => s.clone(),
                     _ => String::new(),
                 };
-                Column {
-                    name,
-                    type_name: ty,
-                }
+                Column { name, type_name: ty }
             })
             .collect())
     }
@@ -437,9 +419,7 @@ impl Connection for PgConnection {
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows, affected) = self.simple(stmt).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(
-            columns, rows, affected,
-        )))
+        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, affected)))
     }
 
     fn cancel_token(&self) -> Option<Box<dyn CancelHandle>> {

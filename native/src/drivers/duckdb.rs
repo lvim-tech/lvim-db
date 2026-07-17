@@ -15,9 +15,7 @@ use duckdb::Connection as DuckConn;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
-use crate::spec::{
-    AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
-};
+use crate::spec::{AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value};
 
 const PARAMS: &[ParamSpec] = &[ParamSpec {
     key: "file",
@@ -62,11 +60,7 @@ impl Driver for DuckdbDriver {
         &META
     }
 
-    async fn connect(
-        &self,
-        spec: &ConnSpec,
-        _net: NetContext,
-    ) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(&self, spec: &ConnSpec, _net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
         let file = spec.param("file")?.to_string();
         let conn = tokio::task::spawn_blocking(move || {
             if file == ":memory:" {
@@ -120,10 +114,7 @@ struct DuckdbConnection {
 }
 
 impl DuckdbConnection {
-    async fn run(
-        &self,
-        sql: String,
-    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>, Option<u64>)> {
+    async fn run(&self, sql: String) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>, Option<u64>)> {
         let arc = self.conn.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let conn = arc.lock().unwrap();
@@ -142,10 +133,7 @@ impl DuckdbConnection {
                     ncol = stmt_ref.column_count();
                     columns = (0..ncol)
                         .map(|i| Column {
-                            name: stmt_ref
-                                .column_name(i)
-                                .map(|s| s.to_string())
-                                .unwrap_or_default(),
+                            name: stmt_ref.column_name(i).map(|s| s.to_string()).unwrap_or_default(),
                             type_name: String::new(),
                         })
                         .collect();
@@ -167,10 +155,7 @@ impl DuckdbConnection {
                 }
                 columns = (0..cc)
                     .map(|i| Column {
-                        name: stmt
-                            .column_name(i)
-                            .map(|s| s.to_string())
-                            .unwrap_or_default(),
+                        name: stmt.column_name(i).map(|s| s.to_string()).unwrap_or_default(),
                         type_name: String::new(),
                     })
                     .collect();
@@ -188,9 +173,7 @@ impl Connection for DuckdbConnection {
     }
 
     async fn switch_database(&mut self, _db: &str) -> anyhow::Result<()> {
-        Err(anyhow::anyhow!(
-            "DuckDB has a single database per connection"
-        ))
+        Err(anyhow::anyhow!("DuckDB has a single database per connection"))
     }
 
     async fn structure(&mut self) -> anyhow::Result<Vec<Node>> {
@@ -295,9 +278,7 @@ impl Connection for DuckdbConnection {
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows, affected) = self.run(stmt.to_string()).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(
-            columns, rows, affected,
-        )))
+        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, affected)))
     }
 
     async fn close(self: Box<Self>) -> anyhow::Result<()> {
