@@ -378,6 +378,24 @@ function M.load_query(conn_name, name)
     require("lvim-db.ui.workspace").focus_editor()
 end
 
+--- Load arbitrary TEXT into the editor buffer (replacing its content), bind `conn_name` as active, and
+--- focus the editor. The generic half of `load_query`: the drawer's `DDL` facet drops a CREATE statement in
+--- here, so it lands in the one place that already syntax-highlights, yanks and re-runs SQL — instead of a
+--- read-only float that can do none of those.
+---
+--- The query NAME is cleared: this text did not come from a saved query, and leaving the previous name bound
+--- would make the next save silently overwrite THAT query with this DDL.
+---@param conn_name string
+---@param text string
+function M.load_text(conn_name, text)
+    local buf = M.ensure_buf()
+    vim.bo[buf].modifiable = true
+    api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(text or "", "\n", { plain = true }))
+    vim.b[buf][QNAME] = nil
+    M.set_active(conn_name)
+    require("lvim-db.ui.workspace").focus_editor()
+end
+
 -- ── the help window (the canonical cheatsheet) ───────────────────────────────
 
 -- Key id → description, in display order. Built from the LIVE `config.keys.editor`, so a rebind

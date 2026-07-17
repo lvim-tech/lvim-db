@@ -70,6 +70,35 @@ local function check_daemon(h)
         end
         table.sort(kinds)
         h.ok(("%d driver%s: %s"):format(#metas, #metas == 1 and "" or "s", table.concat(kinds, ", ")))
+
+        -- Per-object introspection is UNEVEN across engines and the drawer offers a facet only where its
+        -- driver claims the capability — so report which engines answer what, rather than leaving the user to
+        -- wonder why `Indexes` is missing on one connection and present on another.
+        local idx, ddl, neither = {}, {}, {}
+        for _, m in ipairs(metas) do
+            local c = m.caps or {}
+            local name = m.display or m.kind
+            if c.indexes then
+                idx[#idx + 1] = name
+            end
+            if c.ddl then
+                ddl[#ddl + 1] = name
+            end
+            if not c.indexes and not c.ddl then
+                neither[#neither + 1] = name
+            end
+        end
+        table.sort(idx)
+        table.sort(ddl)
+        table.sort(neither)
+        h.info(("object indexes: %s"):format(#idx > 0 and table.concat(idx, ", ") or "none"))
+        h.info(("object DDL: %s"):format(#ddl > 0 and table.concat(ddl, ", ") or "none"))
+        if #neither > 0 then
+            h.info(
+                ("no per-object introspection (by design): %s"):format(table.concat(neither, ", "))
+                    .. " — a KV store has no indexes and no schema to describe"
+            )
+        end
     end
 
     -- Encryption posture (the standard build ships rustls TLS + the SSH tunnel).

@@ -24,7 +24,8 @@ pub fn install_crypto_provider() {
 
 /// Load PEM certificates from a file.
 fn load_certs(path: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    let data = std::fs::read(path).map_err(|e| anyhow::anyhow!("cannot read cert '{path}': {e}"))?;
+    let data =
+        std::fs::read(path).map_err(|e| anyhow::anyhow!("cannot read cert '{path}': {e}"))?;
     let mut reader = std::io::BufReader::new(&data[..]);
     let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
     certs.map_err(|e| anyhow::anyhow!("bad certificate '{path}': {e}"))
@@ -64,7 +65,12 @@ impl ServerCertVerifier for AcceptAnyServerCert {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -73,7 +79,12 @@ impl ServerCertVerifier for AcceptAnyServerCert {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {

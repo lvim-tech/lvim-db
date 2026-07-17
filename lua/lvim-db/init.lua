@@ -217,6 +217,45 @@ function M.columns(conn_id, object, cb)
     end)
 end
 
+--- The indexes on one object `{ name, schema? }` — each `{ name, columns, unique, primary }`.
+--- Only meaningful where the driver advertises `caps.indexes`; a driver without it answers with an empty
+--- list (the daemon's trait default), so the caller gates on the CAPABILITY rather than on an empty reply —
+--- "no indexes" and "cannot tell you" are different answers and must not render the same.
+---@param conn_id integer
+---@param object { name: string, schema: string? }
+---@param cb fun(indexes: table[]?, err: string?)
+function M.indexes(conn_id, object, cb)
+    daemon.request("schema.indexes", { conn_id = conn_id, object = object }, function(result, err)
+        cb(result and result.indexes or nil, err)
+    end)
+end
+
+--- The CREATE statement for one object `{ name, schema? }`, or nil when the engine has none to give.
+--- Gated on `caps.ddl` at the call site, for the same reason as `M.indexes`.
+---@param conn_id integer
+---@param object { name: string, schema: string? }
+---@param cb fun(ddl: string?, err: string?)
+function M.ddl(conn_id, object, cb)
+    daemon.request("schema.ddl", { conn_id = conn_id, object = object }, function(result, err)
+        cb(result and result.ddl or nil, err)
+    end)
+end
+
+--- The capability set of a driver KIND (`caps.indexes` / `caps.ddl` / `caps.sql` …), from the daemon's
+--- `rpc.hello` metadata. Empty table for an unknown kind, so a caller can index it without guarding.
+--- The drawer offers a per-object helper ONLY where its driver claims the capability — so no engine ever
+--- grows a row that dead-ends.
+---@param kind string
+---@return table
+function M.caps(kind)
+    for _, meta in ipairs(daemon.drivers() or {}) do
+        if meta.kind == kind then
+            return meta.caps or {}
+        end
+    end
+    return {}
+end
+
 -- ─── statements ──────────────────────────────────────────────────────────────
 
 --- Whether `statement` matches the configured destructive patterns (DROP /

@@ -16,7 +16,8 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec,
+    ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -60,6 +61,8 @@ const META: DriverMeta = DriverMeta {
         tunnel: true,
         multi_db: true,
         kv: false,
+        indexes: true,
+        ddl: false, // sys.indexes; SQL Server scripts CREATE client-side (SSMS), no server command
     },
 };
 
@@ -78,7 +81,11 @@ impl Driver for MssqlDriver {
         &META
     }
 
-    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(
+        &self,
+        spec: &ConnSpec,
+        net: NetContext,
+    ) -> anyhow::Result<Box<dyn Connection>> {
         let host = spec.param("host")?;
         let port = spec.port(1433);
         let addr = net.resolve(host, port).await?;
@@ -88,7 +95,11 @@ impl Driver for MssqlDriver {
 
         let (user, password) = match &spec.auth {
             AuthSpec::Password { user, password } => (user.clone(), password.resolve().await?),
-            _ => return Err(anyhow::anyhow!("SQL Server requires password authentication")),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "SQL Server requires password authentication"
+                ))
+            }
         };
 
         let mut config = Config::new();
@@ -163,8 +174,15 @@ fn render_cell(row: &tiberius::Row, i: usize) -> Value {
 
 impl MssqlConnection {
     async fn run(&mut self, sql: &str) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>)> {
-        let stream = self.client.query(sql, &[]).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        let rows = stream.into_first_result().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let stream = self
+            .client
+            .query(sql, &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut columns = Vec::new();
         if let Some(r0) = rows.first() {
             columns = r0
@@ -188,7 +206,9 @@ impl MssqlConnection {
 #[async_trait]
 impl Connection for MssqlConnection {
     async fn databases(&mut self) -> anyhow::Result<Vec<String>> {
-        let (_c, rows) = self.run("SELECT name FROM sys.databases ORDER BY name").await?;
+        let (_c, rows) = self
+            .run("SELECT name FROM sys.databases ORDER BY name")
+            .await?;
         Ok(rows
             .into_iter()
             .filter_map(|r| match r.into_iter().next() {
@@ -273,9 +293,34 @@ impl Connection for MssqlConnection {
             .collect())
     }
 
+    async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
+        // sys.index_columns is the per-column table, ordered by key_ordinal — the fold shape. A heap has an
+        // unnamed index_id 0 row, which is not an index and is excluded.
+        let schema_pred = match &obj.schema {
+            Some(sc) => format!("AND s.name = '{}'", sc.replace('\'', "''")),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT i.name, CAST(i.is_unique AS INT), CAST(i.is_primary_key AS INT), c.name \
+             FROM sys.indexes i \
+             JOIN sys.tables t ON t.object_id = i.object_id \
+             JOIN sys.schemas s ON s.schema_id = t.schema_id \
+             LEFT JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+             LEFT JOIN sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id \
+             WHERE t.name = '{}' {} AND i.name IS NOT NULL \
+             ORDER BY i.name, ic.key_ordinal",
+            obj.name.replace('\'', "''"),
+            schema_pred
+        );
+        let (_c, rows) = self.run(&sql).await?;
+        Ok(super::group_indexes(rows))
+    }
+
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows) = self.run(stmt).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, None)))
+        Ok(Box::new(super::buffered::BufferedStream::new(
+            columns, rows, None,
+        )))
     }
 
     fn encrypted(&self) -> bool {

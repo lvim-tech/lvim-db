@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 
 use crate::net::NetContext;
-use crate::spec::{Column, ConnSpec, DriverMeta, Node, ObjRef, Value};
+use crate::spec::{Column, ConnSpec, DriverMeta, Index, Node, ObjRef, Value};
 
 /// A registered database type. Immutable, cheap; holds the static metadata and
 /// knows how to open a connection.
@@ -24,7 +24,11 @@ pub trait Driver: Send + Sync {
 
     /// Open one connection. `net` has already resolved any SSH tunnel, so the
     /// driver dials the address `net` hands it — tunnelling is transparent.
-    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>>;
+    async fn connect(
+        &self,
+        spec: &ConnSpec,
+        net: NetContext,
+    ) -> anyhow::Result<Box<dyn Connection>>;
 }
 
 /// A live connection. Held server-side behind a mutex and addressed by a numeric
@@ -42,6 +46,22 @@ pub trait Connection: Send {
 
     /// The columns of one object.
     async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>>;
+
+    /// The indexes on one object (`Caps::indexes`). Defaults to "this engine has none to show" so a driver
+    /// opts IN by implementing it — the same shape as `cancel_token` — rather than every driver being forced
+    /// to write a stub. A driver that implements this MUST also set `Caps::indexes`, since the UI offers the
+    /// helper off the capability, not off a probe.
+    async fn indexes(&mut self, _obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
+        Ok(Vec::new())
+    }
+
+    /// The CREATE statement for one object (`Caps::ddl`), or `None` when the engine has no server-side way to
+    /// produce it. Returning the engine's OWN answer is the whole point: re-assembling a CREATE from column
+    /// metadata would silently drop constraints, defaults and storage clauses, and would read as authoritative
+    /// while being wrong — so a driver that cannot ask the server for it does not claim the capability.
+    async fn ddl(&mut self, _obj: &ObjRef) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
 
     /// Execute a statement, returning a paged result stream.
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>>;

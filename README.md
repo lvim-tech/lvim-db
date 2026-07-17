@@ -225,6 +225,49 @@ This also covers token-style provider auth, e.g. an AWS RDS IAM token:
 - `:LvimDb status` — a one-line backend/store status snapshot
 - `:LvimDb health` — open `:checkhealth lvim-db`
 
+### Browsing an object
+
+Expanding a table / view / collection shows its **facets** — one row per thing you can ask about it — and
+each facet either opens or acts:
+
+```
+users
+   Data          run a bounded preview into the result dock
+  Columns        expands to the columns, with their types
+  Indexes        expands to the indexes: name, unique/pk, and the columns (in index order)
+   DDL           load the object's CREATE statement into the SQL editor
+```
+
+`Indexes` and `DDL` appear **only where the driver has them**, from the capabilities the daemon reports —
+so no engine grows a row that dead-ends. A document store has no `DDL`; PostgreSQL and SQL Server list
+indexes but have no server-side `CREATE` statement to show (their tooling reconstructs it client-side);
+Redis has neither.
+
+| | indexes | DDL |
+| --- | --- | --- |
+| SQLite · MySQL · MariaDB · ClickHouse · DuckDB | ✓ | ✓ |
+| PostgreSQL · SQL Server · MongoDB · Cassandra · Firebird | ✓ | — |
+| Snowflake | — (micro-partitions) | ✓ |
+| Redis | — | — |
+
+### Changing a schema
+
+On the schema rows, `a` / `e` / `x` mean what they already mean for a connection — add / edit / delete **the
+thing under the cursor** — one tier down:
+
+| row | `a` | `e` | `x` |
+| --- | --- | --- | --- |
+| `Columns` | add a column | — | — |
+| a column | — | rename it | drop it |
+| `Indexes` | create an index | — | — |
+| an index | — | — | drop it |
+
+Each **generates the statement into the SQL editor** in your engine's dialect — it never runs it. You read
+it and run it yourself (where the destructive guard still applies). That is deliberate: `ALTER` dialects
+diverge far more than `SELECT`, and some engines cannot do what a tidy form would imply — SQLite has no
+`ALTER COLUMN` at all, so changing a column's type means rebuilding the table and copying the data. A
+generated statement makes that impossible to do silently.
+
 ### The workspace tab
 
 `:LvimDb open` hosts the client in its OWN tabpage (marked internally so it is always found again,

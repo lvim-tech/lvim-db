@@ -14,7 +14,8 @@ use serde::Deserialize;
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec,
+    ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -58,6 +59,8 @@ const META: DriverMeta = DriverMeta {
         tunnel: true,
         multi_db: true,
         kv: false,
+        indexes: true,
+        ddl: true, // system.data_skipping_indices / SHOW CREATE TABLE
     },
 };
 
@@ -76,7 +79,11 @@ impl Driver for ClickhouseDriver {
         &META
     }
 
-    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(
+        &self,
+        spec: &ConnSpec,
+        net: NetContext,
+    ) -> anyhow::Result<Box<dyn Connection>> {
         let host = spec.param("host")?;
         let port = spec.port(8123);
         let addr = net.resolve(host, port).await?;
@@ -98,21 +105,27 @@ impl Driver for ClickhouseDriver {
                     cb = cb.danger_accept_invalid_hostnames(true);
                 }
                 if let Some(ca) = &tls.ca {
-                    let pem = std::fs::read(ca).map_err(|e| anyhow::anyhow!("cannot read CA '{ca}': {e}"))?;
+                    let pem = std::fs::read(ca)
+                        .map_err(|e| anyhow::anyhow!("cannot read CA '{ca}': {e}"))?;
                     let cert = reqwest::Certificate::from_pem(&pem)
                         .map_err(|e| anyhow::anyhow!("bad CA certificate: {e}"))?;
                     cb = cb.add_root_certificate(cert);
                 }
                 if let (Some(cert), Some(key)) = (&tls.client_cert, &tls.client_key) {
-                    let mut pem = std::fs::read(cert).map_err(|e| anyhow::anyhow!("cannot read cert: {e}"))?;
-                    pem.extend_from_slice(&std::fs::read(key).map_err(|e| anyhow::anyhow!("cannot read key: {e}"))?);
+                    let mut pem = std::fs::read(cert)
+                        .map_err(|e| anyhow::anyhow!("cannot read cert: {e}"))?;
+                    pem.extend_from_slice(
+                        &std::fs::read(key).map_err(|e| anyhow::anyhow!("cannot read key: {e}"))?,
+                    );
                     let id = reqwest::Identity::from_pem(&pem)
                         .map_err(|e| anyhow::anyhow!("bad client identity: {e}"))?;
                     cb = cb.identity(id);
                 }
             }
             Ok(ClickhouseConnection {
-                client: cb.build().map_err(|e| anyhow::anyhow!("http client: {e}"))?,
+                client: cb
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("http client: {e}"))?,
                 base: format!("{}://{addr}", if encrypted { "https" } else { "http" }),
                 user: user.clone(),
                 password: password.clone(),
@@ -131,7 +144,9 @@ impl Driver for ClickhouseDriver {
             Ok(_) => Ok(Box::new(conn)),
             Err(e) => {
                 if tls.required() {
-                    Err(anyhow::anyhow!("clickhouse: TLS is required but the connection failed: {e}"))
+                    Err(anyhow::anyhow!(
+                        "clickhouse: TLS is required but the connection failed: {e}"
+                    ))
                 } else {
                     let plain = build(false)?;
                     plain.query_json("SELECT 1").await?;
@@ -209,8 +224,8 @@ impl ClickhouseConnection {
         if text.trim().is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
-        let parsed: JsonCompact =
-            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("bad clickhouse response: {e}"))?;
+        let parsed: JsonCompact = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("bad clickhouse response: {e}"))?;
         let columns = parsed
             .meta
             .into_iter()
@@ -243,7 +258,8 @@ impl ClickhouseConnection {
 #[async_trait]
 impl Connection for ClickhouseConnection {
     async fn databases(&mut self) -> anyhow::Result<Vec<String>> {
-        self.string_column("SELECT name FROM system.databases ORDER BY name").await
+        self.string_column("SELECT name FROM system.databases ORDER BY name")
+            .await
     }
 
     async fn switch_database(&mut self, db: &str) -> anyhow::Result<()> {
@@ -268,7 +284,11 @@ impl Connection for ClickhouseConnection {
             let schema = get(0);
             let name = get(1);
             let engine = get(2);
-            let kind = if engine.contains("View") { "view" } else { "table" };
+            let kind = if engine.contains("View") {
+                "view"
+            } else {
+                "table"
+            };
             let node = Node {
                 name,
                 kind: kind.to_string(),
@@ -311,9 +331,51 @@ impl Connection for ClickhouseConnection {
             .collect())
     }
 
+    async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
+        // ClickHouse has no b-tree indexes: what it calls an index is a DATA-SKIPPING index, in
+        // system.data_skipping_indices. `expr` is the indexed EXPRESSION, not a column vector, so it is shown
+        // whole rather than parsed apart. A MergeTree's real access path is its ORDER BY / primary key, which
+        // lives in the CREATE statement — that is what the DDL facet is for. Nothing here claims unique or
+        // primary, because a skipping index is neither.
+        let db = match &obj.schema {
+            Some(sc) => sc.replace('\'', "''"),
+            None => self.database.replace('\'', "''"),
+        };
+        let sql = format!(
+            "SELECT name, 0, 0, expr FROM system.data_skipping_indices \
+             WHERE table = '{}' AND database = '{}' ORDER BY name",
+            obj.name.replace('\'', "''"),
+            db
+        );
+        let (_c, rows) = self.query_json(&sql).await?;
+        Ok(super::group_indexes(rows))
+    }
+
+    async fn ddl(&mut self, obj: &ObjRef) -> anyhow::Result<Option<String>> {
+        // SHOW CREATE TABLE is the server's own text, and on ClickHouse it is the only place the engine,
+        // ORDER BY and partitioning appear — the parts that actually define how the table behaves.
+        let qname = match &obj.schema {
+            Some(sc) => format!(
+                "`{}`.`{}`",
+                sc.replace('`', "``"),
+                obj.name.replace('`', "``")
+            ),
+            None => format!("`{}`", obj.name.replace('`', "``")),
+        };
+        let (_c, rows) = self
+            .query_json(&format!("SHOW CREATE TABLE {qname}"))
+            .await?;
+        Ok(rows.first().and_then(|r| match r.first() {
+            Some(Value::Text(s)) => Some(s.clone()),
+            _ => None,
+        }))
+    }
+
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows) = self.query_json(stmt).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, None)))
+        Ok(Box::new(super::buffered::BufferedStream::new(
+            columns, rows, None,
+        )))
     }
 
     fn encrypted(&self) -> bool {

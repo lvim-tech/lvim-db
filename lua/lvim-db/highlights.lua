@@ -38,6 +38,12 @@ function M.build()
         LvimDbCollection = { fg = c.orange }, -- a (mongo) collection
         LvimDbColumn = { fg = c.fg }, -- a column / field — readable, not dim
         LvimDbKey = { fg = c.orange }, -- a redis key (its own driver context)
+        -- The per-object FACET rows (Data / Columns / Indexes / DDL). They are one tier BELOW an object and
+        -- are chrome, not data, so they take the same teal family — distinct from every object hue above them
+        -- (yellow/cyan/orange) and from the columns/indexes they reveal below.
+        LvimDbData = { fg = c.teal }, -- the "Data" facet (runs the preview)
+        LvimDbIndex = { fg = c.teal }, -- the "Indexes" facet + each index leaf
+        LvimDbDdl = { fg = c.teal }, -- the "DDL" facet
         -- Saved queries — PURPLE, a hue used by no other drawer kind (so a connection's Queries branch and
         -- its query leaves read apart from schemas/objects/columns that can sit in the same tree).
         LvimDbQueries = { fg = c.purple, bold = true }, -- the saved-queries BRANCH

@@ -16,7 +16,8 @@ use scylla::value::{CqlValue, Row};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec,
+    ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -56,6 +57,8 @@ const CAPS: Caps = Caps {
     tunnel: true,
     multi_db: true,
     kv: false,
+    indexes: true,
+    ddl: false, // system_schema.indexes; DESCRIBE is reconstructed CLIENT-side in CQL
 };
 
 const CASSANDRA_META: DriverMeta = DriverMeta {
@@ -84,7 +87,9 @@ pub struct CqlDriver {
 impl CqlDriver {
     #[cfg(feature = "cassandra")]
     pub fn cassandra() -> Self {
-        Self { meta: &CASSANDRA_META }
+        Self {
+            meta: &CASSANDRA_META,
+        }
     }
 
     #[cfg(feature = "scylla")]
@@ -99,7 +104,11 @@ impl Driver for CqlDriver {
         self.meta
     }
 
-    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(
+        &self,
+        spec: &ConnSpec,
+        net: NetContext,
+    ) -> anyhow::Result<Box<dyn Connection>> {
         // Native CQL TLS is not yet wired (scylla's rustls TLS context). Rather
         // than silently send credentials in the clear, a REQUIRED-encryption
         // connection is refused — use an SSH tunnel for an encrypted CQL link
@@ -178,7 +187,10 @@ impl CqlConnection {
             })
             .collect();
         let mut out: Vec<Vec<Value>> = Vec::new();
-        for row in rows_result.rows::<Row>().map_err(|e| anyhow::anyhow!("{e}"))? {
+        for row in rows_result
+            .rows::<Row>()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+        {
             let row = row.map_err(|e| anyhow::anyhow!("{e}"))?;
             let cells = row
                 .columns
@@ -255,7 +267,11 @@ impl Connection for CqlConnection {
     }
 
     async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
-        let ks = obj.schema.clone().or_else(|| self.keyspace.clone()).unwrap_or_default();
+        let ks = obj
+            .schema
+            .clone()
+            .or_else(|| self.keyspace.clone())
+            .unwrap_or_default();
         let sql = format!(
             "SELECT column_name, type FROM system_schema.columns \
              WHERE keyspace_name = '{}' AND table_name = '{}'",
@@ -278,9 +294,58 @@ impl Connection for CqlConnection {
             .collect())
     }
 
+    async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
+        // system_schema.indexes is the cluster's own catalog. A CQL secondary index has exactly ONE target
+        // (options['target']) and is never unique nor primary — the partition key is not an index — so those
+        // flags are honestly false rather than invented.
+        let ks = match &obj.schema {
+            Some(sc) => sc.replace('\'', "''"),
+            None => return Ok(Vec::new()),
+        };
+        let sql = format!(
+            "SELECT index_name, options FROM system_schema.indexes \
+             WHERE keyspace_name = '{}' AND table_name = '{}'",
+            ks,
+            obj.name.replace('\'', "''")
+        );
+        let (_c, rows) = self.run(&sql).await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let name = match r.first() {
+                    Some(Value::Text(s)) => s.clone(),
+                    _ => return None,
+                };
+                // `options` is a CQL map<text,text> that this driver renders with Rust's Debug, so it
+                // arrives literally as: Map([(Text("target"), Text("email"))]). MEASURED against a live
+                // cluster — an earlier guess at the shape sliced it into garbage ('), Text('), which is
+                // exactly the failure a "looks like a string, split it" approach earns.
+                // So: find the `target` key, then take the NEXT quoted run — its value.
+                let target = match r.get(1) {
+                    Some(Value::Text(s)) => {
+                        s.split_once("Text(\"target\")").and_then(|(_, rest)| {
+                            rest.split_once("Text(\"")
+                                .and_then(|(_, v)| v.split_once('"'))
+                                .map(|(v, _)| v.to_string())
+                        })
+                    }
+                    _ => None,
+                };
+                Some(Index {
+                    name,
+                    columns: target.into_iter().filter(|t| !t.is_empty()).collect(),
+                    unique: false,
+                    primary: false,
+                })
+            })
+            .collect())
+    }
+
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows) = self.run(stmt).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, None)))
+        Ok(Box::new(super::buffered::BufferedStream::new(
+            columns, rows, None,
+        )))
     }
 
     async fn close(self: Box<Self>) -> anyhow::Result<()> {

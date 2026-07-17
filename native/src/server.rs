@@ -162,6 +162,8 @@ impl Server {
             "conn.switch_database" => self.switch_database(params).await,
             "schema.structure" => self.structure(params).await,
             "schema.columns" => self.columns(params).await,
+            "schema.indexes" => self.indexes(params).await,
+            "schema.ddl" => self.ddl(params).await,
             "query.execute" => self.execute(params).await,
             "query.page" => self.page(params).await,
             "query.cancel" => self.cancel(params).await,
@@ -254,14 +256,20 @@ impl Server {
     /// with neither (an HTTPS API like Snowflake) has nothing to probe short of a
     /// real connect, and says so.
     async fn test_endpoint(spec: &ConnSpec, meta: &'static DriverMeta) -> anyhow::Result<String> {
-        if let Some(fp) = meta.params.iter().find(|p| matches!(p.kind, ParamType::File)) {
+        if let Some(fp) = meta
+            .params
+            .iter()
+            .find(|p| matches!(p.kind, ParamType::File))
+        {
             let raw = spec.param(fp.key)?;
             let path = expand_tilde(raw);
-            let md = std::fs::metadata(&path).map_err(|e| anyhow::anyhow!("cannot stat '{path}': {e}"))?;
+            let md = std::fs::metadata(&path)
+                .map_err(|e| anyhow::anyhow!("cannot stat '{path}': {e}"))?;
             if !md.is_file() {
                 return Err(anyhow::anyhow!("'{path}' is not a regular file"));
             }
-            std::fs::File::open(&path).map_err(|e| anyhow::anyhow!("cannot open '{path}' for reading: {e}"))?;
+            std::fs::File::open(&path)
+                .map_err(|e| anyhow::anyhow!("cannot open '{path}' for reading: {e}"))?;
             return Ok(format!("{path} — readable, {} bytes", md.len()));
         }
 
@@ -273,13 +281,21 @@ impl Server {
         };
         let port = spec.port(meta.default_port.unwrap_or(0));
         if port == 0 {
-            return Err(anyhow::anyhow!("no port set and '{}' declares no default", meta.kind));
+            return Err(anyhow::anyhow!(
+                "no port set and '{}' declares no default",
+                meta.kind
+            ));
         }
         let net = NetContext::new(spec.tunnel.clone());
         let addr = net.resolve(host, port).await?;
         tokio::time::timeout(DIAL_TIMEOUT, tokio::net::TcpStream::connect(&addr))
             .await
-            .map_err(|_| anyhow::anyhow!("timed out dialling {host}:{port} after {}s", DIAL_TIMEOUT.as_secs()))?
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out dialling {host}:{port} after {}s",
+                    DIAL_TIMEOUT.as_secs()
+                )
+            })?
             .map_err(|e| anyhow::anyhow!("cannot reach {host}:{port}: {e}"))?;
         Ok(if net.tunneled() {
             format!("{host}:{port} reachable through the SSH tunnel (local {addr})")
@@ -294,15 +310,20 @@ impl Server {
     /// down when `net` drops at the end of this call.
     async fn test_tunnel(spec: &ConnSpec, meta: &'static DriverMeta) -> anyhow::Result<String> {
         let Some(t) = spec.tunnel.clone() else {
-            return Err(anyhow::anyhow!("no SSH tunnel configured on this connection"));
+            return Err(anyhow::anyhow!(
+                "no SSH tunnel configured on this connection"
+            ));
         };
         // The forward needs a target: the DB endpoint the tunnel would front.
-        let host = spec
-            .param_opt("host")
-            .ok_or_else(|| anyhow::anyhow!("a tunnel needs a host to forward to — fill the Connection tab first"))?;
+        let host = spec.param_opt("host").ok_or_else(|| {
+            anyhow::anyhow!("a tunnel needs a host to forward to — fill the Connection tab first")
+        })?;
         let port = spec.port(meta.default_port.unwrap_or(0));
         if port == 0 {
-            return Err(anyhow::anyhow!("no port set and '{}' declares no default", meta.kind));
+            return Err(anyhow::anyhow!(
+                "no port set and '{}' declares no default",
+                meta.kind
+            ));
         }
         let user = t.user.clone();
         let (shost, sport) = (t.host.clone(), t.port);
@@ -327,9 +348,14 @@ impl Server {
 
         if stage == "tls" {
             return Ok(match (native, tunneled) {
-                (true, true) => "encrypted — native TLS negotiated, and the link also rides the SSH tunnel".into(),
+                (true, true) => {
+                    "encrypted — native TLS negotiated, and the link also rides the SSH tunnel"
+                        .into()
+                }
                 (true, false) => "encrypted — native TLS negotiated".into(),
-                (false, true) => "encrypted — no native TLS, but the link rides the SSH tunnel".into(),
+                (false, true) => {
+                    "encrypted — no native TLS, but the link rides the SSH tunnel".into()
+                }
                 (false, false) => {
                     return Err(anyhow::anyhow!(
                         "connected but the link is PLAINTEXT — no TLS negotiated and no SSH tunnel"
@@ -355,7 +381,11 @@ impl Server {
         };
         Ok(format!(
             "connected — {who}; link {}",
-            if native || tunneled { "encrypted" } else { "PLAINTEXT" }
+            if native || tunneled {
+                "encrypted"
+            } else {
+                "PLAINTEXT"
+            }
         ))
     }
 
@@ -425,6 +455,32 @@ impl Server {
         Ok(json!({ "columns": cols }))
     }
 
+    async fn indexes(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn_id: u64,
+            object: ObjRef,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let conn = self.conn(p.conn_id)?;
+        let idx = conn.lock().await.indexes(&p.object).await?;
+        Ok(json!({ "indexes": idx }))
+    }
+
+    async fn ddl(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn_id: u64,
+            object: ObjRef,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let conn = self.conn(p.conn_id)?;
+        // `null` when the engine has no server-side CREATE to give (the trait default). The client shows the
+        // helper only where `Caps::ddl` is set, so this is a belt on a driver that lies about its caps.
+        let sql = conn.lock().await.ddl(&p.object).await?;
+        Ok(json!({ "ddl": sql }))
+    }
+
     // ── query ────────────────────────────────────────────────────────────────
 
     async fn execute(&self, params: Json) -> anyhow::Result<Json> {
@@ -438,7 +494,11 @@ impl Server {
 
         let call_id = self.inner.next_call.fetch_add(1, Ordering::Relaxed);
         let call = Arc::new(AsyncMutex::new(Call::new()));
-        self.inner.calls.lock().unwrap().insert(call_id, call.clone());
+        self.inner
+            .calls
+            .lock()
+            .unwrap()
+            .insert(call_id, call.clone());
 
         // Run the statement in the background; respond with the call_id now.
         let server = self.clone();
@@ -478,7 +538,14 @@ impl Server {
         Ok(json!({ "call_id": call_id }))
     }
 
-    fn notify_state(&self, call_id: u64, status: CallStatus, ms: u64, error: Option<String>, affected: Option<u64>) {
+    fn notify_state(
+        &self,
+        call_id: u64,
+        status: CallStatus,
+        ms: u64,
+        error: Option<String>,
+        affected: Option<u64>,
+    ) {
         let mut params = json!({
             "call_id": call_id,
             "state": status.as_str(),
@@ -519,7 +586,10 @@ impl Server {
         match c.status {
             CallStatus::Running => return Ok(json!({ "ready": false })),
             CallStatus::Failed => {
-                return Err(anyhow::anyhow!(c.error.clone().unwrap_or_else(|| "query failed".into())))
+                return Err(anyhow::anyhow!(c
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "query failed".into())))
             }
             CallStatus::Cancelled => return Err(anyhow::anyhow!("query was cancelled")),
             CallStatus::Done => {}
@@ -540,7 +610,11 @@ impl Server {
             }
         }
 
-        let total = if c.exhausted { Some(c.buffer.len()) } else { None };
+        let total = if c.exhausted {
+            Some(c.buffer.len())
+        } else {
+            None
+        };
         let start = p.from.min(c.buffer.len());
         let end = need.min(c.buffer.len());
         let rows = &c.buffer[start..end];

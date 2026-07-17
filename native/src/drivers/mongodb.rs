@@ -20,7 +20,8 @@ use mongodb::{Client, Cursor};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec,
+    ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -58,7 +59,12 @@ const PARAMS: &[ParamSpec] = &[
     },
 ];
 
-const AUTH: &[AuthKind] = &[AuthKind::None, AuthKind::Password, AuthKind::ClientCert, AuthKind::Provider];
+const AUTH: &[AuthKind] = &[
+    AuthKind::None,
+    AuthKind::Password,
+    AuthKind::ClientCert,
+    AuthKind::Provider,
+];
 
 const MONGO_META: DriverMeta = DriverMeta {
     kind: "mongodb",
@@ -74,6 +80,8 @@ const MONGO_META: DriverMeta = DriverMeta {
         tunnel: true,
         multi_db: true,
         kv: true,
+        indexes: true, // listIndexes
+        ddl: false,    // a document store has no CREATE statement to show
     },
 };
 
@@ -109,7 +117,11 @@ impl Driver for MongoDriver {
         &MONGO_META
     }
 
-    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(
+        &self,
+        spec: &ConnSpec,
+        net: NetContext,
+    ) -> anyhow::Result<Box<dyn Connection>> {
         let host = spec.param("host")?;
         let port = spec.port(27017);
         let db = spec.param("database")?.to_string();
@@ -145,7 +157,13 @@ impl Driver for MongoDriver {
             let mut tls_opts = opts.clone();
             tls_opts.tls = Some(mongodb::options::Tls::Enabled(topts));
             match MongoConnection::probe(tls_opts, &db).await {
-                Ok(client) => return Ok(Box::new(MongoConnection { client, db, encrypted: true })),
+                Ok(client) => {
+                    return Ok(Box::new(MongoConnection {
+                        client,
+                        db,
+                        encrypted: true,
+                    }))
+                }
                 Err(e) => {
                     if tls.required() {
                         return Err(anyhow::anyhow!(
@@ -159,7 +177,11 @@ impl Driver for MongoDriver {
         }
 
         let client = MongoConnection::probe(opts, &db).await?;
-        Ok(Box::new(MongoConnection { client, db, encrypted }))
+        Ok(Box::new(MongoConnection {
+            client,
+            db,
+            encrypted,
+        }))
     }
 }
 
@@ -173,7 +195,8 @@ struct MongoConnection {
 impl MongoConnection {
     /// Build a client from options and ping so a bad host/auth/TLS fails now.
     async fn probe(opts: ClientOptions, db: &str) -> anyhow::Result<Client> {
-        let client = Client::with_options(opts).map_err(|e| anyhow::anyhow!("mongodb connect failed: {e}"))?;
+        let client = Client::with_options(opts)
+            .map_err(|e| anyhow::anyhow!("mongodb connect failed: {e}"))?;
         client
             .database(db)
             .run_command(mongodb::bson::doc! { "ping": 1 })
@@ -193,7 +216,10 @@ fn cell(b: &Bson) -> Value {
         Bson::Double(d) => Value::Float(*d),
         Bson::String(s) => Value::Text(s.clone()),
         Bson::ObjectId(oid) => Value::Text(oid.to_hex()),
-        Bson::DateTime(dt) => Value::Timestamp(dt.try_to_rfc3339_string().unwrap_or_else(|_| dt.to_string())),
+        Bson::DateTime(dt) => Value::Timestamp(
+            dt.try_to_rfc3339_string()
+                .unwrap_or_else(|_| dt.to_string()),
+        ),
         Bson::Binary(bin) => Value::Bytes {
             b64: base64::engine::general_purpose::STANDARD.encode(&bin.bytes),
             len: bin.bytes.len(),
@@ -226,7 +252,9 @@ fn doc_to_row(doc: &Document, keys: &[String]) -> Vec<Value> {
     for k in keys {
         row.push(doc.get(k).map(cell).unwrap_or(Value::Null));
     }
-    row.push(Value::Json(Bson::Document(doc.clone()).into_relaxed_extjson()));
+    row.push(Value::Json(
+        Bson::Document(doc.clone()).into_relaxed_extjson(),
+    ));
     row
 }
 
@@ -253,7 +281,8 @@ impl MongoConnection {
         let doc: Document = serde_json::from_str::<serde_json::Value>(stmt)
             .map_err(|e| anyhow::anyhow!("statement must be a JSON document: {e}"))
             .and_then(|v| {
-                mongodb::bson::to_document(&v).map_err(|e| anyhow::anyhow!("invalid command document: {e}"))
+                mongodb::bson::to_document(&v)
+                    .map_err(|e| anyhow::anyhow!("invalid command document: {e}"))
             })?;
         let db = self.client.database(&self.db);
 
@@ -264,7 +293,11 @@ impl MongoConnection {
             if let Ok(sort) = doc.get_document("sort") {
                 f = f.sort(sort.clone());
             }
-            if let Some(limit) = doc.get_i64("limit").ok().or_else(|| doc.get_i32("limit").ok().map(|i| i as i64)) {
+            if let Some(limit) = doc
+                .get_i64("limit")
+                .ok()
+                .or_else(|| doc.get_i32("limit").ok().map(|i| i as i64))
+            {
                 f = f.limit(limit);
             }
             if let Ok(proj) = doc.get_document("projection") {
@@ -276,16 +309,25 @@ impl MongoConnection {
 
         if let Ok(coll) = doc.get_str("aggregate") {
             let pipeline: Vec<Document> = match doc.get_array("pipeline") {
-                Ok(arr) => arr.iter().filter_map(|b| b.as_document().cloned()).collect(),
+                Ok(arr) => arr
+                    .iter()
+                    .filter_map(|b| b.as_document().cloned())
+                    .collect(),
                 Err(_) => Vec::new(),
             };
             let handle = db.collection::<Document>(coll);
-            let cursor = handle.aggregate(pipeline).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let cursor = handle
+                .aggregate(pipeline)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             return MongoCursorStream::open(cursor).await;
         }
 
         // Raw command: run it and render the single result document.
-        let result = db.run_command(doc).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let result = db
+            .run_command(doc)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let keys = column_order(&result);
         let row = doc_to_row(&result, &keys);
         Ok(Box::new(super::buffered::BufferedStream::new(
@@ -293,6 +335,19 @@ impl MongoConnection {
             vec![row],
             None,
         )))
+    }
+}
+
+/// The suffix mongo puts after a field in a DERIVED index name: the direction for a numeric key (`1`/`-1`),
+/// else the index TYPE as a string (`"text"`, `"2dsphere"`, `hashed`). Only used when the server returned an
+/// index with no explicit name.
+fn bson_key_suffix(v: &Bson) -> String {
+    match v {
+        Bson::Int32(i) => i.to_string(),
+        Bson::Int64(i) => i.to_string(),
+        Bson::Double(f) => (*f as i64).to_string(),
+        Bson::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -336,12 +391,59 @@ impl Connection for MongoConnection {
 
     async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Column>> {
         // Schemaless: sample one document and expose its top-level fields.
-        let coll = self.client.database(&self.db).collection::<Document>(&obj.name);
-        let sample = coll.find_one(Document::new()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let coll = self
+            .client
+            .database(&self.db)
+            .collection::<Document>(&obj.name);
+        let sample = coll
+            .find_one(Document::new())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         match sample {
             Some(doc) => Ok(columns_for(&column_order(&doc))),
             None => Ok(Vec::new()),
         }
+    }
+
+    async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
+        // `listIndexes` is the engine's own answer, so a compound/unique index reads exactly as the server
+        // holds it. The key DOCUMENT preserves field order, which IS the index order — so the keys are taken
+        // in document order rather than sorted.
+        let coll = self
+            .client
+            .database(&self.db)
+            .collection::<Document>(&obj.name);
+        let mut cur = coll
+            .list_indexes()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut out = Vec::new();
+        while let Some(m) = cur.next().await {
+            let m = m.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let keys = &m.keys;
+            let columns: Vec<String> = keys.keys().map(|k| k.to_string()).collect();
+            let opts = m.options.as_ref();
+            let name = opts
+                .and_then(|o| o.name.clone())
+                // mongo only omits the name when the client did not set one; the server then derives
+                // "<field>_<dir>_…" itself, so fall back to the same shape rather than showing a blank row.
+                .unwrap_or_else(|| {
+                    keys.iter()
+                        .map(|(k, v)| format!("{k}_{}", bson_key_suffix(v)))
+                        .collect::<Vec<_>>()
+                        .join("_")
+                });
+            let unique = opts.and_then(|o| o.unique).unwrap_or(false);
+            // A collection's `_id` index is mongo's primary key: always present, never droppable.
+            let primary = columns.len() == 1 && columns[0] == "_id";
+            out.push(Index {
+                name,
+                columns,
+                unique: unique || primary,
+                primary,
+            });
+        }
+        Ok(out)
     }
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {

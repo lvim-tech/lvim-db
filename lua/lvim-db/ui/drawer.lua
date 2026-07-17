@@ -30,6 +30,15 @@ local KIND = {
     view = { icon = "", hl = "LvimDbView" }, -- nf-fa-eye U+F06E
     collection = { icon = "", hl = "LvimDbCollection" }, -- nf-fa-cubes U+F1B3
     column = { icon = "", hl = "LvimDbColumn" }, -- nf-fa-columns U+F0DB
+    -- The per-object HELPER rows (an expanded table's children): each is one FACET of the same object, so
+    -- each carries its own glyph rather than repeating the object's. Deliberately NOT reusing `list`
+    -- (U+F0CA) or `key` (U+F084) — those already mean a redis list / redis key, and one glyph meaning two
+    -- things in the same tree means nothing.
+    data = { icon = "", hl = "LvimDbData" }, -- nf-fa-list-ol U+F0CB — runs the bounded preview
+    columns_h = { icon = "", hl = "LvimDbColumn" }, -- U+F0DB — the BRANCH of the column rows below it
+    indexes_h = { icon = "", hl = "LvimDbIndex" }, -- nf-fa-sliders U+F1DE — the branch of index rows
+    index = { icon = "", hl = "LvimDbIndex" }, -- one index
+    ddl = { icon = "", hl = "LvimDbDdl" }, -- nf-fa-file-text-o U+F0F6 — the CREATE statement
     key = { icon = "", hl = "LvimDbKey" }, -- redis key (nf-fa-key U+F084)
     string = { icon = "", hl = "LvimDbKey" }, -- redis string (nf-fa-quote-left U+F10D)
     list = { icon = "", hl = "LvimDbKey" }, -- redis list (nf-fa-list-ul U+F0CA)
@@ -212,6 +221,48 @@ local function paint()
     end
 end
 
+--- The HELPER rows an expanded object offers, in display order. Each is one facet of the SAME object, so
+--- expanding a table answers "what can I know about this?" instead of dumping one fixed list.
+---
+--- `Indexes` / `DDL` appear ONLY where the driver advertises the capability (`caps.indexes` / `caps.ddl`).
+--- That gate is the whole reason the daemon reports caps: support is genuinely uneven — a document/KV store
+--- has no DDL at all, and several SQL engines expose indexes while having no server-side CREATE statement —
+--- so a fixed list would grow rows that dead-end on half the engines. `Data` and `Columns` are unconditional:
+--- every driver can preview an object, and `columns()` is a required trait method.
+---@param conn LvimDbDrawerConn
+---@return { id: string, kind: string, label: string, branch: boolean }[]
+local function helpers_for(conn)
+    local caps = require("lvim-db").caps(conn.driver)
+    local out = {
+        { id = "data", kind = "data", label = "Data", branch = false },
+        { id = "columns", kind = "columns_h", label = "Columns", branch = true },
+    }
+    if caps.indexes then
+        out[#out + 1] = { id = "indexes", kind = "indexes_h", label = "Indexes", branch = true }
+    end
+    if caps.ddl then
+        out[#out + 1] = { id = "ddl", kind = "ddl", label = "DDL", branch = false }
+    end
+    return out
+end
+
+--- A short "1 unique · (email)" style suffix for an index row — the shape at a glance without opening it.
+---@param idx table
+---@return string
+local function index_suffix(idx)
+    local tags = {}
+    if idx.primary then
+        tags[#tags + 1] = "pk"
+    elseif idx.unique then
+        tags[#tags + 1] = "unique"
+    end
+    local cols = table.concat(idx.columns or {}, ", ")
+    if cols ~= "" then
+        tags[#tags + 1] = "(" .. cols .. ")"
+    end
+    return table.concat(tags, " ")
+end
+
 -- Forward declaration: the footer is rebuilt context-aware (connect ⇄ disconnect chip) from CursorMoved
 -- and after a connect/disconnect flips a row's state — both of which run through code defined above this
 -- point (M.refresh, render callbacks), so the name has to exist before them.
@@ -325,20 +376,75 @@ local function render()
                             obj.name,
                             km.hl
                         )
-                        if conn.open[okey] and obj.columns then
-                            for _, col in ipairs(obj.columns) do
+                        if conn.open[okey] then
+                            -- The object's FACETS (Data / Columns / Indexes / DDL), then whichever of the
+                            -- branch ones is itself expanded. `Columns` keeps the column rows exactly as they
+                            -- rendered before — one level deeper, but never taken away.
+                            for _, h in ipairs(helpers_for(conn)) do
+                                local hkey = okey .. "#" .. h.id
+                                local km = KIND[h.kind]
+                                local hcaret = ""
+                                if h.branch then
+                                    hcaret = conn.open[hkey] and CARET_OPEN or CARET_CLOSED
+                                end
                                 push_row(
                                     lines,
                                     hls,
-                                    { kind = "column", conn = conn },
+                                    { kind = "helper", conn = conn, schema = schema, obj = obj, helper = h },
                                     3,
-                                    "",
-                                    KIND.column.icon,
-                                    KIND.column.hl,
-                                    col.name,
-                                    KIND.column.hl,
-                                    col.type ~= "" and col.type or nil
+                                    hcaret,
+                                    km.icon,
+                                    km.hl,
+                                    h.label,
+                                    km.hl
                                 )
+                                if h.id == "columns" and conn.open[hkey] and obj.columns then
+                                    for _, col in ipairs(obj.columns) do
+                                        push_row(
+                                            lines,
+                                            hls,
+                                            { kind = "column", conn = conn, schema = schema, obj = obj, col = col },
+                                            4,
+                                            "",
+                                            KIND.column.icon,
+                                            KIND.column.hl,
+                                            col.name,
+                                            KIND.column.hl,
+                                            col.type ~= "" and col.type or nil
+                                        )
+                                    end
+                                elseif h.id == "indexes" and conn.open[hkey] and obj.indexes then
+                                    if #obj.indexes == 0 then
+                                        -- An engine that CAN list indexes and reports none: say so, rather
+                                        -- than render an expanded branch with nothing under it (which reads
+                                        -- as "still loading" / "broken").
+                                        push_row(
+                                            lines,
+                                            hls,
+                                            { kind = "empty", conn = conn },
+                                            4,
+                                            "",
+                                            KIND.index.icon,
+                                            "LvimDbEmpty",
+                                            "(no indexes)",
+                                            "LvimDbEmpty"
+                                        )
+                                    end
+                                    for _, idx in ipairs(obj.indexes) do
+                                        push_row(
+                                            lines,
+                                            hls,
+                                            { kind = "index", conn = conn, schema = schema, obj = obj, index = idx },
+                                            4,
+                                            "",
+                                            KIND.index.icon,
+                                            KIND.index.hl,
+                                            idx.name,
+                                            KIND.index.hl,
+                                            index_suffix(idx)
+                                        )
+                                    end
+                                end
                             end
                         end
                     end
@@ -436,6 +542,145 @@ local function expand_connection(conn)
     end)
 end
 
+--- Run a non-branch facet: `Data` previews the object, `DDL` loads its CREATE statement into the SQL
+--- editor. DDL goes to the EDITOR rather than the result dock on purpose — it is a statement, not a result
+--- set: in the editor it is syntax-highlighted, yankable, and directly re-runnable (the shape you actually
+--- want when you are about to copy a table's definition).
+---@param row table  a `kind == "helper"` row descriptor
+---@return nil
+local function helper_action(row)
+    local conn, obj = row.conn, row.obj
+    if row.helper.id == "data" then
+        -- The bounded preview, through the guarded runner for consistency (a SELECT never trips the guard).
+        local q = require("lvim-db.query")
+        local stmt = q.preview_statement(conn.driver, row.schema.name, obj.name, config.page_size)
+        require("lvim-db.ui.result").run_guarded(conn.conn_id, conn.name, conn.driver, stmt)
+    elseif row.helper.id == "ddl" then
+        require("lvim-db").ddl(conn.conn_id, { name = obj.name, schema = row.schema.name }, function(sql, err)
+            if err or not sql or sql == "" then
+                -- The driver claimed `caps.ddl` yet gave nothing back: report it instead of opening a blank
+                -- editor, which would read as "this table has no definition".
+                vim.notify(
+                    ("lvim-db: no DDL for '%s'%s"):format(obj.name, err and (": " .. tostring(err)) or ""),
+                    vim.log.levels.WARN
+                )
+                return
+            end
+            require("lvim-db.ui.editor").load_text(conn.name, sql)
+        end)
+    end
+end
+
+-- ── schema actions: GENERATE a statement, never run one ───────────────────────
+--
+-- `add` / `edit` / `delete` already mean "act on the thing under the cursor" for connections; on the schema
+-- rows they mean the same thing one tier down — add/rename/drop a COLUMN, create/drop an INDEX. The result
+-- is a statement dropped in the SQL editor for the user to read and run, NOT an execute:
+--
+--   • `ALTER` dialects diverge far more than `SELECT`, and some engines cannot do what a tidy form implies —
+--     SQLite has no ALTER COLUMN at all, so changing a type means rebuilding the table and copying the data.
+--     A generated statement makes that impossible to do silently.
+--   • Every real client (DBeaver included) shows the SQL and asks first, for exactly that reason.
+--   • The destructive guard still applies when the user runs it.
+
+--- Put `stmt` in the editor, bound to `conn`, or report why the engine has none.
+---@param conn LvimDbDrawerConn
+---@param stmt string?
+---@param what string   what was being generated (for the message when it cannot be)
+local function to_editor(conn, stmt, what)
+    if not stmt then
+        vim.notify(("lvim-db: %s has no '%s' statement"):format(conn.driver, what), vim.log.levels.WARN)
+        return
+    end
+    require("lvim-db.ui.editor").load_text(conn.name, stmt)
+end
+
+--- Prompt with `lvim-ui.input` (never `vim.ui.input` — the canon), then run `cb(value)` on a non-empty answer.
+---@param title string
+---@param default string?
+---@param cb fun(value: string)
+local function ask(title, default, cb)
+    require("lvim-ui").input({
+        title = title,
+        default = default or "",
+        -- `lvim-ui.input` answers (confirmed, value) — NOT (value): a cancel arrives as `false` and must not
+        -- be read as an empty name.
+        callback = function(ok, value)
+            if ok and value and vim.trim(value) ~= "" then
+                cb(vim.trim(value))
+            end
+        end,
+    })
+end
+
+--- `add` on a schema row: a column under `Columns`, an index under `Indexes`.
+---@param row table
+---@return boolean handled
+local function schema_add(row)
+    local q = require("lvim-db.query")
+    local conn, obj, schema = row.conn, row.obj, row.schema and row.schema.name
+    local branch = (row.kind == "helper" and row.helper.id)
+        or (row.kind == "column" and "columns")
+        or (row.kind == "index" and "indexes")
+    if branch == "columns" then
+        ask("New column (name)", nil, function(name)
+            ask("Type for " .. name, "TEXT", function(ty)
+                to_editor(conn, q.add_column(conn.driver, schema, obj.name, name, ty), "add column")
+            end)
+        end)
+        return true
+    elseif branch == "indexes" then
+        ask("New index (name)", ("idx_%s_"):format(obj.name), function(name)
+            ask("Column(s), comma separated", nil, function(cols)
+                local list = {}
+                for c in cols:gmatch("[^,]+") do
+                    list[#list + 1] = vim.trim(c)
+                end
+                to_editor(conn, q.create_index(conn.driver, schema, obj.name, name, list, false), "create index")
+            end)
+        end)
+        return true
+    end
+    return false
+end
+
+--- `edit` on a schema row: rename the column under the cursor. An index is not renamed — most engines have no
+--- such statement, and the honest move is to drop and recreate it, which the other two keys already do.
+---@param row table
+---@return boolean handled
+local function schema_edit(row)
+    if row.kind ~= "column" then
+        return false
+    end
+    local q = require("lvim-db.query")
+    local conn, obj = row.conn, row.obj
+    ask("Rename column '" .. row.col.name .. "' to", row.col.name, function(to)
+        to_editor(
+            conn,
+            q.rename_column(conn.driver, row.schema and row.schema.name, obj.name, row.col.name, to),
+            "rename column"
+        )
+    end)
+    return true
+end
+
+--- `delete` on a schema row: drop the column / index under the cursor.
+---@param row table
+---@return boolean handled
+local function schema_delete(row)
+    local q = require("lvim-db.query")
+    local conn, obj = row.conn, row.obj
+    local schema = row.schema and row.schema.name
+    if row.kind == "column" then
+        to_editor(conn, q.drop_column(conn.driver, schema, obj.name, row.col.name), "drop column")
+        return true
+    elseif row.kind == "index" then
+        to_editor(conn, q.drop_index(conn.driver, schema, obj.name, row.index.name), "drop index")
+        return true
+    end
+    return false
+end
+
 --- Toggle expand/collapse (or connect) on the row under the cursor.
 ---@param open boolean  true = expand/connect, false = collapse
 local function toggle(open)
@@ -461,19 +706,43 @@ local function toggle(open)
         row.conn.open[row.schema.name] = open or nil
         render()
     elseif row.kind == "object" then
-        local key = row.schema.name .. "." .. row.obj.name
-        if open and not row.obj.columns then
-            require("lvim-db").columns(
-                row.conn.conn_id,
-                { name = row.obj.name, schema = row.schema.name },
-                function(cols)
-                    row.obj.columns = cols or {}
-                    row.conn.open[key] = true
-                    M.refresh()
+        -- Expanding an object shows its FACETS; the data behind each one is fetched only when that facet is
+        -- itself opened (below), so opening a table costs no round-trip.
+        row.conn.open[row.schema.name .. "." .. row.obj.name] = open or nil
+        render()
+    elseif row.kind == "helper" then
+        local h = row.helper
+        if not h.branch then
+            -- Data / DDL are ACTIONS, not branches: `l` on one does what `<CR>` does.
+            if open then
+                helper_action(row)
+            end
+            return
+        end
+        local key = row.schema.name .. "." .. row.obj.name .. "#" .. h.id
+        local obj, conn = row.obj, row.conn
+        local fetched = (h.id == "columns" and obj.columns) or (h.id == "indexes" and obj.indexes)
+        if open and not fetched then
+            -- LAZY: fetch this facet once, then remember it on the object (same shape as the old column
+            -- cache). A refetch is the `refresh` key's job, not an accident of collapsing and reopening.
+            local db = require("lvim-db")
+            local ref = { name = obj.name, schema = row.schema.name }
+            local done = function(list)
+                if h.id == "columns" then
+                    obj.columns = list or {}
+                else
+                    obj.indexes = list or {}
                 end
-            )
+                conn.open[key] = true
+                M.refresh()
+            end
+            if h.id == "columns" then
+                db.columns(conn.conn_id, ref, done)
+            else
+                db.indexes(conn.conn_id, ref, done)
+            end
         else
-            row.conn.open[key] = open or nil
+            conn.open[key] = open or nil
             render()
         end
     end
@@ -495,12 +764,23 @@ local function default_action()
     elseif row.kind == "schema" then
         toggle(not row.conn.open[row.schema.name])
     elseif row.kind == "object" then
-        -- Run a bounded preview select and show it in the result dock (through the
-        -- guarded runner for consistency — a SELECT never trips the guard).
-        local result = require("lvim-db.ui.result")
-        local q = require("lvim-db.query")
-        local stmt = q.preview_statement(row.conn.driver, row.schema.name, row.obj.name, config.page_size)
-        result.run_guarded(row.conn.conn_id, row.conn.name, row.conn.driver, stmt)
+        -- <CR> on the object EXPANDS it to its facets. The preview moved onto the `Data` facet: an object now
+        -- answers "what do you want to know?" rather than assuming. (`Data` is the first row, so the old
+        -- one-key flow is <CR><CR>.)
+        toggle(not row.conn.open[row.schema.name .. "." .. row.obj.name])
+    elseif row.kind == "helper" then
+        -- A BRANCH facet (Columns / Indexes) opens on <CR> exactly as it does on `l`: it has children, so
+        -- "activate" can only sensibly mean "show them". Only the leaf facets (Data / DDL) run an action.
+        -- (Routing every facet straight to `helper_action` made <CR> silently do NOTHING on the two branch
+        -- rows — they only opened with `l`.)
+        if row.helper.branch then
+            toggle(not row.conn.open[row.schema.name .. "." .. row.obj.name .. "#" .. row.helper.id])
+        else
+            helper_action(row)
+        end
+    elseif row.kind == "index" or row.kind == "column" then
+        -- A leaf: nothing to open. Its own actions (add/rename/drop) hang off the a/e/x keys.
+        return
     end
 end
 
@@ -510,13 +790,13 @@ end
 -- and a key the user set to `false` drops its row.
 ---@type { [1]: string, [2]: string }[]
 local HELP = {
-    { "action", "connect / expand / preview the row" },
+    { "action", "connect / expand the row · run a Data / DDL facet" },
     { "expand", "expand (connect the connection)" },
     { "collapse", "collapse the row (visual)" },
     { "disconnect", "disconnect the connection" },
-    { "add", "add a connection" },
-    { "edit", "edit the focused connection" },
-    { "delete", "delete the focused connection" },
+    { "add", "add: a connection · a column (on Columns) · an index (on Indexes)" },
+    { "edit", "edit: the connection · rename the column (→ SQL editor)" },
+    { "delete", "delete: the connection / query · drop the column / index (→ SQL editor)" },
     { "refresh", "re-read the schema" },
     { "help", "this help" },
     { "close", "close the drawer" },
@@ -659,16 +939,29 @@ local function set_keys(chassis_map)
     map(k.disconnect, disconnect_row)
     map(k.action, default_action)
     map(k.add, function()
+        -- CONTEXT-sensitive, the same way it already was for a connection: `a` adds "the kind of thing this
+        -- row is a list of" — a column under Columns, an index under Indexes, and (anywhere else) a
+        -- connection, which is what it has always done.
+        local row = current_row()
+        if row and schema_add(row) then
+            return
+        end
         require("lvim-db.ui.form").open()
     end)
     map(k.edit, function()
         local row = current_row()
         if row and row.kind == "connection" then
             require("lvim-db.ui.form").open(row.conn.name)
+        elseif row then
+            schema_edit(row)
         end
     end)
     map(k.delete, function()
         local row = current_row()
+        if row and (row.kind == "column" or row.kind == "index") then
+            schema_delete(row)
+            return
+        end
         if row and row.kind == "connection" then
             require("lvim-ui").confirm({
                 title = "Delete connection",

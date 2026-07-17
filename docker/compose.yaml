@@ -1,0 +1,111 @@
+# lvim-db — a real server for every networked driver, for testing against the actual engine.
+#
+# WHY this exists: the daemon speaks to 12 engines, and each one's SCHEMA INTROSPECTION (columns, indexes,
+# DDL) is written against that engine's own catalog — pg_index, SHOW INDEX, sys.index_columns,
+# RDB$INDEX_SEGMENTS. None of that can be checked by reading the code: a catalog either answers in the shape
+# the driver expects or it does not. This brings each server up locally so a driver is verified against the
+# real thing instead of against a guess.
+#
+#   docker compose -f docker/compose.yaml up -d postgres  # ONE engine — the normal way to work
+#   docker compose -f docker/compose.yaml down -v         # stop + drop the volumes when done
+#   docker compose -f docker/compose.yaml up -d           # ALL of them — see the warning below
+#
+# WARNING — bring up ONLY the engine you are testing. All nine at once cost ~34 GB of RAM here (measured:
+# 22 GB → 56 GB of 62, leaving 1 GB free). Cassandra and SQL Server are the heavy ones, and they are also the
+# slowest to become ready. `down -v` gives it all back.
+#
+# Ports are OFFSET (5 prefix) so none of them collide with a real server already running on the host.
+# Credentials are deliberately trivial and identical everywhere: this is a throwaway test bed on localhost,
+# never a template for anything real.
+#
+# NOT here: sqlite and duckdb are embedded (a file — no server to run), and snowflake is cloud-only with no
+# local image, so its driver is the one that cannot be verified this way.
+
+name: lvim-db-test
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: lvimdb
+      POSTGRES_DB: lvimdb
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      retries: 20
+
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: lvimdb
+      MYSQL_DATABASE: lvimdb
+    ports: ["53306:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-plvimdb"]
+      interval: 3s
+      retries: 30
+
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: lvimdb
+      MARIADB_DATABASE: lvimdb
+    ports: ["53307:3306"]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect"]
+      interval: 3s
+      retries: 30
+
+  mongodb:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: lvimdb
+      MONGO_INITDB_ROOT_PASSWORD: lvimdb
+    ports: ["57017:27017"]
+
+  redis:
+    image: redis:7
+    ports: ["56379:6379"]
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    environment:
+      CLICKHOUSE_PASSWORD: lvimdb
+      CLICKHOUSE_DB: lvimdb
+    ports: ["58123:8123", "59000:9000"]
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      # SQL Server REJECTS a weak password at startup and then exits — hence the odd-looking one.
+      MSSQL_SA_PASSWORD: "LvimDb!2345"
+    ports: ["51433:1433"]
+
+  cassandra:
+    image: cassandra:5
+    # NOT offset, unlike every other service: a CQL driver does node DISCOVERY — it asks the cluster for its
+    # members and then dials each one at the address/port the node BROADCASTS. A container broadcasts its
+    # internal IP (172.x), which the host cannot reach, so the control connection succeeds and the pool then
+    # dies with "Connection refused". Broadcasting 127.0.0.1 fixes the address, and the port must then be
+    # the real 9042 because the node advertises that too.
+    ports: ["9042:9042"]
+    environment:
+      # A single-node dev cluster: without this it waits on a seed that never arrives.
+      CASSANDRA_DC: dc1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      CASSANDRA_BROADCAST_RPC_ADDRESS: 127.0.0.1
+
+  firebird:
+    image: firebirdsql/firebird:5
+    environment:
+      FIREBIRD_ROOT_PASSWORD: lvimdb
+      FIREBIRD_DATABASE: lvimdb.fdb
+      FIREBIRD_USER: lvimdb
+      FIREBIRD_PASSWORD: lvimdb
+      # The image registers no alias, so a client must give the FULL server-side path:
+      #   database = /var/lib/firebird/data/lvimdb.fdb   (see docker/seed.lua)
+    ports: ["53050:3050"]

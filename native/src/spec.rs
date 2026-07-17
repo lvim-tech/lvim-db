@@ -28,6 +28,13 @@ pub struct Caps {
     pub tunnel: bool,   // a TCP endpoint that an SSH tunnel can front
     pub multi_db: bool, // exposes multiple databases on one connection
     pub kv: bool,       // key/value or document store (not relational SQL)
+    // Per-object INTROSPECTION beyond the columns every schema driver already serves. Advertised
+    // separately because support is genuinely uneven and NOT implied by `schemas`: a document/KV store has
+    // no DDL to show at all, and several SQL engines expose indexes but no server-side "CREATE statement"
+    // (there the honest answer is "cannot", not a hand-assembled approximation). The drawer offers a helper
+    // ONLY where its driver claims it, so no engine ever grows a row that dead-ends.
+    pub indexes: bool, // can list an object's indexes (`schema.indexes`)
+    pub ddl: bool,     // can return an object's CREATE statement (`schema.ddl`)
 }
 
 /// The kinds of auth a driver can accept. A driver lists the subset it supports
@@ -108,12 +115,17 @@ impl ConnSpec {
 
     /// An optional string param.
     pub fn param_opt(&self, key: &str) -> Option<&str> {
-        self.params.get(key).map(String::as_str).filter(|s| !s.is_empty())
+        self.params
+            .get(key)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
     }
 
     /// An optional param parsed as a port, falling back to `default`.
     pub fn port(&self, default: u16) -> u16 {
-        self.param_opt("port").and_then(|s| s.parse().ok()).unwrap_or(default)
+        self.param_opt("port")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
     }
 }
 
@@ -184,7 +196,10 @@ impl Default for TlsSpec {
 impl TlsSpec {
     /// Whether TLS must be negotiated (a plaintext-only server is rejected).
     pub fn required(&self) -> bool {
-        matches!(self.mode, TlsMode::Require | TlsMode::VerifyCa | TlsMode::VerifyFull)
+        matches!(
+            self.mode,
+            TlsMode::Require | TlsMode::VerifyCa | TlsMode::VerifyFull
+        )
     }
 
     /// Whether TLS should be attempted at all.
@@ -271,7 +286,19 @@ pub struct Node {
     pub children: Vec<Node>,
 }
 
-/// A reference to a browsable object (for `schema.columns`).
+/// One index on a browsable object. Deliberately a SMALL common shape: every engine that has indexes has a
+/// name, the columns it covers, and the unique/primary distinction — everything past that (method, partial
+/// predicates, collation, storage options) is per-engine and belongs in the DDL, not in a lowest-common
+/// struct that would be mostly `None`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Index {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+    pub primary: bool,
+}
+
+/// A reference to a browsable object (for `schema.columns` / `schema.indexes` / `schema.ddl`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ObjRef {
     pub name: String,
@@ -323,9 +350,18 @@ mod tests {
     fn value_serializes_as_plain_json() {
         assert_eq!(serde_json::to_string(&Value::Null).unwrap(), "null");
         assert_eq!(serde_json::to_string(&Value::Int(7)).unwrap(), "7");
-        assert_eq!(serde_json::to_string(&Value::Text("hi".into())).unwrap(), "\"hi\"");
-        let b = Value::Bytes { b64: "AA==".into(), len: 1 };
-        assert_eq!(serde_json::to_string(&b).unwrap(), "{\"__bytes\":\"AA==\",\"len\":1}");
+        assert_eq!(
+            serde_json::to_string(&Value::Text("hi".into())).unwrap(),
+            "\"hi\""
+        );
+        let b = Value::Bytes {
+            b64: "AA==".into(),
+            len: 1,
+        };
+        assert_eq!(
+            serde_json::to_string(&b).unwrap(),
+            "{\"__bytes\":\"AA==\",\"len\":1}"
+        );
     }
 
     #[test]

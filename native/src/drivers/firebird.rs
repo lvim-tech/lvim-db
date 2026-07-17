@@ -16,8 +16,8 @@ use rsfbclient::{Column, Queryable, Row, SimpleConnection, SqlType};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column as SpecColumn, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType,
-    Value,
+    AuthKind, AuthSpec, Caps, Column as SpecColumn, ConnSpec, DriverMeta, Index, Node, ObjRef,
+    ParamSpec, ParamType, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -61,6 +61,8 @@ const META: DriverMeta = DriverMeta {
         tunnel: true,
         multi_db: false,
         kv: false,
+        indexes: true,
+        ddl: false, // RDB$INDICES; Firebird has no server-side CREATE statement
     },
 };
 
@@ -79,7 +81,11 @@ impl Driver for FirebirdDriver {
         &META
     }
 
-    async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(
+        &self,
+        spec: &ConnSpec,
+        net: NetContext,
+    ) -> anyhow::Result<Box<dyn Connection>> {
         let host = spec.param("host")?.to_string();
         let port = spec.port(3050);
         let db = spec.param("database")?.to_string();
@@ -90,7 +96,11 @@ impl Driver for FirebirdDriver {
             .unwrap_or((host.clone(), port));
         let (user, password) = match &spec.auth {
             AuthSpec::Password { user, password } => (
-                if user.is_empty() { "SYSDBA".to_string() } else { user.clone() },
+                if user.is_empty() {
+                    "SYSDBA".to_string()
+                } else {
+                    user.clone()
+                },
                 password.resolve().await?,
             ),
             _ => ("SYSDBA".to_string(), String::new()),
@@ -173,7 +183,9 @@ impl Connection for FirebirdConnection {
     }
 
     async fn switch_database(&mut self, _db: &str) -> anyhow::Result<()> {
-        Err(anyhow::anyhow!("Firebird has a single database per connection"))
+        Err(anyhow::anyhow!(
+            "Firebird has a single database per connection"
+        ))
     }
 
     async fn structure(&mut self) -> anyhow::Result<Vec<Node>> {
@@ -228,9 +240,30 @@ impl Connection for FirebirdConnection {
             .collect())
     }
 
+    async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
+        // RDB$INDEX_SEGMENTS is the per-column table ordered by RDB$FIELD_POSITION — the fold shape.
+        // Firebird pads catalog CHAR columns, so every name is TRIMmed. A primary key is read from
+        // RDB$RELATION_CONSTRAINTS rather than guessed out of the index name.
+        let sql = format!(
+            "SELECT TRIM(i.RDB$INDEX_NAME), COALESCE(i.RDB$UNIQUE_FLAG, 0), \
+                    CASE WHEN rc.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY' THEN 1 ELSE 0 END, \
+                    TRIM(s.RDB$FIELD_NAME) \
+             FROM RDB$INDICES i \
+             LEFT JOIN RDB$INDEX_SEGMENTS s ON s.RDB$INDEX_NAME = i.RDB$INDEX_NAME \
+             LEFT JOIN RDB$RELATION_CONSTRAINTS rc ON rc.RDB$INDEX_NAME = i.RDB$INDEX_NAME \
+             WHERE TRIM(i.RDB$RELATION_NAME) = '{}' \
+             ORDER BY i.RDB$INDEX_NAME, s.RDB$FIELD_POSITION",
+            obj.name.replace('\'', "''")
+        );
+        let (_c, rows) = self.run(sql).await?;
+        Ok(super::group_indexes(rows))
+    }
+
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows) = self.run(stmt.to_string()).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, None)))
+        Ok(Box::new(super::buffered::BufferedStream::new(
+            columns, rows, None,
+        )))
     }
 
     async fn close(self: Box<Self>) -> anyhow::Result<()> {

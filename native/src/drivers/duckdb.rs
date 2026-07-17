@@ -15,7 +15,9 @@ use duckdb::Connection as DuckConn;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
-use crate::spec::{AuthKind, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, Value};
+use crate::spec::{
+    AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, Value,
+};
 
 const PARAMS: &[ParamSpec] = &[ParamSpec {
     key: "file",
@@ -40,6 +42,8 @@ const META: DriverMeta = DriverMeta {
         tunnel: false,
         multi_db: false,
         kv: false,
+        indexes: true,
+        ddl: true, // duckdb_indexes() / duckdb_tables().sql
     },
 };
 
@@ -58,7 +62,11 @@ impl Driver for DuckdbDriver {
         &META
     }
 
-    async fn connect(&self, spec: &ConnSpec, _net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
+    async fn connect(
+        &self,
+        spec: &ConnSpec,
+        _net: NetContext,
+    ) -> anyhow::Result<Box<dyn Connection>> {
         let file = spec.param("file")?.to_string();
         let conn = tokio::task::spawn_blocking(move || {
             if file == ":memory:" {
@@ -112,7 +120,10 @@ struct DuckdbConnection {
 }
 
 impl DuckdbConnection {
-    async fn run(&self, sql: String) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>, Option<u64>)> {
+    async fn run(
+        &self,
+        sql: String,
+    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>, Option<u64>)> {
         let arc = self.conn.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let conn = arc.lock().unwrap();
@@ -131,7 +142,10 @@ impl DuckdbConnection {
                     ncol = stmt_ref.column_count();
                     columns = (0..ncol)
                         .map(|i| Column {
-                            name: stmt_ref.column_name(i).map(|s| s.to_string()).unwrap_or_default(),
+                            name: stmt_ref
+                                .column_name(i)
+                                .map(|s| s.to_string())
+                                .unwrap_or_default(),
                             type_name: String::new(),
                         })
                         .collect();
@@ -153,7 +167,10 @@ impl DuckdbConnection {
                 }
                 columns = (0..cc)
                     .map(|i| Column {
-                        name: stmt.column_name(i).map(|s| s.to_string()).unwrap_or_default(),
+                        name: stmt
+                            .column_name(i)
+                            .map(|s| s.to_string())
+                            .unwrap_or_default(),
                         type_name: String::new(),
                     })
                     .collect();
@@ -171,7 +188,9 @@ impl Connection for DuckdbConnection {
     }
 
     async fn switch_database(&mut self, _db: &str) -> anyhow::Result<()> {
-        Err(anyhow::anyhow!("DuckDB has a single database per connection"))
+        Err(anyhow::anyhow!(
+            "DuckDB has a single database per connection"
+        ))
     }
 
     async fn structure(&mut self) -> anyhow::Result<Vec<Node>> {
@@ -242,9 +261,43 @@ impl Connection for DuckdbConnection {
             .collect())
     }
 
+    async fn indexes(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<Index>> {
+        // duckdb_indexes() is the catalog view; it exposes the index's SQL rather than a column vector, so
+        // the column list is not reconstructed here — `expressions` is a duckdb-internal rendering, and
+        // guessing columns out of it would be parsing, not reading. Name + unique/primary are exact.
+        let schema_pred = match &obj.schema {
+            Some(sc) => format!("AND schema_name = '{}'", sc.replace('\'', "''")),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT index_name, is_unique, is_primary, NULL FROM duckdb_indexes() \
+             WHERE table_name = '{}' {} ORDER BY index_name",
+            obj.name.replace('\'', "''"),
+            schema_pred
+        );
+        let (_c, rows, _a) = self.run(sql).await?;
+        Ok(super::group_indexes(rows))
+    }
+
+    async fn ddl(&mut self, obj: &ObjRef) -> anyhow::Result<Option<String>> {
+        // duckdb_tables()/duckdb_views() carry the engine's own CREATE text in `sql`.
+        let esc = obj.name.replace('\'', "''");
+        let sql = format!(
+            "SELECT sql FROM duckdb_tables() WHERE table_name = '{esc}' \
+             UNION ALL SELECT sql FROM duckdb_views() WHERE view_name = '{esc}'"
+        );
+        let (_c, rows, _a) = self.run(sql).await?;
+        Ok(rows.first().and_then(|r| match r.first() {
+            Some(Value::Text(s)) => Some(s.clone()),
+            _ => None,
+        }))
+    }
+
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let (columns, rows, affected) = self.run(stmt.to_string()).await?;
-        Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, affected)))
+        Ok(Box::new(super::buffered::BufferedStream::new(
+            columns, rows, affected,
+        )))
     }
 
     async fn close(self: Box<Self>) -> anyhow::Result<()> {

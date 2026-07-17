@@ -116,6 +116,54 @@ Oracle is an opt-in build feature (it needs the Oracle Instant Client at
 runtime, so it is excluded from the self-contained standard build).
 
 ==============================================================================
+5b. BROWSING AN OBJECT                                     *lvim-db-facets*
+
+Expanding a table / view / collection shows its FACETS — one row per thing you
+can ask about it. Each facet either opens or acts: >
+
+    users
+       Data          run a bounded preview into the result dock
+      Columns        expands to the columns, with their types
+      Indexes        expands to the indexes (name, unique/pk, columns in order)
+       DDL           load the CREATE statement into the SQL editor
+<
+`Indexes` and `DDL` show ONLY where the driver has them, from the capabilities
+the daemon reports — so no engine grows a row that dead-ends:
+
+  indexes + DDL   SQLite, MySQL, MariaDB, ClickHouse, DuckDB
+  indexes only    PostgreSQL, SQL Server, MongoDB, Cassandra, Firebird
+  DDL only        Snowflake (no indexes — micro-partitions)
+  neither         Redis (a KV store has no indexes and no schema)
+
+PostgreSQL and SQL Server list indexes but have NO server-side CREATE
+statement — their own tooling reconstructs it client-side — so lvim-db does not
+pretend to: an assembled CREATE would silently drop constraints and defaults
+while reading as authoritative.
+
+==============================================================================
+5c. CHANGING A SCHEMA                                *lvim-db-schema-actions*
+
+On the schema rows, `a` / `e` / `x` mean what they already mean for a
+connection — add / edit / delete THE THING UNDER THE CURSOR — one tier down:
+
+  row          a                  e              x
+  ---------------------------------------------------------------
+  Columns      add a column       —              —
+  a column     —                  rename it      drop it
+  Indexes      create an index    —              —
+  an index     —                  —              drop it
+
+Each GENERATES the statement into the SQL editor, in the engine's dialect — it
+never runs it. You read it and run it yourself (the destructive guard still
+applies there).
+
+That is deliberate. `ALTER` dialects diverge far more than `SELECT`, and some
+engines cannot do what a tidy form would imply: SQLite has no ALTER COLUMN at
+all, so changing a column's type means rebuilding the table and copying the
+data. A generated statement makes that impossible to do silently — and it is
+what every real client does before it touches a schema.
+
+==============================================================================
 6a. ENCRYPTION                                         *lvim-db-encryption*
 
 Connections are encrypted by default. Every network driver negotiates real
