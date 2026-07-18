@@ -71,9 +71,11 @@ function M.build()
         LvimDbBgQueries = { bg = mtint(c.purple, 0.08) }, -- the saved-queries branch row (a container)
         LvimDbBgQuery = { bg = mtint(c.purple, 0.08) }, -- a saved-query leaf (odd)
         LvimDbBgQueryAlt = { bg = mtint(c.purple, 0.13) }, -- a saved-query leaf (even, the zebra alt)
-        LvimDbRowSel = { bg = mtint(c.blue, 0.16) }, -- the cursor row (any kind) — bg-only marker
+        LvimDbRowSel = { bg = mtint(c.blue, 0.3) }, -- the drawer cursor row (any kind) — bg-only marker, clearly above the washes
+        LvimDbCursorLine = { bg = mtint(c.blue, 0.3) }, -- the result grid's cursor line (a visible blue wash)
         LvimDbGuide = { fg = hl.blend(c.fg_dark, c.bg, 0.6) }, -- tree guides / carets
         LvimDbCount = { fg = c.comment }, -- a "(12)" child count
+        LvimDbConnMeta = { fg = c.yellow }, -- a connection row's metadata: the expand caret, the (driver) type, the lock glyph
         LvimDbEmpty = { fg = c.comment, italic = true },
         LvimDbDriver = { fg = c.yellow }, -- a driver-kind badge
 

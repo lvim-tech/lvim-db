@@ -1541,7 +1541,9 @@ local function open_dock()
     end
 
     local provider = {
-        cursorline = true,
+        -- A visible cursor line (a blue wash) — the neutral default `LvimUiCursorLine` is the faintest tint
+        -- in the set and vanishes against the grid, so name a distinct group.
+        cursorline = "LvimDbCursorLine",
         filetype = "lvim-db-result",
         -- The grid is a cursor-VISIBLE panel the user scrolls but never types into (edits go through the
         -- popups). `readonly` tells the chassis to nop the builtin EDIT operators (o / dd / p / s / …) while

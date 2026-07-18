@@ -111,24 +111,53 @@ end
 ---@param label string
 ---@param label_hl string
 ---@param suffix string?  a dim trailing note (e.g. child count)
-local function push_row(lines, hls, descr, depth, caret, icon, icon_hl, label, label_hl, suffix)
+---@param tail string?     a SECOND trailing segment coloured `tail_hl` (e.g. the connection lock glyph)
+---@param tail_hl string?
+---@param caret_hl string?  the caret colour (default the dim tree guide; a connection row passes yellow)
+---@param suffix_hl string?  the suffix colour (default the dim count; a connection row passes yellow)
+local function push_row(
+    lines,
+    hls,
+    descr,
+    depth,
+    caret,
+    icon,
+    icon_hl,
+    label,
+    label_hl,
+    suffix,
+    tail,
+    tail_hl,
+    caret_hl,
+    suffix_hl
+)
     local indent = string.rep("  ", depth)
     local caret_str = caret ~= "" and (caret .. " ") or "  "
-    local text = indent .. caret_str .. icon .. " " .. label .. (suffix and (" " .. suffix) or "")
+    local text = indent
+        .. caret_str
+        .. icon
+        .. " "
+        .. label
+        .. (suffix and (" " .. suffix) or "")
+        .. (tail and (" " .. tail) or "")
     local lineno = #lines
     lines[#lines + 1] = text
     local base = #indent
     -- caret
     if caret ~= "" then
-        hls[#hls + 1] = { lineno, base, base + #caret, "LvimDbGuide" }
+        hls[#hls + 1] = { lineno, base, base + #caret, caret_hl or "LvimDbGuide" }
     end
     local icon_start = base + #caret_str
     hls[#hls + 1] = { lineno, icon_start, icon_start + #icon, icon_hl }
     local label_start = icon_start + #icon + 1
     hls[#hls + 1] = { lineno, label_start, label_start + #label, label_hl }
+    local at = label_start + #label
     if suffix then
-        local suf_start = label_start + #label + 1
-        hls[#hls + 1] = { lineno, suf_start, suf_start + #suffix, "LvimDbCount" }
+        hls[#hls + 1] = { lineno, at + 1, at + 1 + #suffix, suffix_hl or "LvimDbCount" }
+        at = at + 1 + #suffix
+    end
+    if tail then
+        hls[#hls + 1] = { lineno, at + 1, at + 1 + #tail, tail_hl or "LvimDbCount" }
     end
     state.rows[lineno + 1] = descr
 end
@@ -293,9 +322,9 @@ local function render()
         -- or tunnelled) or an open-lock warning (plaintext) — never silent.
         local lock = ""
         if connected then
-            lock = (conn.encrypted or conn.tunneled) and " " or " " -- lock (nf-fa-lock U+F023) when encrypted/tunnelled, open lock (nf-fa-unlock U+F09C) plaintext
+            lock = (conn.encrypted or conn.tunneled) and "" or "" -- lock (nf-fa-lock U+F023) when encrypted/tunnelled, open lock (nf-fa-unlock U+F09C) plaintext
         end
-        local suffix = ("(%s)%s"):format(conn.driver, lock)
+        local suffix = ("(%s)"):format(conn.driver)
         push_row(
             lines,
             hls,
@@ -306,7 +335,11 @@ local function render()
             KIND[kind].hl,
             name,
             KIND[kind].hl,
-            suffix
+            suffix,
+            lock ~= "" and lock or nil, -- the lock glyph
+            "LvimDbConnMeta", -- tail_hl (lock)
+            "LvimDbConnMeta", -- caret_hl (the ▸/▾ before the name)
+            "LvimDbConnMeta" -- suffix_hl (the (driver) type)
         )
 
         -- The saved-queries BRANCH — metadata, so it shows under an expanded connection REGARDLESS of the
