@@ -122,6 +122,9 @@ end
 
 --- Open a connection from a spec `{ driver, params, auth?, tls?, tunnel? }` (the
 --- shape the connection form / a saved connection produces). `cb(conn_id, err)`.
+--- A `{{ vault "…" }}` credential resolves in the daemon against the lvim-keyring agent; if the wallet
+--- is locked, the KEYRING parks the resolve and pops its own master-password prompt (lvim-db does
+--- nothing special — the wallet owns that), then the connect proceeds transparently.
 ---@param spec table
 ---@param cb fun(conn_id: integer?, err: string?, info: { encrypted: boolean, tunneled: boolean }?)
 function M.connect(spec, cb)

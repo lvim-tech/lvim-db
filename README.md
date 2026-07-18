@@ -215,8 +215,9 @@ daemon at connect time only — never persisted or logged as plain values:
 - `{{ cmd "pass show db/prod" }}` — the stdout of a command (trimmed)
 - `{{ vault "db/prod" }}` — the secret of that name from the **lvim-keyring** wallet (a
   per-user encrypted secrets agent); the daemon reads it over the wallet's socket at connect
-  time. When the wallet is locked, the connection reports `the keyring is locked — :LvimKeyring
-  unlock`; when it is not running, it says so. On the form's **Auth** tab, `store in keyring`
+  time. If the wallet is LOCKED, lvim-keyring pops its own master-password prompt and the connection
+  proceeds once you unlock — lvim-db does nothing special, the wallet owns that. On the form's
+  **Auth** tab, `store in keyring`
   (default `K`, shown when lvim-keyring is installed) moves the typed password/token into the
   wallet and rewrites the field to `{{ vault "db/<connection>" }}` for you.
 

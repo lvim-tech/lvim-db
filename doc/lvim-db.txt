@@ -202,8 +202,9 @@ daemon at connect time only — never persisted or logged as plain values:
   {{ env "VAR" }}              the value of an environment variable
   {{ cmd "pass show db/x" }}   the stdout of a command (trimmed)
   {{ vault "db/x" }}           the secret of that name from the lvim-keyring
-                               wallet (read over its socket at connect time;
-                               a locked wallet reports ":LvimKeyring unlock")
+                               wallet (read over its socket at connect time; a
+                               LOCKED wallet pops its own master-password prompt
+                               and the connect proceeds once unlocked)
   literal text                 used verbatim
 
 This also covers token-style provider auth, e.g. an AWS RDS IAM token via
