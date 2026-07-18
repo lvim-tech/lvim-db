@@ -87,9 +87,21 @@ function M.build()
         -- result grid
         LvimDbHeader = { fg = c.blue, bg = mtint(c.blue, 0.2), bold = true }, -- column header row
         LvimDbHeaderActive = { fg = c.blue, bg = mtint(c.blue, 0.4), bold = true },
+        -- The dock's header TAB reflecting the active view (Result ⇄ Call log). A SOLID bg across the whole
+        -- button — badge, label and padding all wear this one group, so the active tab reads as a filled block
+        -- (not a fg-only accent), independent of which sector has focus. The inactive tab keeps the plain
+        -- footer colours. `bg` chosen a touch below the column-header active so the two blues don't compete.
+        LvimDbTabActive = { fg = c.blue, bg = mtint(c.blue, 0.3), bold = true },
         LvimDbCellNull = { fg = c.comment, italic = true }, -- a NULL cell
         LvimDbCellNumber = { fg = c.orange }, -- numeric cells
         LvimDbRowAlt = { bg = hl.blend(c.fg, c.bg, 0.03) }, -- zebra striping
+        -- The row LOCKED for editing, and within it a field CHANGED but not yet written. Yellow — the set's
+        -- "in progress, not yet committed" accent — at depths well clear of the zebra (0.03), so a locked row
+        -- cannot be mistaken for a striped one and a pending field cannot be mistaken for a saved one. Both
+        -- are bg-only washes (the "тинт" canon): the per-cell NULL/number fg colours must survive on them,
+        -- since those are exactly what the user is reading while deciding what to change.
+        LvimDbEditRow = { bg = mtint(c.yellow, 0.18) },
+        LvimDbEditCell = { bg = mtint(c.yellow, 0.38) },
 
         -- call / query states (the call-log accents)
         LvimDbStateRunning = { fg = c.yellow, bg = mtint(c.yellow, 0.2) },

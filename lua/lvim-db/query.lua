@@ -20,15 +20,22 @@ local function quote(driver, ident)
     return '"' .. ident:gsub('"', '""') .. '"'
 end
 
---- A bounded "preview the first rows of this object" statement for `driver`.
+--- Read this object's rows for `driver`. `limit` bounds it (a peek); `limit = nil` reads the WHOLE object —
+--- the daemon streams it and the grid pages on demand, so an unbounded browse never loads more than a page
+--- at a time. The drawer's Data facet passes nil (browse the table); a caller that only wants a peek passes a
+--- number.
 ---@param driver string
 ---@param schema string?
 ---@param object string
----@param limit integer
+---@param limit integer?
 ---@return string
 function M.preview_statement(driver, schema, object, limit)
     if driver == "mongodb" then
-        return vim.json.encode({ find = object, limit = limit })
+        local cmd = { find = object }
+        if limit then
+            cmd.limit = limit
+        end
+        return vim.json.encode(cmd)
     end
     if driver == "redis" then
         -- In Redis the "object" is a key; a type-agnostic peek.
@@ -43,12 +50,9 @@ function M.preview_statement(driver, schema, object, limit)
         qualified = quote(driver, object)
     end
     if driver == "sqlserver" then
-        return ("SELECT TOP %d * FROM %s"):format(limit, qualified)
+        return limit and ("SELECT TOP %d * FROM %s"):format(limit, qualified) or ("SELECT * FROM %s"):format(qualified)
     end
-    if driver == "cassandra" or driver == "scylla" then
-        return ("SELECT * FROM %s LIMIT %d"):format(qualified, limit)
-    end
-    return ("SELECT * FROM %s LIMIT %d"):format(qualified, limit)
+    return limit and ("SELECT * FROM %s LIMIT %d"):format(qualified, limit) or ("SELECT * FROM %s"):format(qualified)
 end
 
 -- ─── DDL templates ────────────────────────────────────────────────────────────
@@ -77,6 +81,28 @@ local function qualify(driver, schema, object)
         return quote(driver, schema) .. "." .. quote(driver, object)
     end
     return quote(driver, object)
+end
+
+--- A "how many rows does this object hold" statement for `driver`, or nil when the engine has no cheap count
+--- (redis). The result is ONE row whose value is the total — read by `range_text`'s total fetch. Aliased
+--- `AS n` where the dialect allows, but the reader takes the first numeric cell, so an un-aliasable count
+--- (CQL) still works.
+---@param driver string
+---@param schema string?
+---@param object string
+---@return string?
+function M.count_statement(driver, schema, object)
+    if driver == "mongodb" then
+        return vim.json.encode({ count = object }) -- → { n, ok }
+    end
+    if driver == "redis" then
+        return nil
+    end
+    local qualified = qualify(driver, schema, object)
+    if driver == "cassandra" or driver == "scylla" then
+        return ("SELECT COUNT(*) FROM %s"):format(qualified) -- CQL has no column alias here
+    end
+    return ("SELECT COUNT(*) AS n FROM %s"):format(qualified)
 end
 
 --- `ALTER TABLE … ADD COLUMN` for `driver`, or nil when the engine has no such statement.
@@ -159,6 +185,137 @@ function M.drop_column(driver, schema, object, column)
         return ("ALTER TABLE %s DROP %s;"):format(t, c)
     end
     return ("ALTER TABLE %s DROP COLUMN %s;"):format(t, c)
+end
+
+-- ─── writing one row back ─────────────────────────────────────────────────────
+--
+-- The grid's inline editor sends exactly ONE statement per save: an `UPDATE … SET <changed> WHERE <key>`.
+-- Only the CHANGED cells are in the SET — a minimal update, so a cell the user never touched is never
+-- rewritten (that also keeps a display-TRUNCATED cell out of the statement, which is what stops the grid
+-- from writing a "…"-ended prefix over the real value).
+--
+-- The daemon executes a STATEMENT, not a prepared call (`Connection::execute(&str)`) — there is no bind
+-- channel — so the values are rendered as literals here, per dialect. That makes `literal()` the one place
+-- where quoting correctness lives.
+
+--- Can this engine update a single addressed row at all? Returns false + the honest reason when not, so a
+--- caller can say WHY a grid is read-only instead of offering an edit that silently matches nothing.
+---@param driver string
+---@return boolean, string?
+function M.can_update_row(driver)
+    if driver == "redis" then
+        return false, "redis has no addressable row to update"
+    end
+    return true
+end
+
+--- Render `v` as MongoDB EXTENDED JSON — the form the server matches and updates on.
+---
+--- The whole point is `__oid`: the daemon tags an ObjectId (`Value::Oid`) instead of flattening it to its
+--- hex, because `{_id: "<hex>"}` matches no real ObjectId — it would report success and change nothing. Here
+--- that tag becomes `{"$oid": …}`, which the driver parses back into a true ObjectId (see its `dispatch`).
+---@param v any
+---@return any  a value ready for `vim.json.encode`
+local function ext_json(v)
+    if v == nil or v == vim.NIL then
+        return vim.NIL
+    end
+    if type(v) == "table" then
+        if type(v.__oid) == "string" then
+            return { ["$oid"] = v.__oid }
+        end
+        -- Bytes / a nested document or array: already the shape the driver produced, pass it through.
+        return v
+    end
+    return v
+end
+
+--- Render `v` as a SQL literal for `driver`. `nil` / JSON-null become NULL.
+---@param driver string
+---@param v any
+---@return string
+function M.literal(driver, v)
+    if v == nil or v == vim.NIL then
+        return "NULL"
+    end
+    if type(v) == "number" then
+        return tostring(v)
+    end
+    if type(v) == "boolean" then
+        -- sqlite has no boolean type — it stores 1/0 and would take TRUE as an unknown identifier.
+        if driver == "sqlite" then
+            return v and "1" or "0"
+        end
+        return v and "TRUE" or "FALSE"
+    end
+    local s = tostring(v)
+    -- MySQL/MariaDB and ClickHouse interpret BACKSLASH escapes inside a string literal (the ANSI engines do
+    -- not), so a lone backslash there would swallow the character after it — double it first, then the ANSI
+    -- '' doubling handles the quote for every engine.
+    if driver == "mysql" or driver == "mariadb" or driver == "clickhouse" then
+        s = s:gsub("\\", "\\\\")
+    end
+    return "'" .. s:gsub("'", "''") .. "'"
+end
+
+--- `UPDATE <object> SET <set> WHERE <where>` for `driver` — one row, addressed by its key.
+--- Both `set` and `where` are ORDERED lists of `{ name, value }` so the emitted statement is deterministic
+--- (a map would reorder between runs and make the call log unreadable).
+---@param driver string
+---@param schema string?
+---@param object string
+---@param set { name: string, value: any }[]     the CHANGED columns and their new values
+---@param where { name: string, value: any }[]   the key columns and their ORIGINAL values
+---@return string?, string?  the statement, or nil + why this engine cannot express it
+function M.update_row(driver, schema, object, set, where)
+    local ok, why = M.can_update_row(driver)
+    if not ok then
+        return nil, why
+    end
+    if #set == 0 then
+        return nil, "nothing changed"
+    end
+    if #where == 0 then
+        return nil, "no key columns — the row cannot be addressed"
+    end
+    if driver == "mongodb" then
+        -- A document update is a COMMAND, not a statement — the same `update`/`$set` shape the other mongo
+        -- templates here use. `multi = false`: this addresses ONE document, and a `_id` filter can only ever
+        -- match one, but saying so means a filter that somehow widened still cannot rewrite the collection.
+        local q, u = {}, {}
+        for _, w in ipairs(where) do
+            q[w.name] = ext_json(w.value)
+        end
+        for _, s in ipairs(set) do
+            u[s.name] = ext_json(s.value)
+        end
+        return vim.json.encode({
+            update = object,
+            updates = { { q = q, u = { ["$set"] = u }, multi = false } },
+        })
+    end
+    local t = qualify(driver, schema, object)
+    local sets, conds = {}, {}
+    for _, s in ipairs(set) do
+        sets[#sets + 1] = ("%s = %s"):format(quote(driver, s.name), M.literal(driver, s.value))
+    end
+    for _, w in ipairs(where) do
+        -- A NULL key value cannot be matched with `=` (NULL = NULL is unknown). A key column is NOT NULL by
+        -- definition, so this is a can't-happen — but expressed rather than assumed.
+        if w.value == nil or w.value == vim.NIL then
+            return nil, ("key column '%s' is NULL — the row cannot be addressed"):format(w.name)
+        end
+        conds[#conds + 1] = ("%s = %s"):format(quote(driver, w.name), M.literal(driver, w.value))
+    end
+    local body = ("%s SET %s WHERE %s"):format(t, table.concat(sets, ", "), table.concat(conds, " AND "))
+    if driver == "clickhouse" then
+        -- ClickHouse has no plain UPDATE: a row change is a MUTATION spelled `ALTER TABLE … UPDATE`, and it is
+        -- ASYNCHRONOUS by default — the statement returns before the row is actually changed, so the grid's
+        -- re-read after a save would show the STALE value. `SETTINGS mutations_sync = 1` makes it BLOCK until
+        -- the mutation is applied, so the write is done (and the re-read fresh) by the time `M.write` returns.
+        return ("ALTER TABLE %s SETTINGS mutations_sync = 1;"):format(body)
+    end
+    return ("UPDATE %s;"):format(body)
 end
 
 --- `CREATE INDEX` for `driver`. `columns` is a list; `unique` is ignored by engines that have no such notion.

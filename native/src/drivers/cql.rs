@@ -16,7 +16,8 @@ use scylla::value::{CqlValue, Row};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn,
+    Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -149,7 +150,13 @@ fn cell(v: &CqlValue) -> Value {
             b64: base64::engine::general_purpose::STANDARD.encode(b),
             len: b.len(),
         },
-        other => Value::Text(format!("{other:?}")),
+        // Everything else (uuid/timeuuid, inet, date/time/timestamp/duration, counter, decimal/varint,
+        // list/set/map/tuple/UDT/vector) → the crate's OWN `Display`, which renders CQL-literal forms
+        // (`'2026-07-18'`, `[1,2]`, `{'k':'v'}`, a uuid's hex). This replaces `format!("{:?}")` (Rust Debug:
+        // `Map([(Text("k"),Text("v"))])`, `CqlTimestamp(...)`) — never the value, never a valid literal.
+        // Decimal/Varint still show as `blobAsDecimal(0x…)`/`blobAsVarint(0x…)` (the crate's choice — a valid
+        // CQL expression, not a plain number), but that is honest and round-trippable, unlike the Debug form.
+        other => Value::Text(other.to_string()),
     }
 }
 
@@ -302,17 +309,14 @@ impl Connection for CqlConnection {
                     Some(Value::Text(s)) => s.clone(),
                     _ => return None,
                 };
-                // `options` is a CQL map<text,text> that this driver renders with Rust's Debug, so it
-                // arrives literally as: Map([(Text("target"), Text("email"))]). MEASURED against a live
-                // cluster — an earlier guess at the shape sliced it into garbage ('), Text('), which is
-                // exactly the failure a "looks like a string, split it" approach earns.
-                // So: find the `target` key, then take the NEXT quoted run — its value.
+                // `options` is a CQL map<text,text>, now rendered by the crate's `Display` as a CQL map
+                // literal: `{'target':'email','class_name':'exams'}` (keys/values single-quoted). Find the
+                // `target` key and take its quoted value. (This tracks the cell() render above — when that was
+                // Rust Debug this sliced `Text("target")` instead; both were updated together.)
                 let target = match r.get(1) {
-                    Some(Value::Text(s)) => s.split_once("Text(\"target\")").and_then(|(_, rest)| {
-                        rest.split_once("Text(\"")
-                            .and_then(|(_, v)| v.split_once('"'))
-                            .map(|(v, _)| v.to_string())
-                    }),
+                    Some(Value::Text(s)) => s
+                        .split_once("'target':'")
+                        .and_then(|(_, rest)| rest.split_once('\'').map(|(v, _)| v.to_string())),
                     _ => None,
                 };
                 Some(Index {

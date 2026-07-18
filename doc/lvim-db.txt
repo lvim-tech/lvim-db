@@ -67,7 +67,7 @@ setup() merges your options into the live config. The full defaults: >lua
   require("lvim-db").setup({
       daemon_path = nil,              -- nil ⇒ probe $LVIM_DB_DAEMON, native/build,
                                       --      native/target/release
-      page_size = 200,                -- rows the grid pulls per page
+      page_size = 50,                 -- rows loaded per page (the N in `1–N/total`)
       confirm_destructive = true,     -- prompt before a destructive statement
       destructive_patterns = {        -- case-insensitive Lua patterns
           "^%s*drop%s",
@@ -92,7 +92,15 @@ setup() merges your options into the live config. The full defaults: >lua
               view_result = "r", view_log = "L",
               rerun = "<CR>", cancel = "x",
               next_page = "n", prev_page = "p",
-              yank = "y", export = "e", close = "q",
+              next_column = "<C-n>",  -- jump to the next column
+              prev_column = "<C-p>",  -- jump to the previous column
+              edit_row = "e",         -- LOCK the focused row for editing
+              edit_popup = "E",       -- edit the row in a popup (every field)
+              edit_cell = "<CR>",     -- editing: open the field on the cell
+              insert_cell = { "i", "a" }, -- edit the field (locks the row)
+              save_edit = "S",        -- editing: write back (one UPDATE)
+              cancel_edit = "c",      -- editing: discard
+              yank = "y", export = "Y", close = "q",
           },
           form = { test = "t", save = "s", close = "q" },
       },
@@ -122,7 +130,7 @@ Expanding a table / view / collection shows its FACETS — one row per thing you
 can ask about it. Each facet either opens or acts: >
 
     users
-       Data          run a bounded preview into the result dock
+       Data          browse the object's rows in the result dock (paged)
       Columns        expands to the columns, with their types
       Indexes        expands to the indexes (name, unique/pk, columns in order)
        DDL           load the CREATE statement into the SQL editor
@@ -193,6 +201,9 @@ daemon at connect time only — never persisted or logged as plain values:
 
   {{ env "VAR" }}              the value of an environment variable
   {{ cmd "pass show db/x" }}   the stdout of a command (trimmed)
+  {{ vault "db/x" }}           the secret of that name from the lvim-keyring
+                               wallet (read over its socket at connect time;
+                               a locked wallet reports ":LvimKeyring unlock")
   literal text                 used verbatim
 
 This also covers token-style provider auth, e.g. an AWS RDS IAM token via
@@ -358,11 +369,52 @@ All of these keys are configurable — see `keys` in |lvim-db-setup|.
 A failing test leaves the panel open with everything typed so far, so it can be
 fixed and retried. Secrets are saved as TEMPLATES (|lvim-db-credentials|).
 
-Result dock — a bottom dock with NO drawn border (a blank breathing inset, the
-shared content_border ring, not a box) — two tabs (1/2 or r/L switch):
-  Result: n / p next / previous page, y yank the page as TSV, e export, q close.
+Result dock — a full-width bottom dock. Its header shows the TITLE on the left
+(`database ➤ object` for a table/collection browse, the connection for an ad-hoc
+query) and a COUNTER on the right (`1–50/536` — which rows of the total are
+loaded). Below it, two tabs (1/2 or r/L switch):
+  Result: n / p next / previous PAGE, <C-n> / <C-p> next / previous column, e / E
+  edit the focused row, y yank the page as TSV, Y export, q close.
   Call log: one row per call with a state accent; <CR> re-runs a call, x cancels
   a running one.
+
+The column header STICKS: it is the grid window's winbar, not a row of the
+buffer, so it stays put while the rows scroll under it — and it is re-sliced
+from the window's leftcol on every redraw, so it tracks a horizontal scroll
+exactly. Every column is rendered (the grid never pages sideways); <C-n> walks
+to the next one and scrolls it fully into view.
+
+                                                        *lvim-db-editing*
+Editing a row ~
+
+`e` LOCKS the focused row: it is pinned to the key values it had at that moment,
+tinted, and the footer becomes `S save · c cancel`. `<CR>` — or `i` / `a`, which take the
+lock for you — opens the field under the cursor in a popup sitting ON the cell; a changed field stays tinted until it
+is written. `S` sends exactly one `UPDATE … SET … WHERE key = …` carrying only
+the fields that changed; `c` discards everything. `E` opens the whole row at
+once — every field, one per line.
+
+Nothing is ever typed into the grid itself, by design. A cell shows a padded,
+TRUNCATED, flattened rendering of a value — a `…` prefix, spaces that may be
+padding or may be data, a whole document reduced to one line of JSON — so
+editing that text would mean editing a picture of the data and hoping it reads
+back. The popups hold the value itself, which is why a truncated cell edits its
+FULL value instead of writing its prefix over it.
+
+A grid is editable only when lvim-db can answer BOTH questions — where did these
+rows come from, and how do I name one? So it is read-only for an ad-hoc query
+(an arbitrary join has no answer to "which table is this cell"), for a table
+with no primary key, and for engines that cannot address a single row. `e` says
+which of those it is rather than doing nothing.
+
+Within an editable row a single FIELD is still view-only when it has no faithful
+text round-trip: a binary value (BLOB / bytea), and a structured value that would
+have to be reconstructed to write back — a Postgres bytea, a Snowflake VARIANT /
+OBJECT / ARRAY / BINARY, a ClickHouse Array / Tuple / Map. Editing is refused
+before the field opens (the whole-row save aborts on one) rather than silently
+writing a quoted string where the engine expected a parsed value. MongoDB is the
+exception: a nested document / array edits as extended JSON, and an ObjectId /
+Date / Decimal128 round-trips through its BSON type.
 
 Notes: per-connection scratch SQL as real files under
 stdpath("state")/lvim-db/notes/<conn>/ (opened as `sql` buffers). In a note the

@@ -16,7 +16,8 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn,
+    Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -135,23 +136,79 @@ struct MssqlConnection {
 }
 
 /// Render one cell by trying the common FromSql conversions in order.
+/// A SQL Server DECIMAL/NUMERIC/MONEY as its EXACT decimal string. tiberius `Numeric` is i128-backed (≤38
+/// digits), but its own `Display` delegates to `Debug` (numeric.rs:197 `write!("{:?}")`) — so it prints the
+/// struct, not the number. Reconstruct from int/dec/scale (all exact in i128).
+fn numeric_text(n: tiberius::numeric::Numeric) -> String {
+    let scale = n.scale() as usize;
+    if scale == 0 {
+        return n.int_part().to_string();
+    }
+    let ip = n.int_part();
+    let frac = n.dec_part().unsigned_abs();
+    let neg = ip < 0 || (ip == 0 && n.dec_part() < 0);
+    format!(
+        "{}{}.{:0>width$}",
+        if neg { "-" } else { "" },
+        ip.abs(),
+        frac,
+        width = scale
+    )
+}
+
+/// Render one SQL Server cell. A TRY-LADDER (tiberius decodes by asking for a concrete Rust type): the FIRST
+/// type that matches wins. The ladder must cover every common column type — anything it misses falls through
+/// to the final `Value::Null`, which is INDISTINGUISHABLE from a real NULL: the grid would then show a real
+/// DECIMAL/UUID/DATE value as an empty NULL cell (and an edit would write NULL over it). So the ladder
+/// includes the narrow ints, real(f32), Numeric (decimal/numeric/money), uniqueidentifier, and the date/time
+/// families — each rendered to canonical text — not just i32/i64/f64/bool/str/datetime/bytes.
 fn render_cell(row: &tiberius::Row, i: usize) -> Value {
+    // integers: SQL Server int/bigint AND tinyint(u8)/smallint(i16), which do NOT decode as i32/i64
     if let Ok(Some(v)) = row.try_get::<i32, _>(i) {
         return Value::Int(v as i64);
     }
     if let Ok(Some(v)) = row.try_get::<i64, _>(i) {
         return Value::Int(v);
     }
+    if let Ok(Some(v)) = row.try_get::<u8, _>(i) {
+        return Value::Int(v as i64);
+    }
+    if let Ok(Some(v)) = row.try_get::<i16, _>(i) {
+        return Value::Int(v as i64);
+    }
+    // floats: float(f64) and real(f32)
     if let Ok(Some(v)) = row.try_get::<f64, _>(i) {
         return Value::Float(v);
+    }
+    if let Ok(Some(v)) = row.try_get::<f32, _>(i) {
+        return Value::Float(v as f64);
     }
     if let Ok(Some(v)) = row.try_get::<bool, _>(i) {
         return Value::Bool(v);
     }
+    // decimal / numeric / money → exact decimal text (see numeric_text)
+    if let Ok(Some(v)) = row.try_get::<tiberius::numeric::Numeric, _>(i) {
+        return Value::Text(numeric_text(v));
+    }
+    // uniqueidentifier
+    if let Ok(Some(v)) = row.try_get::<tiberius::Uuid, _>(i) {
+        return Value::Text(v.to_string());
+    }
     if let Ok(Some(v)) = row.try_get::<&str, _>(i) {
         return Value::Text(v.to_string());
     }
+    // date/time families: DATETIME/DATETIME2 (NaiveDateTime), DATE (NaiveDate), TIME (NaiveTime),
+    // DATETIMEOFFSET (DateTime<Utc>)
     if let Ok(Some(v)) = row.try_get::<chrono::NaiveDateTime, _>(i) {
+        return Value::Timestamp(v.to_string());
+    }
+    if let Ok(Some(v)) = row.try_get::<chrono::NaiveDate, _>(i) {
+        return Value::Text(v.to_string());
+    }
+    if let Ok(Some(v)) = row.try_get::<chrono::NaiveTime, _>(i) {
+        return Value::Text(v.to_string());
+    }
+    if let Ok(Some(v)) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(i) {
         return Value::Timestamp(v.to_string());
     }
     if let Ok(Some(v)) = row.try_get::<&[u8], _>(i) {

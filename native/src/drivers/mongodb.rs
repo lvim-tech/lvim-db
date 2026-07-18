@@ -20,7 +20,8 @@ use mongodb::{Client, Cursor};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn,
+    Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -205,8 +206,23 @@ fn cell(b: &Bson) -> Value {
         Bson::Int64(i) => Value::Int(*i),
         Bson::Double(d) => Value::Float(*d),
         Bson::String(s) => Value::Text(s.clone()),
-        Bson::ObjectId(oid) => Value::Text(oid.to_hex()),
-        Bson::DateTime(dt) => Value::Timestamp(dt.try_to_rfc3339_string().unwrap_or_else(|_| dt.to_string())),
+        // TAGGED, not Text: an ObjectId rendered to its bare hex is indistinguishable from a string `_id`
+        // by the time it reaches the grid, and the grid needs that difference to address the document at
+        // all — `{_id: "<hex>"}` matches no real ObjectId. It still DISPLAYS as the hex (see the Lua
+        // `cell_display`); only the type travels with it.
+        Bson::ObjectId(oid) => Value::Oid(oid.to_hex()),
+        // DateTime and Decimal128 are TAGGED (`Value::Ext`, like ObjectId) rather than left as a bare string:
+        // a top-level date/decimal otherwise reaches the grid as plain text and an edit writes it back as a
+        // string — the wrong BSON type. `Ext` shows the readable value AND, on edit, round-trips through the
+        // extended-JSON key (`$date` / `$numberDecimal`) that `Bson::try_from` (see `dispatch`) reads back.
+        Bson::DateTime(dt) => Value::Ext {
+            text: dt.try_to_rfc3339_string().unwrap_or_else(|_| dt.to_string()),
+            key: "$date".to_string(),
+        },
+        Bson::Decimal128(d) => Value::Ext {
+            text: d.to_string(),
+            key: "$numberDecimal".to_string(),
+        },
         Bson::Binary(bin) => Value::Bytes {
             b64: base64::engine::general_purpose::STANDARD.encode(&bin.bytes),
             len: bin.bytes.len(),
@@ -263,11 +279,18 @@ impl MongoConnection {
     /// Open a find/aggregate cursor (returning a live streaming result), or run a
     /// raw command (returning a buffered result).
     async fn dispatch(&self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
-        let doc: Document = serde_json::from_str::<serde_json::Value>(stmt)
-            .map_err(|e| anyhow::anyhow!("statement must be a JSON document: {e}"))
-            .and_then(|v| {
-                mongodb::bson::to_document(&v).map_err(|e| anyhow::anyhow!("invalid command document: {e}"))
-            })?;
+        // EXTENDED JSON, not plain: `bson::to_document` is a straight serde conversion, so `{"$oid": "…"}`
+        // would land as a literal sub-document with a `$oid` KEY and match nothing. `Bson::try_from` reads
+        // the extended-JSON forms (`$oid`, `$date`, `$numberLong`, …) into their real BSON types — which is
+        // both what every other mongo client speaks and the only way a caller can name an ObjectId in a
+        // filter. That is what makes an addressed update possible (see `Value::Oid`).
+        let json: serde_json::Value =
+            serde_json::from_str(stmt).map_err(|e| anyhow::anyhow!("statement must be a JSON document: {e}"))?;
+        let doc: Document = match Bson::try_from(json) {
+            Ok(Bson::Document(d)) => d,
+            Ok(_) => anyhow::bail!("statement must be a JSON object"),
+            Err(e) => anyhow::bail!("invalid command document: {e}"),
+        };
         let db = self.client.database(&self.db);
 
         if let Ok(coll) = doc.get_str("find") {

@@ -551,11 +551,13 @@ end
 local function helper_action(row)
     local conn, obj = row.conn, row.obj
     if row.helper.id == "data" then
-        -- The bounded preview, through the guarded runner for consistency (a SELECT never trips the guard).
+        -- BROWSE the whole object (no LIMIT): the daemon streams it and the grid pages on demand (n / p), so
+        -- the counter reads `1–<page_size> / <total>` and you can page all the way through — not just the
+        -- first page. Guarded runner for consistency (a SELECT never trips the guard).
         local q = require("lvim-db.query")
-        local stmt = q.preview_statement(conn.driver, row.schema.name, obj.name, config.page_size)
-        -- Pass the ORIGIN: these rows ARE this object's, so the result dock can address them (and only then
-        -- offer to edit them). An ad-hoc statement from the editor passes none and stays read-only.
+        local stmt = q.preview_statement(conn.driver, row.schema.name, obj.name, nil)
+        -- Pass the ORIGIN: these rows ARE this object's, so the result dock can address them (edit them) AND
+        -- count them for the total. An ad-hoc statement from the editor passes none and stays read-only.
         require("lvim-db.ui.result").run_guarded(conn.conn_id, conn.name, conn.driver, stmt, {
             schema = row.schema.name,
             object = obj.name,

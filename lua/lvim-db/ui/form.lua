@@ -84,11 +84,11 @@ local function open_tabs(meta, existing)
             options = method_opts,
         },
         srow("a_user", "User", sa.user),
-        srow("a_password", 'Password (literal or {{ env "VAR" }})', sa.password),
+        srow("a_password", 'Password (literal, {{ env "VAR" }} or {{ vault "db/x" }})', sa.password),
         srow("a_cert", "Client certificate path (X.509 auth)", sa.cert),
         srow("a_key", "Client key path", sa.key),
         srow("a_provider", "Provider (aws / oauth / oidc)", sa.provider),
-        srow("a_token", 'Token (literal or {{ cmd "…" }})', sa.token),
+        srow("a_token", 'Token (literal, {{ cmd "…" }} or {{ vault "…" }})', sa.token),
     }
 
     local tabs = {
@@ -266,6 +266,65 @@ local function open_tabs(meta, existing)
         return true
     end
 
+    ---@type table? the ui.tabs handle (captured below) — lets `store_in_keyring` repaint the rewritten field
+    local handle
+
+    --- Store the Auth secret (password, or the provider token) in the lvim-keyring wallet under
+    --- `db/<connection-name>`, then rewrite that field to `{{ vault "db/<name>" }}` — so the secret lives
+    --- ENCRYPTED in the wallet and the store keeps only the template. Requires lvim-keyring installed +
+    --- unlocked; a name is required first (it is the vault key), and an already-templated field is left alone.
+    local function store_in_keyring()
+        local v = values()
+        local name = vim.trim(str(v.__name))
+        if name == "" then
+            vim.notify("lvim-db: enter a connection name first (it is the wallet key)", vim.log.levels.WARN)
+            return
+        end
+        local field = (v.a_kind == "provider") and "a_token" or "a_password"
+        local secret = str(v[field])
+        if secret == "" then
+            vim.notify("lvim-db: no value in the Auth field to store", vim.log.levels.WARN)
+            return
+        end
+        if secret:match("^%s*{{") then
+            vim.notify("lvim-db: the field is already a {{ … }} template", vim.log.levels.INFO)
+            return
+        end
+        local ok_kr, kr = pcall(require, "lvim-keyring")
+        if not ok_kr then
+            vim.notify("lvim-db: lvim-keyring is not installed", vim.log.levels.WARN)
+            return
+        end
+        local vault_name = "db/" .. name
+        kr.ensure_unlocked(function(unlocked, uerr)
+            if not unlocked then
+                if uerr and uerr ~= "" then
+                    vim.notify("lvim-db: " .. uerr, vim.log.levels.WARN)
+                end
+                return
+            end
+            kr.set(vault_name, secret, nil, function(sok, serr)
+                if not sok then
+                    vim.notify("lvim-db: keyring — " .. (serr or "store failed"), vim.log.levels.WARN)
+                    return
+                end
+                -- Rewrite the field to the vault template (in place) and repaint.
+                local template = ('{{ vault "%s" }}'):format(vault_name)
+                for _, t in ipairs(tabs) do
+                    for _, r in ipairs(t.rows) do
+                        if r.name == field then
+                            r.value = template
+                        end
+                    end
+                end
+                if handle and handle.render then
+                    handle.render()
+                end
+                vim.notify(("lvim-db: stored in the keyring — field set to %s"):format(template), vim.log.levels.INFO)
+            end)
+        end)
+    end
+
     -- Per-tab footer band: TEST this tab's layer • SAVE • close (keys from
     -- config.keys.form; a `false` key drops that button). Every tab can save (the
     -- form is submittable from wherever the user finishes), while the test button
@@ -302,6 +361,16 @@ local function open_tabs(meta, existing)
                 end,
             }
         end
+        -- Auth tab only: offer to move the typed secret into the lvim-keyring wallet (when installed).
+        if t.stage == "auth" and fk.keyring and pcall(require, "lvim-keyring") then
+            footer[#footer + 1] = {
+                key = fk.keyring,
+                label = "store in keyring",
+                run = function()
+                    store_in_keyring()
+                end,
+            }
+        end
         if fk.close then
             -- Label-only: the frame already closes on this key (a real mapping here
             -- would only shadow it).
@@ -310,7 +379,7 @@ local function open_tabs(meta, existing)
         t.footer = footer
     end
 
-    ui.tabs({
+    handle = ui.tabs({
         title = existing and ("Edit connection: " .. existing.name)
             or ("New connection: " .. (meta.display or meta.kind)),
         title_pos = "center",

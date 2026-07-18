@@ -79,9 +79,10 @@ require("lvim-db").setup({
     -- Absolute path to the daemon binary. nil ⇒ probe: $LVIM_DB_DAEMON, then the
     -- plugin's own native/build/, then native/target/release/ (a local dev build).
     daemon_path = nil,
-    -- Rows the result grid pulls per page. The daemon buffers the whole result and
-    -- serves slices, so this only bounds how much Neovim holds/redraws at once.
-    page_size = 200,
+    -- Rows loaded per page — the "N" in the dock's `1–N / total` counter, and the step
+    -- n / p page by. The daemon streams the object and serves slices on demand, so this
+    -- bounds how many rows Neovim holds at once, never how many exist.
+    page_size = 50,
     -- Width (columns) of the connections drawer side panel.
     drawer_width = 36,
     -- Prompt before running a statement that matches destructive_patterns.
@@ -132,8 +133,16 @@ require("lvim-db").setup({
             cancel = "x", -- call log: cancel the focused running call
             next_page = "n",
             prev_page = "p",
+            next_column = "<C-n>", -- jump to the next column (scrolls it into view)
+            prev_column = "<C-p>", -- jump to the previous column
+            edit_row = "e", -- LOCK the focused row for editing
+            edit_popup = "E", -- edit the focused row in a popup (every field at once)
+            edit_cell = "<CR>", -- editing: open the field under the cursor, on the cell
+            insert_cell = { "i", "a" }, -- start editing the field under the cursor (locks the row)
+            save_edit = "S", -- editing: write every changed field back (one UPDATE)
+            cancel_edit = "c", -- editing: discard the edit
             yank = "y", -- yank the page as TSV
-            export = "e",
+            export = "Y", -- write the page to a TSV file
             close = "q",
         },
         -- the connection form (one footer band per tab)
@@ -204,6 +213,12 @@ daemon at connect time only — never persisted or logged as plain values:
 
 - `{{ env "VAR" }}` — the value of an environment variable
 - `{{ cmd "pass show db/prod" }}` — the stdout of a command (trimmed)
+- `{{ vault "db/prod" }}` — the secret of that name from the **lvim-keyring** wallet (a
+  per-user encrypted secrets agent); the daemon reads it over the wallet's socket at connect
+  time. When the wallet is locked, the connection reports `the keyring is locked — :LvimKeyring
+  unlock`; when it is not running, it says so. On the form's **Auth** tab, `store in keyring`
+  (default `K`, shown when lvim-keyring is installed) moves the typed password/token into the
+  wallet and rewrites the field to `{{ vault "db/<connection>" }}` for you.
 - literal text — used verbatim
 
 This also covers token-style provider auth, e.g. an AWS RDS IAM token:
@@ -336,13 +351,52 @@ cursor is hidden while the panel is focused (shown again in the code beside it).
 
 ### Result dock
 
-A bottom dock with **no drawn border** — a blank breathing inset (the shared `content_border`
-ring) rather than a box. Two tabs — the **result grid** and the **call log** — switchable with
-`1`/`2` (or `r`/`L`):
+A bottom dock spanning the full width. Its header carries, on one row, the **title** on the left —
+`database ➤ object` for a table/collection browse (the connection name for an ad-hoc query) — and a
+**counter** on the right: `1–50/536`, which rows of the total are loaded. Below it are two tabs, the
+**result grid** and the **call log**, switchable with `1`/`2` (or `r`/`L`):
 
-- Result: `n` / `p` — next / previous page · `y` — yank the page as TSV · `e` — export · `q` — close
+- Result: `n` / `p` — next / previous PAGE · `<C-n>` / `<C-p>` — next / previous column · `e` / `E` —
+  edit the focused row · `y` — yank the page as TSV · `Y` — export · `q` — close
 - Call log: one row per call with a state accent (running / done / failed); `<CR>` re-runs a call,
   `x` cancels a running one.
+
+Opening a table/collection's **Data** facet BROWSES the whole object: the daemon streams it and the
+grid pages `page_size` rows at a time (`n`/`p`), so you can page all the way through — the counter's
+total is the object's real row count (`COUNT(*)` / `countDocuments`, shown at once), not just what is
+on screen.
+
+The **column header sticks**: it is the grid window's winbar, not a row of the buffer, so it stays
+put while the rows scroll under it — and it is re-sliced from the window's `leftcol` on every
+redraw, so it also tracks a horizontal scroll exactly. Every column is rendered (the grid never
+pages sideways); `<C-n>` walks to the next one and scrolls it fully into view.
+
+#### Editing a row
+
+`e` **locks** the focused row: it is pinned to the key values it had at that moment, tinted, and the
+footer becomes `S save · c cancel`. `<CR>` — or `i` / `a`, which also take the lock for you — opens the field under the
+cursor in a popup sitting **on the cell**; a changed field is tinted until written. `S` sends exactly one
+`UPDATE … SET … WHERE key = …` carrying only the fields that changed; `c` discards everything.
+`E` opens the whole row at once — every field, one per line.
+
+Nothing is ever typed into the grid itself, by design. A cell shows a *padded, truncated, flattened*
+rendering of a value — a `…` prefix, spaces that may be padding or may be data, a whole document
+reduced to one line of JSON — so editing that text would mean editing a picture of the data and
+hoping it reads back. The popups hold the value itself, which is why a truncated cell edits its full
+value rather than writing its prefix over it.
+
+A grid is editable only when lvim-db can answer **both** questions — where did these rows come from,
+and how do I name one? So it is read-only for an ad-hoc query (an arbitrary join has no answer to
+"which table is this cell"), for a table with no primary key, and for engines that cannot address a
+single row. `e` says which of those it is rather than doing nothing.
+
+Within an editable row, a single **field** is still view-only when it has no faithful text round-trip:
+a binary value (BLOB / `bytea`), and a structured value that would have to be reconstructed to write it
+back — a Postgres `bytea`, a Snowflake `VARIANT` / `OBJECT` / `ARRAY` / `BINARY`, a ClickHouse
+`Array` / `Tuple` / `Map`. Editing is refused before the field opens (and the whole-row save aborts on
+one) rather than silently writing a quoted string where the engine expected a parsed value. MongoDB is
+the exception: a nested document / array edits as extended JSON, and an `ObjectId` / `Date` /
+`Decimal128` round-trips through its BSON type.
 
 ### Notes / scratch SQL
 

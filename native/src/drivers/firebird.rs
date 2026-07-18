@@ -16,8 +16,8 @@ use rsfbclient::{Column, Queryable, Row, SimpleConnection, SqlType};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column as SpecColumn, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType,
-    Value,
+    AuthKind, AuthSpec, Caps, Column as SpecColumn, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType,
+    TableColumn, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[

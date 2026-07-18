@@ -15,7 +15,8 @@ use mysql_async::{Conn, Opts, OptsBuilder, Row};
 use crate::driver::{CancelHandle, Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn,
+    Value,
 };
 
 const PARAMS: &[ParamSpec] = &[

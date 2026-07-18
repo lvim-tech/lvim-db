@@ -15,7 +15,8 @@ use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use crate::driver::{CancelHandle, Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn,
+    Value,
 };
 
 // ── driver metadata ──────────────────────────────────────────────────────────
@@ -433,7 +434,20 @@ impl Connection for PgConnection {
     }
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
-        let (columns, rows, affected) = self.simple(stmt).await?;
+        let (mut columns, rows, affected) = self.simple(stmt).await?;
+        // Recover column TYPES via an extended-protocol describe — the simple/text protocol reports names
+        // only, so `simple` leaves `type_name` empty. Only the user-query path pays this extra round trip
+        // (the catalog helpers call `simple` directly and do not need types). Best-effort: a multi-statement
+        // or otherwise non-preparable SQL leaves the types empty and the grid falls back to text — the engine
+        // still validates every write. `prepare` describes only; it does NOT execute, so there is no double
+        // run of the statement `simple_query` already ran.
+        if !columns.is_empty() {
+            if let Ok(prepared) = self.client.prepare(stmt).await {
+                for (col, pc) in columns.iter_mut().zip(prepared.columns()) {
+                    col.type_name = pc.type_().name().to_string();
+                }
+            }
+        }
         Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, affected)))
     }
 

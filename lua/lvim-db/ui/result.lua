@@ -1,12 +1,26 @@
 -- lvim-db.ui.result: the query result dock.
 --
 -- A bottom-docked lvim-ui.surface (never a raw float): the content panel renders
--- the current page as an aligned text grid (a highlighted header row + zebra
--- body, NULL/number tints from the theme factory), and the surface FOOTER carries
--- the pagination band + yank/export/close buttons. The whole result is buffered
--- in the daemon; this dock only ever holds one page and pages through the client
--- API (query.page). Executes go through here so the call is recorded in history
--- and the destructive-statement guard is applied by the caller.
+-- the current page as an aligned text grid (zebra body, NULL/number tints from
+-- the theme factory), and the surface FOOTER carries the pagination band +
+-- edit/yank/export/close buttons. The whole result is buffered in the daemon;
+-- this dock only ever holds one page and pages through the client API
+-- (query.page). Executes go through here so the call is recorded in history and
+-- the destructive-statement guard is applied by the caller.
+--
+-- Three things about the grid are worth knowing before changing it:
+--
+--   • WIDTHS AND OFFSETS ARE DISPLAY CELLS, never bytes. See "cells, not bytes".
+--   • The COLUMN HEADER is the window's winbar, not a line in the buffer — that
+--     is what makes it stick while the rows scroll under it (see `M.winbar`),
+--     and it also makes buffer line `ri` exactly result row `ri`.
+--   • A row can be EDITED only when the dock knows both where the rows came from
+--     (`state.origin`) and how to name one (`resolve_key`); everything else is
+--     honestly read-only. See "addressing a row" and "editing a row".
+--   • Nothing is ever typed INTO the grid buffer. The cells show a padded,
+--     truncated, flattened rendering of the values — editing that text would be
+--     editing a picture of the data. Fields are edited in a popup holding the
+--     real value. See "editing a row".
 --
 ---@module "lvim-db.ui.result"
 
@@ -16,16 +30,33 @@ local config = require("lvim-db.config")
 
 local M = {}
 
+-- The separator between two columns, and the widest a cell may render before it is cut. `SEP` is 3 display
+-- CELLS and 5 bytes — the exact discrepancy that makes the cells-vs-bytes rule below non-negotiable.
+local SEP = " │ "
+local SEP_CELLS = 3
+local MAX_CELL = 60
+
 local state = {
     surface = nil, ---@type table?
     buf = nil, ---@type integer?
+    win = nil, ---@type integer?  the grid PANEL window (owns the sticky header's winbar)
     ns = api.nvim_create_namespace("LvimDbResult"),
+    -- A SECOND namespace, deliberately: `ns` carries the grid's own paint and is cleared and rewritten on
+    -- every render, while these marks belong to the LOCKED row and must outlive that.
+    ns_edit = api.nvim_create_namespace("LvimDbResultEdit"),
     view = "result", ---@type "result"|"log"  which tab is shown
     call_id = nil, ---@type integer?
     conn_id = nil, ---@type integer?
     conn = nil, ---@type string?
     driver = nil, ---@type string?
+    statement = nil, ---@type string?  the statement the current page came from (re-run to refresh after a write)
     offset = 0,
+    ---@type table?  the rendered grid's LAYOUT — see `render_result`. The sticky header, the column jump and
+    --- the inline editor all read it; nil whenever the grid is not showing a result.
+    grid = nil,
+    active_col = 1, ---@type integer  the column the cursor is in (its header cell is tinted)
+    ---@type LvimDbEdit?  the row LOCKED for editing — see `start_edit`. nil when not editing.
+    edit = nil,
     page = nil, ---@type table?  the current page { columns, rows, from, has_more, total, affected }
     ---@type table[]  the session CALL LOG (newest last): { call_id, conn_id, conn, driver, statement, state, ms, rows }
     calls = {},
@@ -43,6 +74,112 @@ local function is_open()
     return state.surface ~= nil and state.buf ~= nil and api.nvim_buf_is_valid(state.buf)
 end
 
+-- ── cells, not bytes ─────────────────────────────────────────────────────────
+--
+-- The grid has ONE coordinate system for width and position: display CELLS. That is not tidiness, it is the
+-- only system the pieces agree in — `leftcol` (what the sticky header has to track) is in cells, `│` is 3
+-- bytes and 1 cell, and a Cyrillic letter is 2 bytes and 1 cell. The first cut of this grid mixed all three:
+-- header widths in BYTES, truncation slicing BYTES, padding in CELLS. On ASCII the three agree and it looked
+-- right; on the user's own data it did not — a Cyrillic header made its column its byte-length too wide, and
+-- a byte-sliced value rendered as `<d1>` (a character cut in half). Any header sliced against `leftcol` on
+-- top of that model was measuring one thing and cutting another, which is why it drifted on a real grid.
+--
+-- Bytes appear below ONLY where the API demands them (extmark columns), and are converted explicitly.
+
+local strwidth = api.nvim_strwidth
+
+--- Flatten a display string: every ASCII control character becomes a space. A raw newline would split the
+--- row and a tab would expand to a tabstop — either way the column stops being the width we measured.
+--- The class is written out as an explicit ASCII range rather than `%c`: Lua's character classes are
+--- byte-wise and locale-bound, so `%c` can match UTF-8 continuation bytes (0x80-0xBF) and shred a
+--- multibyte character — the very bug this section exists to prevent.
+---@param s string
+---@return string
+local function flatten(s)
+    return (s:gsub("[%z\1-\31\127]", " "))
+end
+
+--- The first `n` display CELLS of `s`. A wide character straddling the edge is dropped whole and replaced by
+--- spaces for the cells it would have covered, so the result is EXACTLY `n` cells wide — dropping it
+--- silently would shift everything after it a cell to the left.
+---@param s string
+---@param n integer
+---@return string
+local function take_cells(s, n)
+    if n <= 0 then
+        return ""
+    end
+    if strwidth(s) <= n then
+        return s
+    end
+    local pos = vim.str_utf_pos(s)
+    local w = 0
+    for i = 1, #pos do
+        local b = pos[i]
+        local e = (pos[i + 1] or (#s + 1)) - 1
+        local cw = strwidth(s:sub(b, e))
+        if w + cw > n then
+            return s:sub(1, b - 1) .. string.rep(" ", n - w)
+        end
+        w = w + cw
+    end
+    return s
+end
+
+--- Cut `s` to at most `max` display CELLS, marking the cut with `…`. Never splits a character.
+---@param s string
+---@param max integer
+---@return string text, boolean truncated
+local function cut_cells(s, max)
+    if strwidth(s) <= max then
+        return s, false
+    end
+    return take_cells(s, max - 1) .. "…", true -- the ellipsis costs a cell of its own
+end
+
+--- Drop the first `n` display CELLS off `s` — the horizontal-scroll slice. A wide character straddling the
+--- cut contributes its overhanging cells as spaces, so what remains stays aligned with the rows below it.
+---@param s string
+---@param n integer
+---@return string
+local function drop_cells(s, n)
+    if n <= 0 then
+        return s
+    end
+    local pos = vim.str_utf_pos(s)
+    local w = 0
+    for i = 1, #pos do
+        local b = pos[i]
+        if w >= n then
+            return s:sub(b)
+        end
+        local e = (pos[i + 1] or (#s + 1)) - 1
+        w = w + strwidth(s:sub(b, e))
+        if w > n then
+            return string.rep(" ", w - n) .. s:sub(e + 1)
+        end
+    end
+    return ""
+end
+
+--- Pad `s` to `w` display CELLS.
+---@param s string
+---@param w integer
+---@return string
+local function pad_cells(s, w)
+    return s .. string.rep(" ", math.max(0, w - strwidth(s)))
+end
+
+--- Drop trailing spaces. The grid pads every cell to its column width, so a cell's trailing run of spaces is
+--- indistinguishable from its padding — see `save_edit`, which compares TRIMMED text on both sides so a
+--- value that genuinely ends in a space is read as unchanged (and left alone) rather than silently rewritten
+--- without it.
+---@param s string
+---@return string
+local function rtrim(s)
+    return (s:gsub("%s+$", ""))
+end
+
 --- Render one cell value to a display string + a highlight group.
 ---@param v any
 ---@return string text, string? hl
@@ -56,6 +193,20 @@ local function cell_display(v)
     elseif t == "boolean" then
         return tostring(v), "LvimDbCellNumber"
     elseif t == "table" then
+        -- A TAGGED value from the daemon — a value whose TYPE had to survive the trip because two different
+        -- things would otherwise render the same. It still shows as the plain thing a human wants to read
+        -- (an ObjectId as its hex); the tag exists so the row can be addressed, not to be looked at.
+        if type(v.__oid) == "string" then
+            return v.__oid, "LvimDbCellNumber"
+        end
+        if type(v.__ext) == "string" then
+            -- a tagged date/decimal (`{ __ext = "$date"|"$numberDecimal", v = text }`): show the readable
+            -- value; a decimal takes the number tint.
+            return tostring(v.v), v.__ext == "$numberDecimal" and "LvimDbCellNumber" or nil
+        end
+        if type(v.__bytes) == "string" then
+            return ("<%d bytes>"):format(tonumber(v.len) or 0), "LvimDbCellNull"
+        end
         return vim.json.encode(v), nil
     end
     return tostring(v), nil
@@ -108,17 +259,38 @@ local function render_log()
     write_buf(lines, hls)
 end
 
---- Render the current page into the dock buffer as an aligned grid.
+--- Point the grid window's sticky header at `M.winbar` (or clear it — the call log has no columns).
+--- Re-asserted from `render_result` rather than set once at open: a panel that is re-opened / re-docked gets
+--- a FRESH window, and a fresh window has no winbar.
+---@param on boolean
+local function set_winbar(on)
+    if not (state.win and api.nvim_win_is_valid(state.win)) then
+        return
+    end
+    -- `%!` = evaluate on every redraw of THIS window. Every group the bar paints is named inline (`%#…#`),
+    -- including its padding, so the window's own WinBar group never shows through and lvim-ui's winhighlight
+    -- is left exactly as the chassis set it.
+    vim.wo[state.win].winbar = on and "%!v:lua.require'lvim-db.ui.result'.winbar()" or ""
+end
+
+--- Render the current page into the dock buffer as an aligned grid, and build `state.grid` — the layout the
+--- sticky header, the column jump and the inline editor all read.
+---
+--- The COLUMN HEADER is deliberately NOT a line in this buffer: it is the window's winbar (see `M.winbar`).
+--- A winbar cannot scroll, which is the whole point — and it also makes buffer line `ri` exactly result row
+--- `ri`, so no caller has to remember to add one for a header line.
 local function render_result()
     if not is_open() then
         return
     end
+    state.grid = nil
     local page = state.page or { columns = {}, rows = {} }
     local cols = page.columns or {}
     local rows = page.rows or {}
 
     -- affected-count / empty statements have no columns
     if #cols == 0 then
+        set_winbar(false)
         local msg = page.affected ~= nil and (("%d row(s) affected"):format(page.affected)) or "(no result)"
         vim.bo[state.buf].modifiable = true
         api.nvim_buf_set_lines(state.buf, 0, -1, false, { "", "  " .. msg })
@@ -126,63 +298,129 @@ local function render_result()
         return
     end
 
-    -- column widths = max of header + cell strings (capped)
-    local widths = {}
-    local cell_strs = {}
+    -- Column widths — CELLS on both sides of the max. (`#col.name` counted BYTES, so every non-ASCII header
+    -- made its own column that many cells too wide.)
+    local gcols, cells = {}, {}
     for ci, col in ipairs(cols) do
-        widths[ci] = #col.name
+        gcols[ci] = { name = col.name, type = col.type, label = flatten(col.name), width = 0 }
+        gcols[ci].width = strwidth(gcols[ci].label)
     end
     for ri, row in ipairs(rows) do
-        cell_strs[ri] = {}
+        cells[ri] = {}
         for ci = 1, #cols do
             local disp, hl = cell_display(row[ci])
-            disp = disp:gsub("[\n\r]", " ")
-            if #disp > 60 then
-                disp = disp:sub(1, 57) .. "…"
-            end
-            cell_strs[ri][ci] = { disp, hl }
-            widths[ci] = math.max(widths[ci], vim.fn.strdisplaywidth(disp))
+            local text, truncated = cut_cells(flatten(disp), MAX_CELL)
+            cells[ri][ci] = { text = text, hl = hl, truncated = truncated }
+            gcols[ci].width = math.max(gcols[ci].width, strwidth(text))
         end
     end
 
-    local function pad(s, w)
-        local sw = vim.fn.strdisplaywidth(s)
-        return s .. string.rep(" ", math.max(0, w - sw))
+    -- Each column's first display CELL in a row line. Uniform across rows — that IS the alignment — which is
+    -- what lets the winbar slice the header by `leftcol` and land on the same columns as the rows below.
+    --   line = " " col1 SEP col2 SEP … " "
+    local at = 1 -- the leading space
+    for ci = 1, #gcols do
+        gcols[ci].start = at
+        at = at + gcols[ci].width + SEP_CELLS
     end
 
     local lines, hls = {}, {}
-    -- header
-    local hparts = {}
-    for ci, col in ipairs(cols) do
-        hparts[ci] = pad(col.name, widths[ci])
-    end
-    local header = " " .. table.concat(hparts, " │ ") .. " "
-    lines[1] = header
-    hls[#hls + 1] = { 0, 0, #header, "LvimDbHeader" }
-    -- body
-    for ri, row in ipairs(cell_strs) do
-        local parts, offsets, pos = {}, {}, 1 -- pos in bytes (leading space)
-        for ci = 1, #cols do
-            offsets[ci] = pos
-            parts[ci] = pad(row[ci][1], widths[ci])
-            pos = pos + #parts[ci] + #" │ "
+    for ri, row in ipairs(cells) do
+        local parts, bpos = {}, 1 -- byte offset within the line (past the leading space)
+        for ci = 1, #gcols do
+            parts[ci] = pad_cells(row[ci].text, gcols[ci].width)
+            -- BYTE geometry, per row: a padded cell's byte length depends on its own characters, so unlike
+            -- `start` this cannot be shared. The inline editor anchors its extmarks on exactly this range.
+            row[ci].bstart, row[ci].blen = bpos, #parts[ci]
+            bpos = bpos + #parts[ci] + #SEP
         end
-        local line = " " .. table.concat(parts, " │ ") .. " "
+        local line = " " .. table.concat(parts, SEP) .. " "
         local lineno = #lines
         lines[#lines + 1] = line
         if ri % 2 == 0 then
             hls[#hls + 1] = { lineno, 0, #line, "LvimDbRowAlt" }
         end
-        for ci = 1, #cols do
-            local hl = row[ci][2]
+        for ci = 1, #gcols do
+            local hl = row[ci].hl
             if hl then
-                local s = offsets[ci] -- 1-based byte offset within " " + parts
-                hls[#hls + 1] = { lineno, s, s + #parts[ci], hl }
+                hls[#hls + 1] = { lineno, row[ci].bstart, row[ci].bstart + row[ci].blen, hl }
             end
         end
     end
 
+    state.grid = { cols = gcols, rows = cells }
+    if state.active_col > #gcols then
+        state.active_col = 1
+    end
     write_buf(lines, hls)
+    set_winbar(true)
+end
+
+--- The STICKY column header — Neovim evaluates this on every redraw of the grid window (its `winbar` is
+--- `%!v:lua.…`), so it is a pure function of where the grid is scrolled RIGHT NOW.
+---
+--- That is what makes it correct rather than merely usually-correct: there is no event to subscribe to, no
+--- cached position to invalidate and nothing to keep in step — the header cannot lag the rows because it is
+--- recomputed from them. MEASURED against the real grid: exactly one evaluation per horizontal scroll, with
+--- `leftcol` stepping 0 → 40 → 65 in lockstep.
+---
+--- `g:statusline_winid` is the window being drawn. Reading `leftcol` from the CURRENT window instead is the
+--- classic way this goes wrong — the grid is often not focused while it redraws.
+---@return string
+function M.winbar()
+    local g = state.grid
+    local win = vim.g.statusline_winid
+    if not (g and win and win ~= 0 and api.nvim_win_is_valid(win)) then
+        return ""
+    end
+    local leftcol = api.nvim_win_call(win, function()
+        return vim.fn.winsaveview().leftcol
+    end)
+    local width = api.nvim_win_get_width(win)
+
+    -- Emit the header a segment at a time, in CELLS: skip what is scrolled off to the left, stop at the
+    -- window's right edge, and pad the remainder — so the bar is exactly `width` cells and never depends on
+    -- statusline truncation (which cuts at the START by default and would shift the header off the columns).
+    local out, used, skip = {}, 0, leftcol
+    local function emit(text, group)
+        if used >= width then
+            return
+        end
+        local w = strwidth(text)
+        if skip >= w then
+            skip = skip - w
+            return
+        end
+        if skip > 0 then
+            text = drop_cells(text, skip)
+            w = strwidth(text)
+            skip = 0
+        end
+        if used + w > width then
+            text = take_cells(text, width - used)
+            w = strwidth(text)
+        end
+        used = used + w
+        -- a `%` in a column name is a statusline ITEM introducer — escape it or the header goes haywire
+        out[#out + 1] = "%#" .. group .. "#" .. text:gsub("%%", "%%%%")
+    end
+
+    -- The active column's bright bg covers ONLY its own label+padding; the `│` separators and the leading /
+    -- trailing pad stay the normal header blue. (An earlier try extended the bright over the flanking
+    -- separators to read as a solid block, but that made the active column bleed into its neighbours —
+    -- reverted at the user's call.)
+    emit(" ", "LvimDbHeader")
+    for ci, col in ipairs(g.cols) do
+        if ci > 1 then
+            emit(SEP, "LvimDbHeader")
+        end
+        emit(pad_cells(col.label, col.width), ci == state.active_col and "LvimDbHeaderActive" or "LvimDbHeader")
+    end
+    emit(" ", "LvimDbHeader")
+    if used < width then
+        out[#out + 1] = "%#LvimDbHeader#" .. string.rep(" ", width - used)
+    end
+    return table.concat(out)
 end
 
 --- Render whichever tab is active.
@@ -197,29 +435,66 @@ local function render()
     end
 end
 
---- Title string with the page/row counter.
+--- The dock TITLE (left of the header): which database + object the current rows came from — `db ➤ object`
+--- (`➤` the set-wide breadcrumb separator). Falls back to the connection name for an ad-hoc query (no
+--- object), and names the call-log view when it is showing.
 ---@return string
-local function title()
+local function title_left()
     if state.view == "log" then
-        return ("Call log  (%d calls)  [Result: r]"):format(#state.calls)
+        return ("Call log  (%d calls)"):format(#state.calls)
     end
-    local page = state.page
-    if not page then
-        return "Result  [Call log: L]"
+    local o = state.origin
+    if o and o.object then
+        local db = (o.schema and o.schema ~= "") and o.schema or (state.conn or "")
+        return db ~= "" and ("%s ➤ %s"):format(db, o.object) or o.object
     end
-    local from = (page.from or 0) + 1
-    local to = (page.from or 0) + #(page.rows or {})
-    local total = page.total and tostring(page.total) or "?"
-    return ("Result  %s  rows %d–%d / %s  [Call log: L]"):format(state.conn or "", from, to, total)
+    return state.conn or "Result"
 end
 
---- Switch the active tab and re-render + re-title.
+--- The dock COUNTER (right of the header): which records of the total are shown — "1–20/536". Empty in the
+--- call-log view and before any page has loaded. `total` shows `?` when the driver did not report a count.
+---@return string
+local function range_text()
+    if state.view ~= "result" then
+        return ""
+    end
+    local page = state.page
+    if not (page and page.rows) then
+        return ""
+    end
+    local n = #page.rows
+    if n == 0 then
+        return "0"
+    end
+    local from = (page.from or 0) + 1
+    local to = (page.from or 0) + n
+    -- Total, best source first: the object's COUNT (`fetch_total`, shown immediately for a table browse), else
+    -- the daemon's own count once it has streamed to the END (an ad-hoc query has no object to count), else
+    -- `?` while it is genuinely unknown. Never the raw `vim.NIL` sentinel.
+    local o = state.origin
+    local total = (o and type(o.count) == "number" and tostring(o.count))
+        or (type(page.total) == "number" and tostring(page.total))
+        or "?"
+    return ("%d–%d/%s"):format(from, to, total)
+end
+
+--- The header tab-bar spec, marking the CURRENT view's tab active — declared here, defined with the other
+--- bar specs below (it needs `set_view` as the tabs' action, which is defined just above).
+---@type fun(): table
+local header_spec
+
+--- Switch the active tab and re-render + re-title. Rebuilds the header too, so the ACTIVE tab (a solid
+--- highlight, see `header_spec`) follows the view — the tab is the persistent "which view am I in" marker,
+--- independent of which sector has focus.
 ---@param view "result"|"log"
 local function set_view(view)
     state.view = view
     render()
-    if state.surface and state.surface.set_title then
-        pcall(state.surface.set_title, title())
+    -- The header carries BOTH the title/counter (a `title_counter` band) and the tabs, so rebuilding it is
+    -- the single "refresh the top of the dock" call — the active tab, the `db ➤ object` title and the range
+    -- counter all re-derive from the new view.
+    if state.surface and state.surface.set_header then
+        pcall(state.surface.set_header, header_spec())
     end
 end
 
@@ -237,8 +512,9 @@ local function goto_page(offset)
         state.page = page
         vim.schedule(function()
             render()
-            if state.surface and state.surface.set_title then
-                pcall(state.surface.set_title, title())
+            -- rebuild the header so the range counter (1–20/536) follows the new page
+            if state.surface and state.surface.set_header then
+                pcall(state.surface.set_header, header_spec())
             end
         end)
     end)
@@ -281,198 +557,6 @@ local function export_page()
     vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
     vim.fn.writefile(vim.split(text, "\n"), path)
     vim.notify("lvim-db: exported to " .. path, vim.log.levels.INFO)
-end
-
--- ── the help window (the canonical cheatsheet) ───────────────────────────────
-
--- Key id → description, in display order. Built from the LIVE `config.keys.result`, so a rebind shows up
--- and a key the user set to `false` drops its row.
----@type { [1]: string, [2]: string }[]
-local HELP = {
-    { "result_tab", "show the RESULT view (header tab)" },
-    { "log_tab", "show the CALL LOG view (header tab)" },
-    { "view_result", "switch to the result view" },
-    { "view_log", "switch to the call-log view" },
-    { "rerun", "call log: re-run the focused call" },
-    { "cancel", "call log: cancel the running call" },
-    { "next_page", "result: next page" },
-    { "prev_page", "result: previous page" },
-    { "yank", "result: yank the page as TSV" },
-    { "export", "result: export the page" },
-    { "help", "this help" },
-    { "close", "close the dock" },
-}
-
---- The result dock's keymap cheatsheet — the shared `lvim-ui.help` component owns the rows, the striping,
---- the colours and the window; this only supplies the plugin's LIVE keys.
-local function show_help()
-    local k = config.keys.result
-    local items = {}
-    for _, e in ipairs(HELP) do
-        local lhs = k[e[1]]
-        if lhs then
-            items[#items + 1] = { lhs, e[2] }
-        end
-    end
-    require("lvim-ui").help({
-        title = "Result keymaps",
-        items = items,
-        close_keys = { "q", "<Esc>", k.help or "g?" },
-    })
-end
-
---- Open (or refresh) the dock with the current result.
-local function open_dock()
-    if is_open() then
-        render()
-        if state.surface and state.surface.set_title then
-            pcall(state.surface.set_title, title())
-        end
-        return
-    end
-    -- Buffer-local keys (all from config.keys.result): switch views, and in the
-    -- call-log view re-open a call (re-runs its statement) or cancel a running one.
-    -- A key set to `false` is left unbound.
-    local k = config.keys.result
-    -- Bind THROUGH the chassis `map` (the provider's `keys` hook), never with a raw `vim.keymap.set`: only
-    -- the keys the chassis binds itself land in its `used` set, and that set is what makes the panel OWN a
-    -- chord PREFIX (the `g` of `g?`) — otherwise a `g?` typed at human speed falls through to the builtin
-    -- `g` once `timeoutlen` expires.
-    ---@param chassis_map fun(lhs: string|string[], fn: fun())
-    local function set_keys(chassis_map)
-        local function map(lhs, fn)
-            if not lhs then
-                return
-            end
-            chassis_map(lhs, fn)
-        end
-        map(k.help, show_help)
-        map(k.view_result, function()
-            set_view("result")
-        end)
-        map(k.view_log, function()
-            set_view("log")
-        end)
-        map(k.rerun, function()
-            if state.view ~= "log" then
-                return
-            end
-            local c = state.log_rows[api.nvim_win_get_cursor(0)[1]]
-            if c and c.conn_id then
-                M.run(c.conn_id, c.conn, c.driver, c.statement)
-            end
-        end)
-        map(k.cancel, function()
-            if state.view ~= "log" then
-                return
-            end
-            local c = state.log_rows[api.nvim_win_get_cursor(0)[1]]
-            if c and c.state == "running" and c.call_id then
-                require("lvim-db").cancel(c.call_id)
-            end
-        end)
-    end
-
-    local provider = {
-        cursorline = true,
-        filetype = "lvim-db-result",
-        update = function(pan)
-            state.buf = pan.buf
-            vim.bo[pan.buf].buftype = "nofile"
-            render()
-        end,
-        keys = function(map)
-            set_keys(map)
-        end,
-        on_close = function()
-            state.surface, state.buf = nil, nil
-        end,
-    }
-    -- Dock FULL WIDTH at the bottom of the tab (the chassis splits the far tabpage edge → the result spans
-    -- under BOTH the tree and the editor). This wraps the existing top row `[tree | editor]` into
-    -- `[ [tree | editor] / result ]`, so the tree shrinks to the top-left and its footer stays visible ABOVE
-    -- the result. The docked split keeps the full chrome (header tabs · grid · footer) and its own `<C-j/k>`
-    -- sector nav, whose TOP-edge `<C-k>` steps back up to the tree or editor above the cursor column
-    -- (escape_to_neighbor). A `<C-j>` from either top window descends onto the result (the chassis WinEnter
-    -- hook enters the docked panel).
-    state.surface = surface.open({
-        mode = "split",
-        dock = "below",
-        title = title(),
-        size = { height = { fixed = math.max(8, math.floor(vim.o.lines * 0.35)) } },
-        -- Blank " " ring on the result panel (no drawn border): the CONTENT_BORDER marker resolves at open
-        -- time to the LIVE `config.content_border` (the shared { " ", … } ring), so the dock gets a 1-cell
-        -- breathing inset with no glyph — matching every other content panel — instead of the default rounded
-        -- ring a block with no border falls back to. A theme/border change to that one key flows through here.
-        content = { blocks = { { id = "result", provider = provider, border = surface.CONTENT_BORDER } } },
-        header = {
-            bars = {
-                surface.bar({ { "result_tab", "log_tab" } }, {
-                    result_tab = {
-                        name = "result_tab",
-                        key = k.result_tab or nil,
-                        run = function()
-                            set_view("result")
-                        end,
-                    },
-                    log_tab = {
-                        name = "log_tab",
-                        key = k.log_tab or nil,
-                        run = function()
-                            set_view("log")
-                        end,
-                    },
-                }),
-            },
-        },
-        footer = {
-            bars = {
-                surface.bar({ { "prev", "next", "yank", "export" }, { "help", "close" } }, {
-                    prev = {
-                        name = "prev",
-                        key = k.prev_page or nil,
-                        run = function()
-                            goto_page(math.max(0, state.offset - config.page_size))
-                        end,
-                    },
-                    next = {
-                        name = "next",
-                        key = k.next_page or nil,
-                        run = function()
-                            if state.page and state.page.has_more then
-                                goto_page(state.offset + config.page_size)
-                            end
-                        end,
-                    },
-                    yank = { name = "yank", key = k.yank or nil, run = yank_page },
-                    export = { name = "export", key = k.export or nil, run = export_page },
-                    -- The dock's keys are not discoverable from the grid, so the bar has to say where the
-                    -- cheatsheet is (the key itself is bound in `set_keys`, through the chassis).
-                    help = { name = "help", key = k.help or nil, run = show_help },
-                    close = {
-                        name = "close",
-                        key = k.close or nil,
-                        run = function(s)
-                            s.close()
-                        end,
-                    },
-                }),
-            },
-        },
-        close_keys = k.close and { k.close } or {},
-    })
-end
-
---- Re-open the dock over a preserved session (used when the workspace tab is re-opened): if a result page
---- or any call log survives in the module state, rebuild the dock and re-render it so the last result — or
---- at least the call log — comes back exactly as it was. A no-op when nothing has run yet, so the dock only
---- appears once there is something to show.
-function M.reopen()
-    if state.page == nil and #state.calls == 0 then
-        return
-    end
-    open_dock()
-    render()
 end
 
 -- ── addressing a row (what makes editing possible at all) ────────────────────
@@ -523,10 +607,1017 @@ local function readonly_reason()
     if not o then
         return "this result is not one object's rows — open a table's Data facet to edit"
     end
+    -- Ask the DIALECT before the data: an engine that cannot express "update this one row" makes the key
+    -- question moot, and saying so up front beats letting the user type an edit that could never be sent.
+    local ok, why = require("lvim-db.query").can_update_row(state.driver)
+    if not ok then
+        return why
+    end
     if o.key and #o.key == 0 then
         return ("'%s' has no primary key — a row cannot be addressed uniquely"):format(o.object)
     end
     return nil
+end
+
+--- Count the origin object's TOTAL rows (COUNT(*) / mongo `count`) and stash it on the origin, then rebuild
+--- the header so the counter reads `1–N / <total>` right away instead of `?` (the daemon only learns the
+--- total by streaming to the END, which for a big table never happens on the first page). Runs through the
+--- LOW-LEVEL `db.execute` — NOT `M.run` — so this background count never appears in the call log or replaces
+--- the visible result. Cached on the origin (a property of the object); a driver with no cheap count (redis)
+--- returns no statement and the counter stays `?`.
+---@param origin table  the SAME table set on `state.origin` (identity-checked before it is used, so a later
+---       run's count cannot land on this one)
+local function fetch_total(origin)
+    if not (state.conn_id and state.driver) then
+        return
+    end
+    local stmt = require("lvim-db.query").count_statement(state.driver, origin.schema, origin.object)
+    if not stmt then
+        return
+    end
+    local db = require("lvim-db")
+    local cid
+    db.execute(state.conn_id, stmt, function(st)
+        if st.state ~= "done" or not cid then
+            return
+        end
+        db.page(cid, 0, 1, function(page)
+            local row = page and page.rows and page.rows[1]
+            if not row then
+                return
+            end
+            -- the count is the first NUMBER in the one result row (SQL `COUNT(*) AS n`, mongo `{ n, ok }`, …)
+            local total
+            for _, v in ipairs(row) do
+                if type(v) == "number" then
+                    total = v
+                    break
+                end
+            end
+            if type(total) == "number" and state.origin == origin then
+                origin.count = total
+                vim.schedule(function()
+                    if state.surface and state.surface.set_header then
+                        pcall(state.surface.set_header, header_spec())
+                    end
+                end)
+            end
+        end)
+    end, function(call_id)
+        cid = call_id
+    end)
+end
+
+-- ── moving by COLUMN ─────────────────────────────────────────────────────────
+--
+-- Every column is rendered, always. Paging the grid sideways a screen at a time was considered and dropped:
+-- a column you cannot see is a column you forget the table has, and the widths are already known — so the
+-- grid stays one wide surface and the CURSOR does the travelling.
+
+--- Which column display cell `cell` falls in (the last column whose `start` it has reached).
+---@param cell integer
+---@return integer
+local function column_at(cell)
+    local g = state.grid
+    if not g then
+        return 1
+    end
+    local ci = 1
+    for i, col in ipairs(g.cols) do
+        if cell >= col.start then
+            ci = i
+        end
+    end
+    return ci
+end
+
+--- The column the cursor is in, from its DISPLAY cell (`virtcol` is 1-based, `col.start` is 0-based-ish in
+--- the same run of cells — hence the -1).
+---@return integer
+local function cursor_column()
+    if not (state.win and api.nvim_win_is_valid(state.win)) then
+        return 1
+    end
+    return column_at(api.nvim_win_call(state.win, function()
+        return vim.fn.virtcol(".") - 1
+    end))
+end
+
+--- Track the active column as the cursor moves and re-tint the header when it changes. `redrawstatus`
+--- re-evaluates the winbar (Neovim redraws the status line AND the window bar) — needed because a cursor
+--- move WITHIN a line does not otherwise force the bar to re-run.
+local function track_column()
+    if state.view ~= "result" or not state.grid then
+        return
+    end
+    local ci = cursor_column()
+    if ci ~= state.active_col then
+        state.active_col = ci
+        pcall(vim.cmd, "redrawstatus")
+    end
+end
+
+--- Jump the cursor to column `ci`'s first cell and scroll that column fully into view.
+---@param ci integer
+local function goto_column(ci)
+    local g = state.grid
+    if not (g and g.cols[ci] and state.win and api.nvim_win_is_valid(state.win)) then
+        return
+    end
+    local col = g.cols[ci]
+    api.nvim_win_call(state.win, function()
+        local lnum = api.nvim_win_get_cursor(state.win)[1]
+        -- CELLS → the byte column of that cell on THIS row: the two differ per row (Cyrillic is 2 bytes and 1
+        -- cell), and `virtcol2col` is the conversion Neovim already owns — recomputing it here would be a
+        -- second, worse copy of it.
+        local bcol = vim.fn.virtcol2col(state.win, lnum, col.start + 1)
+        api.nvim_win_set_cursor(state.win, { lnum, math.max(0, bcol - 1) })
+        -- Position the VIEW, not just the cursor: landing the cursor scrolls only far enough to show the
+        -- cursor itself, which leaves the rest of a wide column off the right edge. Show the whole column
+        -- when it fits; otherwise put its first cell at the left edge.
+        local view = vim.fn.winsaveview()
+        local width = api.nvim_win_get_width(state.win)
+        local left, right = col.start, col.start + col.width
+        local leftcol = view.leftcol
+        if left < leftcol then
+            -- The FIRST column owns the grid's leading margin, so reaching it means scrolling fully home —
+            -- landing on `start` instead would clip that margin and leave the grid looking scrolled when it
+            -- is not.
+            leftcol = ci == 1 and 0 or left
+        elseif right > leftcol + width then
+            leftcol = math.min(left, math.max(0, right - width))
+        end
+        if leftcol ~= view.leftcol then
+            view.leftcol = leftcol
+            vim.fn.winrestview(view)
+        end
+    end)
+    state.active_col = ci
+    pcall(vim.cmd, "redrawstatus")
+end
+
+--- `next_column`: the column after the cursor's, wrapping at the last.
+local function next_column()
+    local g = state.grid
+    if state.view ~= "result" or not g or #g.cols == 0 then
+        return
+    end
+    goto_column(cursor_column() % #g.cols + 1)
+end
+
+--- `prev_column`: the column before the cursor's, wrapping at the first.
+local function prev_column()
+    local g = state.grid
+    if state.view ~= "result" or not g or #g.cols == 0 then
+        return
+    end
+    goto_column((cursor_column() - 2) % #g.cols + 1)
+end
+
+-- ── editing a row ────────────────────────────────────────────────────────────
+--
+-- `e` LOCKS the focused row: the row is pinned to the key values it had at that moment and tinted so it
+-- reads as the one live row. `<CR>` on a cell opens that ONE field in a popup, holding the value itself;
+-- `S` writes exactly one `UPDATE … SET … WHERE key=…` carrying every field that changed; `c` throws the
+-- whole edit away.
+--
+-- NOTHING is typed into the grid buffer, and that is the design, not a shortcut. What the grid shows is a
+-- PADDED, TRUNCATED, FLATTENED rendering of a value — a `…` prefix, spaces that may be padding or may be
+-- data, a tab drawn as a space, a whole BSON document reduced to one line of JSON. Typing on that text means
+-- editing a picture of the value and hoping it can be read back into the thing it depicts; for a truncated
+-- cell it cannot (writing it back writes the prefix over the real value), and for a document it never could.
+-- So the value is edited where the value actually is: in a field seeded from the raw row data.
+--
+-- The lock is by KEY, not by line: the WHERE is built from the key values captured when the row was locked,
+-- so editing a key field re-points nothing — the statement still addresses the row the user chose. (Reading
+-- the key back at save time would let a typo in the id field silently rewrite a DIFFERENT row.)
+--
+-- Only CHANGED fields reach the SET, so a field the user never opened is never rewritten.
+
+--- The LOCKED row. `where` is captured once, when the row is locked, and never re-read — that is what makes
+--- the lock a lock: the statement addresses the row the user chose, whatever they then type into a key field.
+---@class LvimDbEdit
+---@field ri integer                            the result row (== the buffer line) being edited
+---@field where { name: string, value: any }[]  the key columns and the values they had at lock time
+---@field row any[]                             the row's RAW values, as the page delivered them
+---@field pending table<integer, { value: any }>  ci → the new value, for fields changed but not yet written
+
+--- A column whose value has no faithful SCALAR text round-trip on `driver`, keyed on the engine's OWN type
+--- name (`col.type`) rather than the received `Value` shape. Some hazards the shape cannot reveal: a Snowflake
+--- VARIANT/OBJECT/ARRAY and a Postgres BYTEA both arrive as plain text, so the shape-based `field_editable`
+--- would wave them through — but writing the text back as a bare `'…'` literal stores a QUOTED STRING on a
+--- VARIANT (Snowflake needs `PARSE_JSON`) or hand-mangled hex on BYTEA. View-only, like the Bytes/structured
+--- guard. Returns the reason it is view-only, or nil when the type is freely editable (the common case).
+---@param driver string
+---@param coltype string?
+---@return string?
+local function structured_type(driver, coltype)
+    if type(coltype) ~= "string" or coltype == "" then
+        return nil
+    end
+    local t = coltype:upper()
+    if driver == "snowflake" then
+        -- Semi-structured (VARIANT/OBJECT/ARRAY) prints as JSON but is stored parsed; a plain string literal
+        -- would land as a VARIANT-wrapped STRING, not the structure. BINARY has no text surface.
+        if t == "VARIANT" or t == "OBJECT" or t == "ARRAY" then
+            return "semi-structured value — view only (needs a typed constructor to write back)"
+        end
+        if t == "BINARY" then
+            return "binary value — view only"
+        end
+    elseif driver == "postgres" then
+        -- bytea prints as `\x…` hex; editing that by hand is a footgun with no faithful UX (arrays and
+        -- json/jsonb DO round-trip: their text form is the engine's own input form, which it re-parses).
+        if t == "BYTEA" then
+            return "binary value — view only"
+        end
+    end
+    return nil
+end
+
+--- The value to write for a re-typed field. The popup edits TEXT, so the new text is read against the
+--- ORIGINAL value's type — a number stays a number, and `NULL` is the same sentinel the grid displays for
+--- one. Anything else goes to the engine as a string literal for IT to coerce: it is the authority on its own
+--- column types, and a second type system here could only disagree with it. `coltype` (the engine's declared
+--- column type) closes the gaps a value SHAPE cannot — see `structured_type`; this is the last-line guard the
+--- popup save relies on, since it coerces without a pre-open `field_editable` check.
+---@param text string
+---@param orig any
+---@param driver string
+---@param coltype string?
+---@return any value, string? err
+local function coerce(text, orig, driver, coltype)
+    local sty = structured_type(driver, coltype)
+    if sty then
+        return nil, sty
+    end
+    if text == "NULL" then
+        return nil
+    end
+    if type(orig) == "number" then
+        return tonumber(text) or text
+    elseif type(orig) == "boolean" then
+        local l = text:lower()
+        if l == "true" or l == "1" then
+            return true
+        elseif l == "false" or l == "0" then
+            return false
+        end
+        return text
+    elseif type(orig) == "table" then
+        -- A tagged / structured value. An ObjectId is edited as its hex (the daemon re-checks it via
+        -- `Bson::try_from`); a nested document/array is edited as EXTENDED JSON and PARSED here — the parse is
+        -- the syntax gate (Lua's job) and also how the value re-enters the statement as structure, not a
+        -- string, so the daemon's `Bson::try_from` reconstructs its BSON types (`$oid`/`$date`/…). Binary and
+        -- a structured value on a non-mongo engine have no faithful text round-trip — refused (see
+        -- `field_editable`, which stops these before the field even opens; this is the last-line guard).
+        if type(orig.__oid) == "string" then
+            return { __oid = vim.trim(text) }
+        end
+        if type(orig.__ext) == "string" then
+            -- a tagged date/decimal: re-wrap the edited text under its extended-JSON key so the daemon's
+            -- `Bson::try_from` reconstructs the BSON type ({ "$date" = … } / { "$numberDecimal" = … }).
+            return { [orig.__ext] = vim.trim(text) }
+        end
+        if type(orig.__bytes) == "string" then
+            return nil, "binary value cannot be edited as text"
+        end
+        if driver == "mongodb" then
+            local ok, parsed = pcall(vim.json.decode, text)
+            if not ok then
+                return nil, "not valid JSON — " .. (tostring(parsed):gsub("^.-:%s*", ""))
+            end
+            return parsed
+        end
+        return nil, "structured value cannot be edited as text on this engine"
+    end
+    return text
+end
+
+--- Can this field be edited AND written back faithfully, for `driver`? The client can only judge by the
+--- `Value` SHAPE it received (not the real column type). Binary (`{__bytes}`) has no text surface. A
+--- structured value (a nested document / array, a `{__oid}` aside) round-trips only where the write path
+--- reconstructs it: mongo, via extended JSON → `Bson::try_from`. The same structure on any other engine
+--- (e.g. a ClickHouse Array/Tuple/Map, which arrives as JSON) cannot be written back from a JSON-string edit
+--- to the engine's native literal, so it is VIEW-ONLY. Scalars are always editable — the ENGINE validates
+--- the literal. (Driver-side rendering losses that masquerade as a scalar — a decimal shown as NULL, a date
+--- shown as a Rust Debug string — are NOT catchable here; they are separate driver fixes.)
+---@param raw any
+---@param driver string
+---@param coltype string?
+---@return boolean ok, string? reason
+local function field_editable(raw, driver, coltype)
+    -- A type-name guard first: it catches hazards the value SHAPE hides (a Snowflake VARIANT / Postgres bytea
+    -- both arrive as plain text). `structured_type` is nil for the common editable case.
+    local sty = structured_type(driver, coltype)
+    if sty then
+        return false, sty
+    end
+    if type(raw) ~= "table" then
+        return true
+    end
+    if type(raw.__bytes) == "string" then
+        return false, "binary value — view only"
+    end
+    if type(raw.__oid) == "string" then
+        return true -- an ObjectId, edited as its hex
+    end
+    if driver == "mongodb" then
+        return true -- a nested document / array, edited as extended JSON
+    end
+    return false, "structured value — view only (no faithful text form on this engine)"
+end
+
+--- Swap the dock's footer between browsing and editing — declared here, defined with the footer specs below
+--- (it needs the browse bar, which needs `edit_row`).
+---@type fun()
+local refresh_footer
+
+--- Paint the locked row: its own tint, plus a stronger one on every field the user has changed but not yet
+--- written. A pending change has to be VISIBLE — it lives only in `state.edit` until `S`, and an edit you
+--- cannot see is an edit you lose.
+local function paint_edit()
+    local e, g = state.edit, state.grid
+    if not (e and g and is_open()) then
+        return
+    end
+    api.nvim_buf_clear_namespace(state.buf, state.ns_edit, 0, -1)
+    api.nvim_buf_set_extmark(state.buf, state.ns_edit, e.ri - 1, 0, { line_hl_group = "LvimDbEditRow" })
+    for ci, cell in ipairs(g.rows[e.ri]) do
+        if e.pending[ci] then
+            pcall(api.nvim_buf_set_extmark, state.buf, state.ns_edit, e.ri - 1, cell.bstart, {
+                end_col = cell.bstart + cell.blen,
+                hl_group = "LvimDbEditCell",
+            })
+        end
+    end
+end
+
+--- Leave edit mode and drop everything pending.
+local function cancel_edit()
+    if not state.edit then
+        return
+    end
+    state.edit = nil
+    if is_open() then
+        api.nvim_buf_clear_namespace(state.buf, state.ns_edit, 0, -1)
+        render()
+    end
+    refresh_footer()
+end
+
+--- Lock `ri` for editing, keyed on `key`.
+---@param ri integer      the result row (== the buffer line)
+---@param row table       the row's RAW values (not the display strings)
+---@param key string[]    its key columns
+local function start_edit(ri, row, key)
+    local g = state.grid
+    if not (g and g.rows[ri]) then
+        return
+    end
+    local index = {}
+    for ci, c in ipairs(g.cols) do
+        index[c.name] = ci
+    end
+    -- Capture the key's ORIGINAL values now — this is the "locked by its key" part.
+    local where = {}
+    for _, name in ipairs(key) do
+        local ci = index[name]
+        if not ci then
+            -- The key is not in this result (a projection, not `SELECT *`): there is nothing to address the
+            -- row by, and guessing one would be a rewrite of some other row.
+            vim.notify(
+                ("lvim-db: key column '%s' is not in this result — cannot address the row"):format(name),
+                vim.log.levels.WARN
+            )
+            return
+        end
+        where[#where + 1] = { name = name, value = row[ci] }
+    end
+    -- `pending[ci] = { value = … }` — a BOX, not the bare value: setting a field to NULL means a pending
+    -- `nil`, and a bare nil in a Lua table is indistinguishable from "never touched", so the NULL would be
+    -- dropped on the way to the statement.
+    state.edit = { ri = ri, where = where, row = row, pending = {} }
+    paint_edit()
+    refresh_footer()
+    vim.notify(
+        ("lvim-db: row locked — %s edits a field, %s saves, %s cancels"):format(
+            tostring(config.keys.result.edit_cell),
+            tostring(config.keys.result.save_edit),
+            tostring(config.keys.result.cancel_edit)
+        ),
+        vim.log.levels.INFO
+    )
+end
+
+--- `edit_row`: lock the focused row, once it is established that it CAN be addressed. `after` runs once the
+--- lock is held — resolving the key is a round trip, so "lock, then open this field" cannot be two statements
+--- at the call site.
+---@param after fun()?
+local function edit_row(after)
+    if state.view ~= "result" or state.edit then
+        return
+    end
+    local why = readonly_reason()
+    if why then
+        vim.notify("lvim-db: read-only — " .. why, vim.log.levels.WARN)
+        return
+    end
+    local ri = api.nvim_win_get_cursor(0)[1]
+    local row = state.page and state.page.rows and state.page.rows[ri]
+    if not (row and state.grid and state.grid.rows[ri]) then
+        return
+    end
+    resolve_key(function(key)
+        if not key then
+            vim.notify("lvim-db: read-only — " .. (readonly_reason() or "no key"), vim.log.levels.WARN)
+            return
+        end
+        start_edit(ri, row, key)
+        if after and state.edit then
+            after()
+        end
+    end)
+end
+
+--- `edit_cell`: the field under the cursor, in a popup ON the cell.
+---
+--- `bare` + `at` is the one popup shape that can sit on a grid cell (lvim-ui built it for exactly this): no
+--- title row and no footer, so the popup IS the field — one row, over the value it edits. A titled popup
+--- would be several rows of chrome anchored to the cell, with the field itself landing over the wrong row.
+--- Seeded from the RAW value, never from the rendered cell, so a truncated or flattened value is edited
+--- whole.
+local function edit_cell()
+    local e, g = state.edit, state.grid
+    if not (e and g and state.win and api.nvim_win_is_valid(state.win)) then
+        return
+    end
+    local ci = cursor_column()
+    local col, cell = g.cols[ci], g.rows[e.ri][ci]
+    if not (col and cell) then
+        return
+    end
+    local raw = e.pending[ci] and e.pending[ci].value or e.row[ci]
+    -- Guard the field BEFORE opening: a binary / non-mongo-structured cell has no faithful text edit, so say
+    -- so and do nothing rather than open a field whose save could only be refused or corrupt the value.
+    local ok_edit, why = field_editable(raw, state.driver, col.type)
+    if not ok_edit then
+        vim.notify("lvim-db: " .. tostring(why), vim.log.levels.WARN)
+        return
+    end
+    require("lvim-ui").input({
+        bare = true,
+        -- the cell's own spot in the grid window's 0-based text coordinates
+        at = { win = state.win, row = e.ri - 1, col = col.start },
+        -- EXACTLY the column's width, so the field sits ON the cell and never spills into the neighbour
+        -- column — the input scrolls a longer value inside itself. A too-long value is what `E` (the full-row
+        -- popup) is for; here the point is that the inline field aligns with the cell it edits.
+        width = col.width,
+        default = (cell_display(raw)),
+        callback = function(ok, value)
+            if not ok or not state.edit then
+                return
+            end
+            local coerced, cerr = coerce(value, e.row[ci], state.driver, col.type)
+            if cerr then
+                vim.notify("lvim-db: " .. cerr, vim.log.levels.WARN)
+                return
+            end
+            e.pending[ci] = { value = coerced }
+            -- Show it: the cell repaints to the new value, cut to the COLUMN's width so the row stays
+            -- aligned with every other row (the grid's widths were measured before this value existed).
+            local text = cut_cells(flatten((cell_display(e.pending[ci].value))), col.width)
+            vim.bo[state.buf].modifiable = true
+            api.nvim_buf_set_text(
+                state.buf,
+                e.ri - 1,
+                cell.bstart,
+                e.ri - 1,
+                cell.bstart + cell.blen,
+                { pad_cells(text, col.width) }
+            )
+            vim.bo[state.buf].modifiable = false
+            -- the byte length of this cell just changed; re-derive the row's geometry so the marks and the
+            -- next edit land on the right bytes
+            local bpos = 1
+            for i = 1, #g.cols do
+                g.rows[e.ri][i].bstart = bpos
+                if i == ci then
+                    g.rows[e.ri][i].blen = #pad_cells(text, col.width)
+                    g.rows[e.ri][i].text = text
+                end
+                bpos = bpos + g.rows[e.ri][i].blen + #SEP
+            end
+            paint_edit()
+        end,
+    })
+end
+
+--- `save_edit`: write every changed field as ONE statement.
+local function save_edit()
+    local e = state.edit
+    local g = state.grid
+    local o = state.origin
+    -- `readonly_reason` already cleared these when the row was locked; re-established here so the statement
+    -- builder is handed real values, not maybes.
+    if not (e and g and o and o.object and state.driver and is_open()) then
+        return
+    end
+    local set = {}
+    for ci in ipairs(g.cols) do
+        if e.pending[ci] then
+            set[#set + 1] = { name = g.cols[ci].name, value = e.pending[ci].value }
+        end
+    end
+    if #set == 0 then
+        vim.notify("lvim-db: nothing changed", vim.log.levels.INFO)
+        cancel_edit()
+        return
+    end
+    local stmt, why = require("lvim-db.query").update_row(state.driver, o.schema, o.object, set, e.where)
+    if not stmt then
+        vim.notify("lvim-db: " .. tostring(why), vim.log.levels.WARN)
+        return
+    end
+    cancel_edit()
+    M.write(stmt)
+end
+
+-- ── editing a row in a POPUP (every column at once) ──────────────────────────
+
+--- The whole focused row as a typed form — one row per column, seeded with the FULL values.
+---
+--- Opens even when the row CANNOT be written (`readonly`): a row is worth SEEING whole whether or not you
+--- may change it — the grid truncates at `MAX_CELL` and flattens a document to one line, so this is the only
+--- place some values are legible at all. A read-only row simply gets no save button and says why in its
+--- title, instead of the key refusing to show you your own data.
+---@param ri integer      the result row
+---@param row any[]       its RAW values
+---@param key string[]?   its key columns — nil when the row cannot be addressed
+---@param readonly string?  why it cannot be written, or nil when it can
+local function open_row_popup(ri, row, key, readonly)
+    local g = state.grid
+    local o = state.origin
+    if not (g and row) then
+        return
+    end
+    local index, keyed = {}, {}
+    for ci, c in ipairs(g.cols) do
+        index[c.name] = ci
+    end
+    local where = {}
+    for _, name in ipairs(key or {}) do
+        local ci = index[name]
+        if not ci then
+            vim.notify(
+                ("lvim-db: key column '%s' is not in this result — cannot address the row"):format(name),
+                vim.log.levels.WARN
+            )
+            return
+        end
+        keyed[name] = true
+        where[#where + 1] = { name = name, value = row[ci] }
+    end
+    do
+        -- One typed row per column, holding the value as TEXT. `cell_display` (not tostring) so a NULL shows
+        -- as the same `NULL` sentinel the grid uses and round-trips through `coerce` unchanged.
+        local rows, orig = {}, {}
+        for ci, col in ipairs(g.cols) do
+            local text = (cell_display(row[ci]))
+            orig[ci] = text
+            rows[#rows + 1] = {
+                type = "string",
+                name = "c" .. ci,
+                -- the key columns are marked: they are what addresses the row, and the WHERE uses the value
+                -- they had on open regardless of what is typed here
+                label = col.name .. (keyed[col.name] and "  (key)" or ""),
+                value = text,
+            }
+        end
+
+        local fk = config.keys.result
+        require("lvim-ui").tabs({
+            -- The title carries the READ-ONLY reason: the popup is open precisely so the row can be read, so
+            -- "why can't I save this" has to be answerable without closing it and pressing something else.
+            title = readonly and ("Row — %s  (read-only: %s)"):format(o and o.object or "", readonly)
+                or ("Edit row — %s"):format(o and o.object or ""),
+            title_pos = "center",
+            layout = "float",
+            tabs = {
+                {
+                    label = "Row",
+                    rows = rows,
+                    footer = {
+                        not readonly
+                                and fk.save_edit
+                                and {
+                                    key = fk.save_edit,
+                                    label = "save",
+                                    run = function(st)
+                                        -- `readonly` being nil already established these (that is what the check
+                                        -- MEANS); re-stated so the statement builder is handed real values.
+                                        if not (o and o.object and state.driver) then
+                                            return
+                                        end
+                                        local set = {}
+                                        for ci in ipairs(g.cols) do
+                                            local now = rows[ci].value
+                                            if now ~= orig[ci] then
+                                                -- Coerce per field; a field with no faithful text round-trip (binary,
+                                                -- non-mongo structured) or invalid JSON aborts the WHOLE save — never
+                                                -- send a partial/corrupt update.
+                                                local val, cerr = coerce(now, row[ci], state.driver, g.cols[ci].type)
+                                                if cerr then
+                                                    vim.notify(
+                                                        ("lvim-db: '%s' — %s"):format(g.cols[ci].name, cerr),
+                                                        vim.log.levels.WARN
+                                                    )
+                                                    return
+                                                end
+                                                set[#set + 1] = { name = g.cols[ci].name, value = val }
+                                            end
+                                        end
+                                        if #set == 0 then
+                                            vim.notify("lvim-db: nothing changed", vim.log.levels.INFO)
+                                            st.close()
+                                            return
+                                        end
+                                        local stmt, err = require("lvim-db.query").update_row(
+                                            state.driver,
+                                            o.schema,
+                                            o.object,
+                                            set,
+                                            where
+                                        )
+                                        if not stmt then
+                                            vim.notify("lvim-db: " .. tostring(err), vim.log.levels.WARN)
+                                            return
+                                        end
+                                        st.close()
+                                        M.write(stmt)
+                                    end,
+                                }
+                            or nil,
+                        fk.close and { key = fk.close, label = "close", no_hotkey = true } or nil,
+                    },
+                },
+            },
+        })
+    end
+end
+
+--- `edit_popup`: the focused row, every field at once.
+local function edit_popup()
+    if state.view ~= "result" or state.edit then
+        return
+    end
+    local g = state.grid
+    local ri = api.nvim_win_get_cursor(0)[1]
+    local row = state.page and state.page.rows and state.page.rows[ri]
+    if not (row and g and g.rows[ri]) then
+        return
+    end
+    local why = readonly_reason()
+    if why then
+        return open_row_popup(ri, row, nil, why) -- readable, just not writable
+    end
+    resolve_key(function(key)
+        open_row_popup(ri, row, key, key and nil or (readonly_reason() or "no key"))
+    end)
+end
+
+-- ── the help window (the canonical cheatsheet) ───────────────────────────────
+
+-- Key id → description, in display order. Built from the LIVE `config.keys.result`, so a rebind shows up
+-- and a key the user set to `false` drops its row.
+---@type { [1]: string, [2]: string }[]
+local HELP = {
+    { "result_tab", "show the RESULT view (header tab)" },
+    { "log_tab", "show the CALL LOG view (header tab)" },
+    { "view_result", "switch to the result view" },
+    { "view_log", "switch to the call-log view" },
+    { "rerun", "call log: re-run the focused call" },
+    { "cancel", "call log: cancel the running call" },
+    { "next_page", "result: next page" },
+    { "prev_page", "result: previous page" },
+    { "next_column", "result: jump to the next column" },
+    { "prev_column", "result: jump to the previous column" },
+    { "edit_row", "result: lock the focused row for editing" },
+    { "edit_popup", "result: edit the focused row in a popup (every field)" },
+    { "edit_cell", "editing: open the field under the cursor" },
+    { "insert_cell", "result: start editing the field under the cursor" },
+    { "save_edit", "editing: write every changed field back (one UPDATE)" },
+    { "cancel_edit", "editing: discard the edit" },
+    { "yank", "result: yank the page as TSV" },
+    { "export", "result: export the page to a file" },
+    { "help", "this help" },
+    { "close", "close the dock" },
+}
+
+--- The result dock's keymap cheatsheet — the shared `lvim-ui.help` component owns the rows, the striping,
+--- the colours and the window; this only supplies the plugin's LIVE keys.
+local function show_help()
+    local k = config.keys.result
+    local items = {}
+    for _, e in ipairs(HELP) do
+        local lhs = k[e[1]]
+        if type(lhs) == "table" then
+            lhs = table.concat(lhs, " / ") -- a key bound to several lhs (i / a) shows all of them
+        end
+        if lhs then
+            items[#items + 1] = { lhs, e[2] }
+        end
+    end
+    require("lvim-ui").help({
+        title = "Result keymaps",
+        items = items,
+        close_keys = { "q", "<Esc>", k.help or "g?" },
+    })
+end
+
+-- ── the footer bands (browsing ⇄ editing) ────────────────────────────────────
+--
+-- The dock has TWO footers and swaps between them, because it has two modes. That swap is also what binds
+-- and unbinds `S`/`c`: `set_footer` re-derives the bar hotkeys (lvim-ui `map_hotkeys`), so the save/cancel
+-- keys exist exactly while a row is locked and the browse keys come back the moment it is not — no keymap of
+-- our own to leak, and the bar can never advertise a key that is not live.
+
+-- (declared above `set_view`, which rebuilds the header on a view switch)
+-- The two header tabs, with the CURRENT view's tab marked `active` — a SOLID `LvimDbTabActive` bg across the
+-- whole button (badge + label + padding; the `active` render, unlike hover, does not bracket the label, so
+-- nothing eats the side padding). The active tab therefore reads as one filled block and shows which view is
+-- open regardless of focus, instead of only lighting up while the header bar is the focused sector.
+function header_spec()
+    local k = config.keys.result
+    local ACTIVE = { icon = { active = "LvimDbTabActive" }, text = { active = "LvimDbTabActive" } }
+    return {
+        bars = {
+            -- The TITLE row: `db ➤ object` on the LEFT, the range counter (1–20/536) pushed to the RIGHT — a
+            -- `title_counter` band (title_pos "left", `count` a live function re-read on every chrome render).
+            -- This replaces the old centred brand: the title now says WHICH object the rows are, and the
+            -- counter says WHICH of the total is on screen.
+            {
+                title_counter = true,
+                text = title_left(),
+                count = range_text,
+                hl = "LvimUiPeekTitle",
+                count_hl = "LvimUiPeekCounter",
+                title_pos = "left",
+            },
+            surface.bar({ { "result_tab", "log_tab" } }, {
+                result_tab = {
+                    name = "result",
+                    key = k.result_tab or nil,
+                    active = state.view == "result",
+                    hl = state.view == "result" and ACTIVE or nil,
+                    run = function()
+                        set_view("result")
+                    end,
+                },
+                log_tab = {
+                    name = "call log",
+                    key = k.log_tab or nil,
+                    active = state.view == "log",
+                    hl = state.view == "log" and ACTIVE or nil,
+                    run = function()
+                        set_view("log")
+                    end,
+                },
+            }),
+        },
+    }
+end
+
+--- The BROWSE footer: paging, the row editors, yank/export, help, close.
+---@return table
+local function browse_footer()
+    local k = config.keys.result
+    return {
+        bars = {
+            surface.bar({ { "prev", "next" }, { "edit", "edit_popup" }, { "yank", "export" }, { "help", "close" } }, {
+                prev = {
+                    name = "prev",
+                    key = k.prev_page or nil,
+                    run = function()
+                        goto_page(math.max(0, state.offset - config.page_size))
+                    end,
+                },
+                next = {
+                    name = "next",
+                    key = k.next_page or nil,
+                    run = function()
+                        if state.page and state.page.has_more then
+                            goto_page(state.offset + config.page_size)
+                        end
+                    end,
+                },
+                -- Wrapped, never `run = edit_row` directly: the bar invokes `run(surface_state)`, and
+                -- `edit_row`'s first param is now `after` (a continuation) — the state table would be called
+                -- as one. `edit_popup` ignores extra args, but wrap it too for symmetry.
+                edit = {
+                    name = "edit",
+                    key = k.edit_row or nil,
+                    run = function()
+                        edit_row()
+                    end,
+                },
+                edit_popup = {
+                    name = "edit row",
+                    key = k.edit_popup or nil,
+                    run = function()
+                        edit_popup()
+                    end,
+                },
+                yank = { name = "yank", key = k.yank or nil, run = yank_page },
+                export = { name = "export", key = k.export or nil, run = export_page },
+                -- The dock's keys are not discoverable from the grid, so the bar has to say where the
+                -- cheatsheet is (the key itself is bound in `set_keys`, through the chassis).
+                help = { name = "help", key = k.help or nil, run = show_help },
+                close = {
+                    name = "close",
+                    key = k.close or nil,
+                    run = function(s)
+                        s.close()
+                    end,
+                },
+            }),
+        },
+    }
+end
+
+--- The EDIT-MODE footer — the two keys that end the edit, and nothing else.
+---@return table
+local function edit_footer()
+    local k = config.keys.result
+    return {
+        bars = {
+            surface.bar({ { "save", "cancel" } }, {
+                save = { name = "save", key = k.save_edit or nil, run = save_edit },
+                cancel = { name = "cancel", key = k.cancel_edit or nil, run = cancel_edit },
+            }),
+        },
+    }
+end
+
+-- (declared above `cancel_edit`, which swaps the footer back)
+function refresh_footer()
+    if state.surface and state.surface.set_footer then
+        pcall(state.surface.set_footer, state.edit and edit_footer() or browse_footer())
+    end
+end
+
+--- Open (or refresh) the dock with the current result.
+local function open_dock()
+    if is_open() then
+        render()
+        if state.surface and state.surface.set_header then
+            pcall(state.surface.set_header, header_spec())
+        end
+        return
+    end
+    -- Buffer-local keys (all from config.keys.result): switch views, and in the
+    -- call-log view re-open a call (re-runs its statement) or cancel a running one.
+    -- A key set to `false` is left unbound.
+    local k = config.keys.result
+    -- Bind THROUGH the chassis `map` (the provider's `keys` hook), never with a raw `vim.keymap.set`: only
+    -- the keys the chassis binds itself land in its `used` set, and that set is what makes the panel OWN a
+    -- chord PREFIX (the `g` of `g?`) — otherwise a `g?` typed at human speed falls through to the builtin
+    -- `g` once `timeoutlen` expires.
+    ---@param chassis_map fun(lhs: string|string[], fn: fun())
+    local function set_keys(chassis_map)
+        local function map(lhs, fn)
+            if not lhs then
+                return
+            end
+            chassis_map(lhs, fn)
+        end
+        map(k.help, show_help)
+        map(k.view_result, function()
+            set_view("result")
+        end)
+        map(k.view_log, function()
+            set_view("log")
+        end)
+        -- `<CR>` is the "act on what is under the cursor" key, and what that means depends on what the dock is
+        -- showing: a call in the log → re-run it; a field of a LOCKED row → open it. Sharing the key keeps
+        -- both as the same gesture instead of inventing a second one for the grid.
+        map(k.rerun, function()
+            if state.view == "result" then
+                if state.edit then
+                    edit_cell()
+                end
+                return
+            end
+            local c = state.log_rows[api.nvim_win_get_cursor(0)[1]]
+            if c and c.conn_id then
+                M.run(c.conn_id, c.conn, c.driver, c.statement)
+            end
+        end)
+        map(k.cancel, function()
+            if state.view ~= "log" then
+                return
+            end
+            local c = state.log_rows[api.nvim_win_get_cursor(0)[1]]
+            if c and c.state == "running" and c.call_id then
+                require("lvim-db").cancel(c.call_id)
+            end
+        end)
+        map(k.next_column, next_column)
+        map(k.prev_column, prev_column)
+        map(k.edit_row, function()
+            edit_row()
+        end)
+        map(k.edit_popup, edit_popup)
+        -- "start typing here", the way i/a mean it everywhere else: open the field under the cursor, taking
+        -- the row lock first if it is not held. Bound rather than left alone BECAUSE the grid is read-only —
+        -- an unbound `i` falls through to the builtin insert and raises E21 on every press.
+        map(k.insert_cell, function()
+            if state.edit then
+                edit_cell()
+            else
+                edit_row(edit_cell)
+            end
+        end)
+    end
+
+    local provider = {
+        cursorline = true,
+        filetype = "lvim-db-result",
+        -- The grid is a cursor-VISIBLE panel the user scrolls but never types into (edits go through the
+        -- popups). `readonly` tells the chassis to nop the builtin EDIT operators (o / dd / p / s / …) while
+        -- keeping the motions — else, on the nomodifiable buffer, every unbound edit key raises
+        -- `E21: Cannot make changes` (a bare `s` did, expecting to save).
+        readonly = true,
+        update = function(pan)
+            state.buf, state.win = pan.buf, pan.win
+            vim.bo[pan.buf].buftype = "nofile"
+            render()
+        end,
+        keys = function(map)
+            set_keys(map)
+        end,
+        on_close = function()
+            state.surface, state.buf, state.win, state.edit, state.grid = nil, nil, nil, nil, nil
+        end,
+    }
+    -- Dock FULL WIDTH at the bottom of the tab (the chassis splits the far tabpage edge → the result spans
+    -- under BOTH the tree and the editor). This wraps the existing top row `[tree | editor]` into
+    -- `[ [tree | editor] / result ]`, so the tree shrinks to the top-left and its footer stays visible ABOVE
+    -- the result. The docked split keeps the full chrome (header tabs · grid · footer) and its own `<C-j/k>`
+    -- sector nav, whose TOP-edge `<C-k>` steps back up to the tree or editor above the cursor column
+    -- (escape_to_neighbor). A `<C-j>` from either top window descends onto the result (the chassis WinEnter
+    -- hook enters the docked panel).
+    state.surface = surface.open({
+        mode = "split",
+        dock = "below",
+        -- No `title` on the surface: the title lives in the header's FIRST band (a `title_counter` row —
+        -- `db ➤ object` left, the 1–20/536 counter right — see `header_spec`), so a separate centred brand
+        -- would only duplicate it.
+        size = { height = { fixed = math.max(8, math.floor(vim.o.lines * 0.35)) } },
+        -- NO panel border on the result grid — `border = "none"` (not CONTENT_BORDER, the shared blank " "
+        -- ring every other content panel uses). The ring's 1-cell side inset is what stopped the STICKY HEADER
+        -- (the winbar) from reaching the window edge: its blue filled the text area but not the gutter, so the
+        -- header read as "not edge to edge". With no ring the winbar spans the full width, blue edge-to-edge,
+        -- and it keeps its OWN 1-cell padding inside (its leading/trailing blue space) so the labels don't butt
+        -- the edge. The ROWS keep their inset too — they already pad themselves (`" " .. cells .. " "`), so
+        -- dropping the ring moves only the header out to the edge, not the row text. (`"none"` is explicit: a
+        -- block with NO border key falls back to a drawn rounded ring.)
+        content = { blocks = { { id = "result", provider = provider, border = "none" } } },
+        header = header_spec(),
+        footer = browse_footer(),
+        close_keys = k.close and { k.close } or {},
+        -- Vertical layer nav, past the dock's own edges: `<C-j>` off the BOTTOM sector descends into the
+        -- message zone below (lvim-msgarea), `<C-k>` off the TOP sector is already handled by the chassis
+        -- (escape_to_neighbor → the editor/tree above). The dock is the bottom LAYER of the workspace, and the
+        -- msgarea is the layer under it, so this closes the down half of the "layer after layer" chain the
+        -- user expects. Guarded + optional: no lvim-msgarea (or nothing to descend into) ⇒ `focus_content`
+        -- returns false and the chassis just stops at the edge, exactly as before. Cross-plugin optional dep,
+        -- so the require is inline (never hoisted).
+        on_escape_below = function()
+            local ok, msg = pcall(require, "lvim-msgarea")
+            return ok and msg.focus_content and msg.focus_content() == true
+        end,
+    })
+
+    -- Track which column the cursor is in, so the sticky header can tint it. A cursor move within a line does
+    -- not re-run the winbar on its own; `track_column` forces it only when the column actually CHANGES, so
+    -- moving down a column costs nothing.
+    api.nvim_create_autocmd("CursorMoved", {
+        buffer = state.buf,
+        callback = track_column,
+    })
+end
+
+--- Re-open the dock over a preserved session (used when the workspace tab is re-opened): if a result page
+--- or any call log survives in the module state, rebuild the dock and re-render it so the last result — or
+--- at least the call log — comes back exactly as it was. A no-op when nothing has run yet, so the dock only
+--- appears once there is something to show.
+function M.reopen()
+    if state.page == nil and #state.calls == 0 then
+        return
+    end
+    open_dock()
+    render()
 end
 
 --- Execute `statement` on `conn_id` and show its first page in the dock. Records
@@ -538,13 +1629,27 @@ end
 ---@param statement string
 ---@param origin? table  `{ schema, object }` when these rows ARE one object's — the drawer's `Data` facet
 ---       passes it; an ad-hoc statement passes nothing and its result stays read-only.
-function M.run(conn_id, conn_name, driver, statement, origin)
+---@param offset? integer  which page to land on (default 0). The refresh after a row is written passes the
+---       page the user was ON, so saving an edit does not throw them back to the top of a long table.
+function M.run(conn_id, conn_name, driver, statement, origin, offset)
     local db = require("lvim-db")
+    -- A LOCKED row belongs to the result being replaced. Its `where` was captured from THAT object's key, so
+    -- carrying it into a new result would let `S` build an UPDATE addressing the old table with the new
+    -- grid's columns — a write to something the user is no longer even looking at. The lock dies with the
+    -- result it locked. (Measured: without this, running another object's preview left the edit footer up and
+    -- `e` inert, because the stale lock was still held.)
+    cancel_edit()
     state.conn, state.driver, state.conn_id, state.call_id, state.page, state.offset =
         conn_name, driver, conn_id, nil, nil, 0
+    state.statement = statement
     -- Rebound on EVERY run: a result is only editable while it is showing the object it came from, so a
     -- later ad-hoc query must clear this rather than inherit the last preview's identity.
     state.origin = origin and { schema = origin.schema, object = origin.object } or nil
+    -- Count the object's total in the background so the header reads `1–N / <total>` right away (see
+    -- `fetch_total`). Only for an object browse — an ad-hoc query has nothing to count.
+    if state.origin then
+        fetch_total(state.origin)
+    end
 
     -- A pending entry in the session call log (accent = running until it resolves).
     local entry = {
@@ -593,7 +1698,7 @@ function M.run(conn_id, conn_name, driver, statement, origin)
         vim.schedule(function()
             state.view = "result"
             open_dock()
-            goto_page(0)
+            goto_page(offset or 0)
         end)
     end, function(call_id, err)
         if err then
@@ -604,6 +1709,76 @@ function M.run(conn_id, conn_name, driver, statement, origin)
         end
         entry.call_id = call_id
         state.call_id = call_id
+    end)
+end
+
+--- Execute a WRITE the grid built (the row editors' single `UPDATE`), then re-read the page so the grid
+--- shows what the engine actually holds.
+---
+--- It does NOT re-render from what we sent: a trigger, a default, or the engine's own type coercion can all
+--- make the stored row differ from the literal in the statement, and painting our version over it would make
+--- the grid quietly lie about the database. The re-read costs one round trip and is the only way the rows on
+--- screen are the rows in the table.
+---
+--- The destructive guard is not applied here and does not need to be: the statement is generated, always
+--- carries a key WHERE, and touches exactly one row (`is_destructive` exists for free-text statements — see
+--- `M.run_guarded`).
+---@param statement string
+function M.write(statement)
+    local db = require("lvim-db")
+    local conn_id, conn_name, driver = state.conn_id, state.conn, state.driver
+    if not (conn_id and conn_name and driver) then
+        return
+    end
+    local entry = {
+        conn_id = conn_id,
+        conn = conn_name,
+        driver = driver,
+        statement = statement,
+        state = "running",
+    }
+    state.calls[#state.calls + 1] = entry
+    if #state.calls > 200 then
+        table.remove(state.calls, 1)
+    end
+    db.execute(conn_id, statement, function(st)
+        entry.state, entry.ms, entry.rows = st.state, st.ms, st.affected
+        db.store.record({
+            conn = conn_name,
+            driver = driver,
+            statement = statement,
+            state = st.state,
+            ms = st.ms,
+            rows = st.affected,
+        })
+        vim.schedule(function()
+            if st.state ~= "done" then
+                vim.notify(
+                    ("lvim-db: write %s%s"):format(st.state, st.error and (": " .. st.error) or ""),
+                    vim.log.levels.ERROR
+                )
+                return
+            end
+            vim.notify(("lvim-db: %d row(s) updated"):format(st.affected or 0), vim.log.levels.INFO)
+            -- back to the page the user was on, showing the engine's version of the row
+            if state.statement then
+                local o = state.origin
+                M.run(
+                    conn_id,
+                    conn_name,
+                    driver,
+                    state.statement,
+                    o and { schema = o.schema, object = o.object } or nil,
+                    state.offset
+                )
+            end
+        end)
+    end, function(_, err)
+        if err then
+            vim.schedule(function()
+                vim.notify("lvim-db: write failed: " .. tostring(err), vim.log.levels.ERROR)
+            end)
+        end
     end)
 end
 

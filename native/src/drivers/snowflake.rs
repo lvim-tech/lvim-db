@@ -12,7 +12,9 @@ use serde::Deserialize;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
-use crate::spec::{AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value};
+use crate::spec::{
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, TableColumn, Value,
+};
 
 const PARAMS: &[ParamSpec] = &[
     ParamSpec {

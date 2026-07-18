@@ -39,7 +39,42 @@ local db_tab
 local state = {
     origin_tab = nil, ---@type integer?  the tabpage to return to on close
     editor_win = nil, ---@type integer?  the top-right editor window
+    augroup = nil, ---@type integer?  the chrome-guard autocmd group (see below)
 }
+
+-- The workspace's two-row layout (`[tree | editor] / result`) needs a GLOBAL statusline (`laststatus = 3`):
+-- with per-window statuslines (`laststatus = 2`) each top window grows its OWN bar at its bottom — mid-screen,
+-- ABOVE the docked result — so the status line "splits in two" under the tree and the editor and the result
+-- is pushed below them. That is exactly what happens opening the workspace from the dashboard: the dashboard
+-- runs with `laststatus = 0` and, on teardown, restores the value it captured at STARTUP — before the user's
+-- config set 3 — which can be Neovim's built-in default (2). The workspace would inherit that 2 and split.
+--
+-- So the workspace OWNS its statusline: it forces `laststatus = 3` on open and re-asserts it whenever its tab
+-- becomes current (another tab — the dashboard — may set it to 0 globally while focused). It does NOT save +
+-- restore the prior value: that value can be the stale 2, and 3 is the configured normal anyway; on close the
+-- origin tab (the dashboard) re-asserts its own chrome through its own autocmds.
+local function guard_chrome()
+    vim.o.laststatus = 3
+    if not state.augroup then
+        state.augroup = api.nvim_create_augroup("LvimDbWorkspaceChrome", { clear = true })
+        api.nvim_create_autocmd("TabEnter", {
+            group = state.augroup,
+            callback = function()
+                if db_tab() == api.nvim_get_current_tabpage() then
+                    vim.o.laststatus = 3
+                end
+            end,
+        })
+    end
+end
+
+--- Drop the chrome guard (on close).
+local function unguard_chrome()
+    if state.augroup then
+        pcall(api.nvim_del_augroup_by_id, state.augroup)
+        state.augroup = nil
+    end
+end
 
 --- The top-right EDITOR window of the db workspace tab. Resolved by the cached handle, else by finding the
 --- workspace tab's window whose buffer carries the `lvim_db_editor` marker var (survives a re-open on a fresh
@@ -115,6 +150,7 @@ function M.open()
     local existing = db_tab()
     if existing then
         api.nvim_set_current_tabpage(existing)
+        guard_chrome()
         setup_editor(M.editor_win() or api.nvim_get_current_win())
         require("lvim-db.ui.drawer").open(true)
         require("lvim-db.ui.result").reopen()
@@ -123,6 +159,7 @@ function M.open()
     state.origin_tab = api.nvim_get_current_tabpage()
     vim.cmd("tabnew")
     api.nvim_tabpage_set_var(api.nvim_get_current_tabpage(), "lvim_db_workspace", true)
+    guard_chrome() -- one GLOBAL statusline in the tab, never per-window bars that split the layout (see above)
     -- The fresh tab's window becomes the EDITOR placeholder (captured BEFORE the drawer splits off the left,
     -- so it stays the top-right window). The drawer is the top-left tree (a left native split); a full-width
     -- result later docks at the bottom, wrapping the top row. Restore the previous result, if there was one.
@@ -138,6 +175,7 @@ function M.close()
     if not t then
         return
     end
+    unguard_chrome()
     pcall(function()
         require("lvim-db.ui.result").close()
     end)

@@ -49,6 +49,14 @@
 ---@field cancel     string|false  Call log: cancel the focused running call
 ---@field next_page  string|false  Result: next page
 ---@field prev_page  string|false  Result: previous page
+---@field next_column string|false Result: jump to the next column (scrolls it into view)
+---@field prev_column string|false Result: jump to the previous column
+---@field edit_row   string|false  Result: LOCK the focused row for editing
+---@field edit_popup string|false  Result: edit the focused row in a popup (every column at once)
+---@field edit_cell  string|false  Editing: open the field under the cursor in a popup on the cell
+---@field insert_cell string|string[]|false  Result: start editing the field under the cursor (locks the row)
+---@field save_edit  string|false  Editing: write every changed field back (one UPDATE)
+---@field cancel_edit string|false Editing: discard the edit
 ---@field yank       string|false  Result: yank the page as TSV
 ---@field export     string|false  Result: export the page
 ---@field close      string|false  Close the dock
@@ -73,9 +81,12 @@ return {
     -- Absolute path to the daemon binary. nil ⇒ probe (in order): $LVIM_DB_DAEMON,
     -- the plugin's own native/build/, then native/target/release/ (a local dev build).
     daemon_path = nil,
-    -- Rows the result grid pulls per page. The daemon buffers the whole result and
-    -- serves slices, so this only bounds how much Neovim holds/redraws at once.
-    page_size = 200,
+    -- Rows loaded per page — the "N" in the dock's `1–N / total` counter, and the step
+    -- the result grid pages by (n / p). The daemon streams the object and serves slices
+    -- on demand, so this only bounds how many rows Neovim holds/redraws at once, never how
+    -- many exist; the total is counted separately (COUNT / countDocuments). Raise it to see
+    -- more per page, lower it for a lighter redraw.
+    page_size = 50,
     -- Width (columns) of the connections drawer side panel.
     drawer_width = 36,
     -- Guard destructive statements: prompt via lvim-ui.confirm before executing one
@@ -125,8 +136,27 @@ return {
             cancel = "x",
             next_page = "n",
             prev_page = "p",
+            -- Jump the cursor to the next column's first cell and scroll that column into view. A CHORD, not
+            -- a letter: it is the one result key that stays live INSIDE edit mode (where the buffer is
+            -- modifiable and every bare letter is typing).
+            next_column = "<C-n>",
+            prev_column = "<C-p>", -- jump to the PREVIOUS column (mirror of next_column)
+            edit_row = "e", -- LOCK the focused row for editing (its fields then open one at a time)
+            edit_popup = "E", -- edit the focused row in a popup — every column at once, full values
+            -- Bound only while a row is LOCKED, and unbound the moment it is not (the footer swap carries
+            -- them — see `edit_footer`), so outside an edit they mean whatever they normally would.
+            edit_cell = "<CR>", -- open the field under the cursor in a popup ON the cell
+            -- `i` / `a` mean "start typing here" in every buffer, and the grid is no exception — they open
+            -- the field under the cursor, locking the row first if it is not locked yet. They are bound
+            -- because the grid is NOT modifiable: left unbound they fall through to the builtin insert and
+            -- raise `E21: Cannot make changes, 'modifiable' is off` on every press.
+            insert_cell = { "i", "a" },
+            save_edit = "S", -- write every changed field as ONE UPDATE
+            cancel_edit = "c", -- discard the whole edit
             yank = "y",
-            export = "e",
+            -- `e` now opens the row editor (it is the edit gesture everywhere else in the set), so the page
+            -- export moved to `Y` — paired with `y`: yank the page to the clipboard, Y write it to a file.
+            export = "Y",
             close = "q",
         },
         -- the SQL editor (an editable `sql` buffer — chords / leader sequences, never bare letters)
@@ -141,6 +171,7 @@ return {
             test = "t",
             save = "s",
             close = "q",
+            keyring = "K", -- Auth tab: store the secret in the lvim-keyring wallet + set the field to {{ vault … }}
         },
     },
 }

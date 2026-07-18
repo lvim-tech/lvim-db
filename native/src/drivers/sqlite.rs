@@ -15,7 +15,9 @@ use rusqlite::Connection as SqliteConn;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
-use crate::spec::{AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value};
+use crate::spec::{
+    AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn, Value,
+};
 
 const PARAMS: &[ParamSpec] = &[ParamSpec {
     key: "file",

@@ -23,6 +23,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "process",
+    "net",
 ] }
 async-trait = "0.1"
 futures-util = "0.3"
@@ -125,7 +126,7 @@ mariadb = ["dep:mysql_async", "tls"]
 mysql = ["dep:mysql_async", "tls"] # same impl as mariadb, distinct registry kind
 mongodb = ["dep:mongodb", "tls"]
 sqlite = ["dep:rusqlite"]
-duckdb = ["dep:duckdb"]
+duckdb = ["dep:duckdb", "dep:chrono"] # chrono renders DuckDB temporal cells as canonical text
 redis = ["dep:redis", "redis/tls-rustls", "redis/tokio-rustls-comp", "tls"]
 clickhouse = ["dep:reqwest", "tls"]
 sqlserver = ["dep:tiberius", "dep:tokio-util", "dep:chrono"]

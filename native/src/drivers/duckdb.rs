@@ -10,12 +10,14 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use duckdb::types::Value as DuckValue;
+use duckdb::types::{TimeUnit, Value as DuckValue};
 use duckdb::Connection as DuckConn;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
-use crate::spec::{AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, ParamSpec, ParamType, Value};
+use crate::spec::{
+    AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn, Value,
+};
 
 const PARAMS: &[ParamSpec] = &[ParamSpec {
     key: "file",
@@ -77,7 +79,100 @@ impl Driver for DuckdbDriver {
     }
 }
 
-/// Convert an owned DuckDB Value to our text-first cell Value.
+/// A (TimeUnit, raw count) → (whole seconds, sub-second nanos) since the unit's epoch. `div_euclid`/
+/// `rem_euclid` keep it correct for negative (pre-1970) values.
+fn duck_split(u: TimeUnit, v: i64) -> (i64, u32) {
+    let (per_sec, nanos_per) = match u {
+        TimeUnit::Second => (1i64, 1_000_000_000i64),
+        TimeUnit::Millisecond => (1_000, 1_000_000),
+        TimeUnit::Microsecond => (1_000_000, 1_000),
+        TimeUnit::Nanosecond => (1_000_000_000, 1),
+    };
+    (v.div_euclid(per_sec), (v.rem_euclid(per_sec) * nanos_per) as u32)
+}
+
+/// Render one DuckDB value as CANONICAL text — the string a human reads and, for a scalar, the engine can
+/// re-parse on a write-back. This replaces the old `format!("{:?}")` catch-all, which emitted Rust Debug
+/// (`Decimal(...)`, `List([Int(1)])`, a struct-ish temporal) — neither the real value nor a valid literal.
+/// Temporal types go through chrono (well-tested date math beats hand-rolled). Nested types recurse.
+fn duck_text(v: &DuckValue) -> String {
+    match v {
+        DuckValue::Null => "NULL".to_string(),
+        DuckValue::Boolean(b) => b.to_string(),
+        DuckValue::TinyInt(i) => i.to_string(),
+        DuckValue::SmallInt(i) => i.to_string(),
+        DuckValue::Int(i) => i.to_string(),
+        DuckValue::BigInt(i) => i.to_string(),
+        DuckValue::HugeInt(i) => i.to_string(),
+        DuckValue::UTinyInt(i) => i.to_string(),
+        DuckValue::USmallInt(i) => i.to_string(),
+        DuckValue::UInt(i) => i.to_string(),
+        DuckValue::UBigInt(i) => i.to_string(),
+        DuckValue::Float(f) => f.to_string(),
+        DuckValue::Double(f) => f.to_string(),
+        DuckValue::Decimal(d) => d.to_string(),
+        DuckValue::Text(s) => s.clone(),
+        DuckValue::Enum(s) => s.clone(),
+        DuckValue::Timestamp(u, x) => {
+            let (s, n) = duck_split(*u, *x);
+            chrono::DateTime::from_timestamp(s, n)
+                .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.f").to_string())
+                .unwrap_or_else(|| x.to_string())
+        }
+        DuckValue::Date32(d) => chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+            .and_then(|e| e.checked_add_signed(chrono::Duration::days(*d as i64)))
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| d.to_string()),
+        DuckValue::Time64(u, x) => {
+            let (s, n) = duck_split(*u, *x);
+            chrono::NaiveTime::from_num_seconds_from_midnight_opt(s.rem_euclid(86_400) as u32, n)
+                .map(|t| t.format("%H:%M:%S%.f").to_string())
+                .unwrap_or_else(|| x.to_string())
+        }
+        DuckValue::Interval { months, days, nanos } => {
+            let mut parts = Vec::new();
+            if *months != 0 {
+                parts.push(format!("{} months", months));
+            }
+            if *days != 0 {
+                parts.push(format!("{} days", days));
+            }
+            let secs = nanos / 1_000_000_000;
+            let sub = (nanos % 1_000_000_000).abs();
+            if *nanos != 0 || parts.is_empty() {
+                let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+                if sub != 0 {
+                    parts.push(format!("{:02}:{:02}:{:02}.{:09}", h, m, s, sub));
+                } else {
+                    parts.push(format!("{:02}:{:02}:{:02}", h, m, s));
+                }
+            }
+            parts.join(" ")
+        }
+        DuckValue::Blob(b) => format!("<{} bytes>", b.len()),
+        DuckValue::List(xs) | DuckValue::Array(xs) => {
+            format!("[{}]", xs.iter().map(duck_text).collect::<Vec<_>>().join(", "))
+        }
+        DuckValue::Struct(m) => format!(
+            "{{{}}}",
+            m.iter()
+                .map(|(k, val)| format!("{}: {}", k, duck_text(val)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        DuckValue::Map(m) => format!(
+            "{{{}}}",
+            m.iter()
+                .map(|(k, val)| format!("{}: {}", duck_text(k), duck_text(val)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        DuckValue::Union(b) => duck_text(b),
+    }
+}
+
+/// Convert an owned DuckDB Value to our text-first cell Value. Scalars map to typed cells; everything else
+/// (decimals, temporal, enum, list/struct/map/union) renders to CANONICAL text via `duck_text`.
 fn cell(v: DuckValue) -> Value {
     match v {
         DuckValue::Null => Value::Null,
@@ -103,8 +198,8 @@ fn cell(v: DuckValue) -> Value {
             b64: base64::engine::general_purpose::STANDARD.encode(&b),
             len: b.len(),
         },
-        // Decimals, temporal types, lists, structs, enums, … render as their text form.
-        other => Value::Text(format!("{other:?}")),
+        // Decimals, temporal types, lists, structs, enums, … → canonical text (NOT Rust Debug).
+        ref other => Value::Text(duck_text(other)),
     }
 }
 

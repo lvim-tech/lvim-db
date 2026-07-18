@@ -322,6 +322,15 @@ pub struct ObjRef {
 /// A single result cell. Serializes to a plain JSON value the Lua grid can
 /// render directly: scalars as scalars, bytes/timestamp as a tagged object so
 /// the grid can show a marker and fetch the full value via `query.cell`.
+///
+/// A variant exists whenever the grid must be able to tell apart two values that
+/// would RENDER the same. That is not a display concern — it is what decides
+/// whether a row can be written back at all. `Oid` is the case that proved it:
+/// rendering a MongoDB ObjectId to its hex as `Text` made it indistinguishable
+/// from a string `_id`, so the grid could only ever match `{_id: "<hex>"}` —
+/// which matches NOTHING against a real ObjectId, i.e. an update that reports
+/// success and changes no document. The type has to survive the trip: Lua can
+/// only judge what IT rendered, never recover what this enum already discarded.
 #[derive(Debug, Clone)]
 pub enum Value {
     Null,
@@ -329,9 +338,25 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Text(String),
-    Bytes { b64: String, len: usize },
+    Bytes {
+        b64: String,
+        len: usize,
+    },
     Json(serde_json::Value),
     Timestamp(String),
+    /// A MongoDB ObjectId, as its 24-char hex. Tagged (`{ __oid }`) rather than
+    /// plain text so the grid can render the hex yet still address the document
+    /// with the `{"$oid": …}` extended-JSON form the server matches on.
+    Oid(String),
+    /// A value that DISPLAYS as `text` but, on a write-back, round-trips through the MongoDB extended-JSON
+    /// key `key` (e.g. `$date`, `$numberDecimal`): a top-level DateTime / Decimal128 shows its readable form
+    /// yet an edit is re-emitted as `{key: <text>}` so `Bson::try_from` reconstructs the real BSON type.
+    /// This generalises the `Oid` tag to the other types that would otherwise render as an untagged string
+    /// and be written back as the wrong type. Serializes as `{ "__ext": key, "v": text }`.
+    Ext {
+        text: String,
+        key: String,
+    },
 }
 
 impl Serialize for Value {
@@ -349,6 +374,17 @@ impl Serialize for Value {
                 let mut m = s.serialize_map(Some(2))?;
                 m.serialize_entry("__bytes", b64)?;
                 m.serialize_entry("len", len)?;
+                m.end()
+            }
+            Value::Oid(hex) => {
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_entry("__oid", hex)?;
+                m.end()
+            }
+            Value::Ext { text, key } => {
+                let mut m = s.serialize_map(Some(2))?;
+                m.serialize_entry("__ext", key)?;
+                m.serialize_entry("v", text)?;
                 m.end()
             }
         }

@@ -19,6 +19,7 @@ mod rpc;
 mod secret;
 mod server;
 mod spec;
+mod vault;
 #[cfg(feature = "tls")]
 mod tls;
 

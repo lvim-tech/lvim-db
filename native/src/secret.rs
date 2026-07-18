@@ -10,6 +10,7 @@
 //   literal text            → used verbatim
 //   {{ env "VAR" }}         → the value of environment variable VAR
 //   {{ cmd "prog args" }}   → stdout of a shell command, trimmed
+//   {{ vault "name" }}      → the secret named `name` from the lvim-keyring agent (see vault.rs)
 // An empty template resolves to an empty string.
 
 use std::fmt;
@@ -46,6 +47,7 @@ impl Secret {
                     std::env::var(&arg).map_err(|_| anyhow::anyhow!("secret: environment variable '{arg}' is not set"))
                 }
                 "cmd" => run_cmd(&arg).await,
+                "vault" => crate::vault::fetch(&arg).await,
                 other => Err(anyhow::anyhow!("secret: unknown template verb '{other}'")),
             };
         }

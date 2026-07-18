@@ -99,6 +99,28 @@ local function check_daemon(h)
                     .. " — a KV store has no indexes and no schema to describe"
             )
         end
+
+        -- Which engines can have a ROW written back from the grid. Same reasoning as the facets above: the
+        -- editor is offered per-engine, so a user who finds `e` read-only on one connection and live on
+        -- another should be able to read WHY here instead of guessing.
+        local q = require("lvim-db.query")
+        local rw, ro = {}, {}
+        for _, m in ipairs(metas) do
+            local name = m.display or m.kind
+            local ok, why = q.can_update_row(m.kind)
+            if ok then
+                rw[#rw + 1] = name
+            else
+                ro[#ro + 1] = ("%s (%s)"):format(name, why)
+            end
+        end
+        table.sort(rw)
+        table.sort(ro)
+        h.info(("grid row editing: %s"):format(#rw > 0 and table.concat(rw, ", ") or "none"))
+        for _, r in ipairs(ro) do
+            h.info("grid row editing unavailable: " .. r)
+        end
+        h.info("a row is editable only from an object's Data facet, and only when the object has a key")
     end
 
     -- Encryption posture (the standard build ships rustls TLS + the SSH tunnel).
