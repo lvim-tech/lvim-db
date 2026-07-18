@@ -150,8 +150,17 @@ function M.rename_column(driver, schema, object, from, to)
     end
     local t = qualify(driver, schema, object)
     if driver == "sqlserver" then
-        -- T-SQL has no ALTER … RENAME; sp_rename is the documented way.
-        return ("EXEC sp_rename '%s.%s', '%s', 'COLUMN';"):format(object, from, to)
+        -- T-SQL has no ALTER … RENAME; sp_rename is the documented way. Both @objname and @newname are
+        -- passed as string LITERALS, so any `'` in an identifier has to be '-doubled (same rule as
+        -- `M.literal`) or it would break out of the quotes. @objname is the schema-qualified column
+        -- (schema.table.column) — sp_rename parses it as a multi-part name; @newname is taken literally
+        -- (it must be the bare new column name, unquoted), so it is only escaped, never qualified.
+        local function esc(s)
+            return (s:gsub("'", "''"))
+        end
+        local objname = (schema and schema ~= "") and ("%s.%s.%s"):format(schema, object, from)
+            or ("%s.%s"):format(object, from)
+        return ("EXEC sp_rename '%s', '%s', 'COLUMN';"):format(esc(objname), esc(to))
     end
     if driver == "firebird" then
         return ("ALTER TABLE %s ALTER COLUMN %s TO %s;"):format(t, quote(driver, from), quote(driver, to))
