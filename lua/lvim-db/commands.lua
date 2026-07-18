@@ -54,6 +54,12 @@ local subcommands = {
     log = function()
         require("lvim-db.ui.result").show_log()
     end,
+
+    --- Scan saved connections for PLAINTEXT secrets and offer to move them into the lvim-keyring wallet
+    --- (rewriting each to `{{ vault "db/<name>" }}`).
+    ["keyring-migrate"] = function()
+        require("lvim-db.keyring").migrate()
+    end,
 }
 
 --- Register the `:LvimDb` command (idempotent).

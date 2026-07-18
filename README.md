@@ -219,6 +219,11 @@ daemon at connect time only — never persisted or logged as plain values:
   unlock`; when it is not running, it says so. On the form's **Auth** tab, `store in keyring`
   (default `K`, shown when lvim-keyring is installed) moves the typed password/token into the
   wallet and rewrites the field to `{{ vault "db/<connection>" }}` for you.
+
+`:LvimDb keyring-migrate` scans ALL saved connections for **plaintext** (literal, non-template)
+passwords/tokens and offers to move them into the wallet in one step — storing each under
+`db/<name>` and rewriting the stored spec to `{{ vault "db/<name>" }}`. A connection whose secret is
+already a `{{ … }}` template is left untouched.
 - literal text — used verbatim
 
 This also covers token-style provider auth, e.g. an AWS RDS IAM token:
