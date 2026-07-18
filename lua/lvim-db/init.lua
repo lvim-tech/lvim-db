@@ -76,6 +76,11 @@ function M.setup(opts)
     if ok_hl and hl.bind then
         hl.bind(require("lvim-db.highlights").build)
     end
+    -- Register the `db/` parent with the wallet (if installed), so `:LvimKeyring` renders db connection
+    -- secrets under a database icon + accent. pcall-guarded: lvim-db never hard-depends on lvim-keyring.
+    pcall(function()
+        require("lvim-keyring").register_namespace("db", { icon = "", accent = "blue" })
+    end)
     -- Self-register the plugin's PANELS with the shared cursor module as `panel_ft` (persistent side
     -- panels: the hardware cursor is hidden ONLY while the drawer / result dock is the CURRENT window, and
     -- shown again in the code beside it) — so the user's central cursor config need not name our filetypes.
