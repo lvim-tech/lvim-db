@@ -79,7 +79,7 @@ function M.setup(opts)
     -- Register the `db/` parent with the wallet (if installed), so `:LvimKeyring` renders db connection
     -- secrets under a database icon + accent. pcall-guarded: lvim-db never hard-depends on lvim-keyring.
     pcall(function()
-        require("lvim-keyring").register_namespace("db", { icon = "", accent = "blue" })
+        require("lvim-keyring").register_namespace("db", { icon = "", accent = "red" })
     end)
     -- Self-register the plugin's PANELS with the shared cursor module as `panel_ft` (persistent side
     -- panels: the hardware cursor is hidden ONLY while the drawer / result dock is the CURRENT window, and
