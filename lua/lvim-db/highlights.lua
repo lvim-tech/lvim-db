@@ -29,18 +29,19 @@ function M.build()
         --   CONNECTION  magenta when disconnected → green (live) once connected — state also in the icon
         --   DATABASE    schema is blue
         --   OBJECTS     table yellow · view cyan · collection orange (all distinct from each other)
-        --   FIELDS      columns take the full foreground (a real readable colour, not the old near-bg dim)
+        --   FIELDS      columns are teal — the facet family (Columns branch + its leaves), matching Indexes
         LvimDbConnection = { fg = c.magenta, bold = true }, -- a saved, DISCONNECTED connection
         LvimDbConnectionOpen = { fg = c.green, bold = true }, -- a CONNECTED (live) connection
         LvimDbSchema = { fg = c.blue, bold = true }, -- a schema / database
         LvimDbTable = { fg = c.yellow }, -- a table
         LvimDbView = { fg = c.cyan }, -- a view
         LvimDbCollection = { fg = c.orange }, -- a (mongo) collection
-        LvimDbColumn = { fg = c.fg }, -- a column / field — readable, not dim
+        LvimDbColumn = { fg = c.teal }, -- the "Columns" facet header + every column/field leaf (teal, exactly like Indexes)
         LvimDbKey = { fg = c.orange }, -- a redis key (its own driver context)
-        -- The per-object FACET rows (Data / Columns / Indexes / DDL). They are one tier BELOW an object and
-        -- are chrome, not data, so they take the same teal family — distinct from every object hue above them
-        -- (yellow/cyan/orange) and from the columns/indexes they reveal below.
+        -- The per-object FACET rows (Data / Columns / Indexes / DDL) and their leaves — one tier BELOW an
+        -- object, chrome rather than data, so the whole family is teal: distinct from every object hue above
+        -- them (yellow/cyan/orange). A facet branch and the rows it reveals share the teal (Columns → its
+        -- column leaves, Indexes → its index leaves), so each facet reads as one coherent group.
         LvimDbData = { fg = c.teal }, -- the "Data" facet (runs the preview)
         LvimDbIndex = { fg = c.teal }, -- the "Indexes" facet + each index leaf
         LvimDbDdl = { fg = c.teal }, -- the "DDL" facet
@@ -73,7 +74,7 @@ function M.build()
         LvimDbBgQueryAlt = { bg = mtint(c.purple, 0.13) }, -- a saved-query leaf (even, the zebra alt)
         LvimDbRowSel = { bg = mtint(c.blue, 0.3) }, -- the drawer cursor row (any kind) — bg-only marker, clearly above the washes
         LvimDbCursorLine = { bg = mtint(c.blue, 0.3) }, -- the result grid's cursor line (a visible blue wash)
-        LvimDbGuide = { fg = hl.blend(c.fg_dark, c.bg, 0.6) }, -- tree guides / carets
+        LvimDbCaret = { fg = c.yellow }, -- every expand caret (▸/▾) in the drawer tree — uniformly yellow
         LvimDbCount = { fg = c.comment }, -- a "(12)" child count
         LvimDbConnMeta = { fg = c.yellow }, -- a connection row's metadata: the expand caret, the (driver) type, the lock glyph
         LvimDbEmpty = { fg = c.comment, italic = true },

@@ -16,6 +16,8 @@
 local api = vim.api
 local surface = require("lvim-ui.surface")
 local config = require("lvim-db.config")
+local hl = require("lvim-utils.highlight")
+local colors = require("lvim-utils.colors")
 
 local M = {}
 
@@ -48,6 +50,10 @@ local KIND = {
 }
 local CARET_OPEN = "" -- nf-fa-caret_down U+F0D7
 local CARET_CLOSED = "" -- nf-fa-caret_right U+F0DA
+local LOCK = "" -- nf-fa-lock U+F023 (link encrypted: native TLS or SSH tunnel)
+local UNLOCK = "" -- nf-fa-unlock U+F09C (link is plaintext)
+local ICON_DRIVER = "" -- nf-fa-cog U+F013 (the connection-info Driver row)
+local ICON_HOST = "" -- nf-fa-server U+F233 (the connection-info Host row)
 
 ---@class LvimDbDrawerState
 local state = {
@@ -113,7 +119,7 @@ end
 ---@param suffix string?  a dim trailing note (e.g. child count)
 ---@param tail string?     a SECOND trailing segment coloured `tail_hl` (e.g. the connection lock glyph)
 ---@param tail_hl string?
----@param caret_hl string?  the caret colour (default the dim tree guide; a connection row passes yellow)
+---@param caret_hl string?  the caret colour (default `LvimDbCaret`, yellow — every tree caret is yellow)
 ---@param suffix_hl string?  the suffix colour (default the dim count; a connection row passes yellow)
 local function push_row(
     lines,
@@ -145,7 +151,7 @@ local function push_row(
     local base = #indent
     -- caret
     if caret ~= "" then
-        hls[#hls + 1] = { lineno, base, base + #caret, caret_hl or "LvimDbGuide" }
+        hls[#hls + 1] = { lineno, base, base + #caret, caret_hl or "LvimDbCaret" }
     end
     local icon_start = base + #caret_str
     hls[#hls + 1] = { lineno, icon_start, icon_start + #icon, icon_hl }
@@ -322,7 +328,7 @@ local function render()
         -- or tunnelled) or an open-lock warning (plaintext) — never silent.
         local lock = ""
         if connected then
-            lock = (conn.encrypted or conn.tunneled) and "" or "" -- lock (nf-fa-lock U+F023) when encrypted/tunnelled, open lock (nf-fa-unlock U+F09C) plaintext
+            lock = (conn.encrypted or conn.tunneled) and LOCK or UNLOCK -- link encrypted (TLS/tunnel) vs plaintext
         end
         local suffix = ("(%s)"):format(conn.driver)
         push_row(
@@ -338,7 +344,7 @@ local function render()
             suffix,
             lock ~= "" and lock or nil, -- the lock glyph
             "LvimDbConnMeta", -- tail_hl (lock)
-            "LvimDbConnMeta", -- caret_hl (the ▸/▾ before the name)
+            "LvimDbCaret", -- caret_hl (the ▸/▾ before the name — same yellow caret group as every other row)
             "LvimDbConnMeta" -- suffix_hl (the (driver) type)
         )
 
@@ -838,6 +844,7 @@ local HELP = {
     { "edit", "edit: the connection · rename the column (→ SQL editor)" },
     { "delete", "delete: the connection / query · drop the column / index (→ SQL editor)" },
     { "refresh", "re-read the schema" },
+    { "info", "connection info (driver, host, link encryption)" },
     { "help", "this help" },
     { "close", "close the drawer" },
 }
@@ -900,6 +907,115 @@ local function disconnect_row()
     if update_footer then
         update_footer() -- the row flipped connected → disconnected under a stationary cursor
     end
+end
+
+-- Per-open, palette-tracking highlight groups for the info popup, keyed by the row's accent COLOUR (a live
+-- hex from lvim-utils.colors). The KEY box is the accent washed onto the bg (the "тинт" canon — a coloured
+-- cell is its own accent mtint-ed toward the bg) with the accent as a bold fg; the VALUE is the accent as a
+-- plain readable fg. Recomputed on every open so both track the theme (no static groups to drift).
+---@param color string  a "#rrggbb" accent
+---@return string keybox_group, string value_group
+local function info_groups(color)
+    local tag = color:gsub("#", "")
+    local kb = "LvimDbInfoK" .. tag
+    local vg = "LvimDbInfoV" .. tag
+    api.nvim_set_hl(0, kb, { fg = color, bg = hl.blend(color, colors.bg, 0.3), bold = true })
+    api.nvim_set_hl(0, vg, { fg = color })
+    return kb, vg
+end
+
+--- A framed, read-only INFO popup for the focused connection: its identity (name / driver / host / db) plus
+--- — the whole point of the row's padlock glyph — a plain-language LINK line saying whether the LIVE link is
+--- encrypted (native TLS, or riding an SSH tunnel) or PLAINTEXT. Each row is a fixed-width, bg-TINTED KEY box
+--- (`<icon> <label>`, all rows widened to the longest key) followed by the VALUE; the cursor lands in the
+--- value column and is pinned there (it cannot cross left into the key boxes). Built on `lvim-ui.info`.
+---@param conn table  a `state.conns` entry (name, driver, conn_id, encrypted, tunneled)
+local function connection_info(conn)
+    local ui = require("lvim-ui")
+    local connected = conn.conn_id ~= nil
+
+    -- Collect the rows first (icon · label · value · accent colour), so the KEY box can be widened to the
+    -- longest key present (host / database rows are conditional).
+    local rows = {}
+    local kind = connected and "connection_open" or "connection"
+    rows[#rows + 1] = { KIND[kind].icon, "Connection", conn.name, connected and colors.green or colors.magenta }
+    rows[#rows + 1] = { ICON_DRIVER, "Driver", conn.driver, colors.yellow }
+
+    -- Best-effort host / database from the SAVED spec params (keys differ per driver; each row shown only
+    -- when present, so an embedded/file engine simply omits it rather than printing an empty line).
+    local saved = require("lvim-db").store.get_connection(conn.name)
+    local params = (saved and saved.spec and saved.spec.params) or {}
+    if params.host then
+        local host = params.port and (params.host .. ":" .. tostring(params.port)) or params.host
+        rows[#rows + 1] = { ICON_HOST, "Host", host, colors.blue }
+    end
+    local db = params.database or params.db or params.dbname or params.path
+    if db then
+        rows[#rows + 1] = { KIND.connection_open.icon, "Database", tostring(db), colors.cyan }
+    end
+
+    -- The LINK line — the padlock in words. The daemon reports `encrypted` = (native TLS OR SSH tunnel) and
+    -- `tunneled` = (an SSH tunnel is in use), so the connected states read unambiguously; a disconnected row
+    -- has nothing live to measure.
+    if not connected then
+        rows[#rows + 1] = { UNLOCK, "Link", "not connected — connect to check the link", colors.comment }
+    elseif conn.encrypted and conn.tunneled then
+        rows[#rows + 1] = { LOCK, "Link", "encrypted — rides the SSH tunnel", colors.green }
+    elseif conn.encrypted then
+        rows[#rows + 1] = { LOCK, "Link", "encrypted — native TLS negotiated", colors.green }
+    else
+        rows[#rows + 1] = { UNLOCK, "Link", "PLAINTEXT — no TLS and no SSH tunnel", colors.red }
+    end
+
+    -- Widen every KEY box to the longest `" <icon> <label>"` (display cells) + 1 trailing pad, so the tinted
+    -- boxes form one aligned column. Every icon is a 3-byte / 1-cell Nerd glyph and labels are ASCII, so the
+    -- BYTE length of each padded box is identical → one constant value column (`value_col`) to pin against.
+    local keyw = 0
+    for _, r in ipairs(rows) do
+        keyw = math.max(keyw, vim.fn.strdisplaywidth(" " .. r[1] .. " " .. r[2]))
+    end
+    keyw = keyw + 1
+
+    local lines, hls, value_col = {}, {}, 0
+    for _, r in ipairs(rows) do
+        local icon, label, value, color = r[1], r[2], r[3], r[4]
+        local box = " " .. icon .. " " .. label
+        box = box .. string.rep(" ", keyw - vim.fn.strdisplaywidth(box))
+        -- One UNTINTED space separates the tinted key box from the value column, then the value starts.
+        local box_bytes = #box
+        value_col = box_bytes + 1
+        local ri = #lines
+        lines[#lines + 1] = box .. " " .. value
+        local kb, vg = info_groups(color)
+        hls[#hls + 1] = { ri, 0, box_bytes, kb } -- the tinted KEY box (icon + label + padding)
+        hls[#hls + 1] = { ri, value_col, value_col + #value, vg } -- the VALUE (after the 1-space gap)
+    end
+
+    ui.info(lines, {
+        title = "Connection info",
+        highlights = hls,
+        max_width = 0.7,
+        on_open = function(buf, win)
+            -- Land the cursor in the VALUE column and PIN it there: a CursorMoved guard snaps the column back
+            -- whenever a motion (or the mouse) tries to carry it left into the key boxes. Vertical movement is
+            -- unrestricted; every value has ≥1 char so `value_col` is always a valid column on each row.
+            if win and api.nvim_win_is_valid(win) then
+                pcall(api.nvim_win_set_cursor, win, { 1, value_col })
+            end
+            api.nvim_create_autocmd("CursorMoved", {
+                buffer = buf,
+                callback = function()
+                    if not (win and api.nvim_win_is_valid(win)) then
+                        return
+                    end
+                    local pos = api.nvim_win_get_cursor(win)
+                    if pos[2] < value_col then
+                        pcall(api.nvim_win_set_cursor, win, { pos[1], value_col })
+                    end
+                end,
+            })
+        end,
+    })
 end
 
 --- The focused row's connect-state, for the context footer: a DISCONNECTED / CONNECTED connection row, or
@@ -1034,6 +1150,12 @@ local function set_keys(chassis_map)
                 row.conn.nodes = nodes or {}
                 M.refresh()
             end)
+        end
+    end)
+    map(k.info, function()
+        local row = current_row()
+        if row and row.kind == "connection" and row.conn then
+            connection_info(row.conn)
         end
     end)
     map(k.close, request_close)

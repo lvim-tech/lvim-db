@@ -37,6 +37,7 @@
 ---@field edit     string|false  Open the connection form on the focused connection
 ---@field delete   string|false  Delete the focused saved connection (confirmed)
 ---@field refresh  string|false  Re-read the focused connection's schema
+---@field info     string|false  Show the focused connection's info (driver, host, link encryption)
 ---@field close    string|false  Close the drawer
 
 ---@class LvimDbResultKeys
@@ -124,6 +125,7 @@ return {
             edit = "e",
             delete = "x",
             refresh = "r",
+            info = "i", -- connection info popup (driver, host, and what the padlock means: link encryption)
             close = "q",
         },
         result = {

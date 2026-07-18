@@ -84,7 +84,7 @@ setup() merges your options into the live config. The full defaults: >lua
               help = "g?",            -- the keymap CHEATSHEET
               expand = "l", collapse = "h", disconnect = "<C-q>",
               action = "<CR>", add = "a", edit = "e", delete = "x",
-              refresh = "r", notes = "n", close = "q",
+              refresh = "r", info = "i", close = "q",
           },
           result = {
               help = "g?",            -- the keymap CHEATSHEET
@@ -320,7 +320,9 @@ process, so closing and re-opening the workspace never re-connects.
 
 Drawer keys: l / <CR> connect-or-expand (a table's <CR> previews its rows),
 h collapse the row (VISUAL only), <C-q> DISCONNECT the live connection, a add,
-e edit, x delete, r refresh, n notes, q close.
+e edit, x delete, r refresh, i info, q close. `i` opens a connection-info popup
+(driver, host/database, and a plain-language LINK line — encrypted via native TLS
+or an SSH tunnel, or plaintext — which is what the row's padlock glyph means).
 
 The bottom key-hint bar is CONTEXT-AWARE: on a disconnected connection it shows a
 `<CR> connect` chip, on a connected one a `<C-q> disconnect` chip (plus the

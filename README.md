@@ -119,7 +119,7 @@ require("lvim-db").setup({
             edit = "e", -- open the connection form on the focused connection
             delete = "x", -- delete the focused saved connection (confirmed)
             refresh = "r", -- re-read the focused connection's schema
-            notes = "n", -- open the notes picker
+            info = "i", -- connection info popup (driver, host, and what the padlock means: link encryption)
             close = "q",
         },
         -- the result dock (grid + call log)
@@ -335,7 +335,10 @@ retried. Secrets are saved as templates (see [Credentials](#credentials)), never
 - `h` — collapse the row (visual only — does **not** drop the live link)
 - `<C-q>` — **disconnect** the focused connection (closes the live link; the row flips back to
   the disconnected icon/colour)
-- `a` — add · `e` — edit · `x` — delete · `r` — refresh schema · `n` — notes · `q` — close
+- `a` — add · `e` — edit · `x` — delete · `r` — refresh schema · `i` — info · `q` — close
+- `i` — **connection info** popup: driver, host/database, and a plain-language **link** line saying
+  whether the live connection is encrypted (native TLS or an SSH tunnel) or plaintext — this is exactly
+  what the row's padlock glyph means (locked = encrypted, open padlock = plaintext)
 
 The bottom **key-hint bar is context-aware**: on a disconnected connection it shows a `⏎ connect`
 chip, on a connected one a `C-q disconnect` chip (plus the always-present help / close chips),
