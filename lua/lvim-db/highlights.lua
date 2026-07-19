@@ -94,7 +94,6 @@ function M.build()
         -- button — badge, label and padding all wear this one group, so the active tab reads as a filled block
         -- (not a fg-only accent), independent of which sector has focus. The inactive tab keeps the plain
         -- footer colours. `bg` chosen a touch below the column-header active so the two blues don't compete.
-        LvimDbTabActive = { fg = c.blue, bg = mtint(c.blue, 0.3), bold = true },
         LvimDbCellNull = { fg = c.comment, italic = true }, -- a NULL cell
         LvimDbCellNumber = { fg = c.orange }, -- numeric cells
         LvimDbRowAlt = { bg = hl.blend(c.fg, c.bg, 0.03) }, -- zebra striping

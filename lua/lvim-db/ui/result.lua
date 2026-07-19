@@ -44,6 +44,12 @@ local state = {
     -- A SECOND namespace, deliberately: `ns` carries the grid's own paint and is cleared and rewritten on
     -- every render, while these marks belong to the LOCKED row and must outlive that.
     ns_edit = api.nvim_create_namespace("LvimDbResultEdit"),
+    -- A THIRD namespace for the CURSOR ROW. `cursorline` alone cannot show it: the zebra stripe
+    -- (`LvimDbRowAlt`) is a background extmark, and extmarks paint OVER the window's CursorLine — so the
+    -- hover vanished on exactly the striped (even) rows. Re-painting the row here as an extmark above the
+    -- stripe makes it win on every row. Its own namespace so a cursor move clears just this mark, never the
+    -- grid paint (`ns`) or the locked-row marks (`ns_edit`).
+    ns_cursor = api.nvim_create_namespace("LvimDbResultCursor"),
     view = "result", ---@type "result"|"log"  which tab is shown
     call_id = nil, ---@type integer?
     conn_id = nil, ---@type integer?
@@ -233,6 +239,34 @@ local function write_buf(lines, hls)
     for _, h in ipairs(hls) do
         pcall(api.nvim_buf_set_extmark, state.buf, state.ns, h[1], h[2], { end_col = h[3], hl_group = h[4] })
     end
+end
+
+--- Paint the CURSOR ROW so it wins over the zebra stripe. `cursorline` is drawn UNDER buffer extmarks, so on
+--- a striped (even) row `LvimDbRowAlt`'s background hid the hover completely — the row under the cursor read
+--- as untinted every other line. Re-painting it as a `line_hl_group` extmark above the grid paint restores it
+--- on every row; the group is the same `LvimDbCursorLine`, so the rows where the built-in cursorline already
+--- showed look unchanged. Cheap: one mark, cleared and re-set per cursor move.
+local function paint_cursor_row()
+    if not (state.buf and api.nvim_buf_is_valid(state.buf)) then
+        return
+    end
+    api.nvim_buf_clear_namespace(state.buf, state.ns_cursor, 0, -1)
+    if state.view ~= "result" or not state.grid then
+        return
+    end
+    if not (state.win and api.nvim_win_is_valid(state.win)) then
+        return
+    end
+    local ok, cur = pcall(api.nvim_win_get_cursor, state.win)
+    if not ok then
+        return
+    end
+    pcall(api.nvim_buf_set_extmark, state.buf, state.ns_cursor, cur[1] - 1, 0, {
+        line_hl_group = "LvimDbCursorLine",
+        -- Above the stripe and the cell marks (default extmark priority 4096) so this background is the one
+        -- that lands; those cell groups carry only a foreground, which still merges through.
+        priority = 5000,
+    })
 end
 
 -- state → highlight group for the call-log accent.
@@ -447,6 +481,8 @@ local function render()
     else
         render_result()
     end
+    -- The rewrite above replaced the lines the cursor mark was anchored to — re-assert it.
+    paint_cursor_row()
 end
 
 --- The dock TITLE (left of the header): which database + object the current rows came from — `db ➤ object`
@@ -1390,13 +1426,20 @@ end
 -- our own to leak, and the bar can never advertise a key that is not live.
 
 -- (declared above `set_view`, which rebuilds the header on a view switch)
--- The two header tabs, with the CURRENT view's tab marked `active` — a SOLID `LvimDbTabActive` bg across the
--- whole button (badge + label + padding; the `active` render, unlike hover, does not bracket the label, so
--- nothing eats the side padding). The active tab therefore reads as one filled block and shows which view is
--- open regardless of focus, instead of only lighting up while the header bar is the focused sector.
+-- The two header tabs, with the CURRENT view's tab marked `active` — the badge and the label each DEEPEN to
+-- their own selected tint (blue / yellow), so the active tab reads as the stronger block and shows which view
+-- is open regardless of focus, instead of only lighting up while the header bar is the focused sector. The
+-- `active` render, unlike hover, does not bracket the label, so nothing eats the side padding.
 function header_spec()
     local k = config.keys.result
-    local ACTIVE = { icon = { active = "LvimDbTabActive" }, text = { active = "LvimDbTabActive" } }
+    -- ACTIVE = the SELECTED tint of the shared footer canon: each box KEEPS ITS OWN HUE — blue key badge,
+    -- yellow label — and merely DEEPENS, exactly like every other button's hover/selected pair. This used to
+    -- point BOTH boxes at one blue group, which turned the active tab's LABEL blue instead of a stronger
+    -- yellow (the badge and the caption then read as the same colour).
+    local ACTIVE = {
+        icon = { active = "LvimUiFooterKeyHover" },
+        text = { active = "LvimUiFooterLabelHover" },
+    }
     return {
         bars = {
             -- The TITLE row: `db ➤ object` on the LEFT, the range counter (1–20/536) pushed to the RIGHT — a
@@ -1653,7 +1696,10 @@ local function open_dock()
     -- moving down a column costs nothing.
     api.nvim_create_autocmd("CursorMoved", {
         buffer = state.buf,
-        callback = track_column,
+        callback = function()
+            track_column()
+            paint_cursor_row()
+        end,
     })
 end
 
