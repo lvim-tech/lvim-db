@@ -63,7 +63,7 @@ impl Driver for DuckdbDriver {
     }
 
     async fn connect(&self, spec: &ConnSpec, _net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
-        let file = spec.param("file")?.to_string();
+        let file = crate::spec::expand_tilde(spec.param("file")?);
         let conn = tokio::task::spawn_blocking(move || {
             if file == ":memory:" {
                 DuckConn::open_in_memory()
@@ -254,6 +254,19 @@ impl DuckdbConnection {
                         type_name: String::new(),
                     })
                     .collect();
+            }
+            // DuckDB returns a DML's affected count as a single-row `Count` RESULT (not an affected field), so
+            // an UPDATE/DELETE/INSERT shows a `Count` grid instead of "N row(s) affected". Map that shape back
+            // to `affected` for the mutation keywords only — a RETURNING clause yields real columns (unmatched),
+            // and a plain SELECT is not a mutation, so a user's `SELECT … AS Count` is never misread.
+            let is_mutation = {
+                let up: String = sql.trim_start().chars().take(6).collect::<String>().to_ascii_uppercase();
+                matches!(up.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+            };
+            if is_mutation && columns.len() == 1 && columns[0].name == "Count" && out.len() == 1 {
+                if let Value::Int(n) = &out[0][0] {
+                    return Ok((Vec::new(), Vec::new(), Some((*n).max(0) as u64)));
+                }
             }
             Ok((columns, out, None))
         })

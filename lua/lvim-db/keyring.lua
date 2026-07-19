@@ -36,16 +36,24 @@ function M.scan()
     for _, c in ipairs(store.list_connections()) do
         local spec = c.spec or {}
         local auth = spec.auth or {}
-        -- the main auth secret (whichever method the connection uses)
+        -- the main auth secret (whichever method the connection uses). If a connection carries MORE than one
+        -- plaintext auth field (e.g. `password` + `key_password`), the first is `db/<conn>` and the rest are
+        -- suffixed `db/<conn>-<field>` — else both would map to the same vault name and resolve to one value.
+        local primary_taken = false
         for _, f in ipairs({ "password", "token", "key_password" }) do
             if is_plaintext(auth[f]) then
+                local vname = "db/" .. c.name
+                if primary_taken then
+                    vname = vname .. "-" .. f:gsub("_", "-")
+                end
+                primary_taken = true
                 hits[#hits + 1] = {
                     conn = c.name,
                     driver = c.driver,
                     spec = spec,
                     path = { "auth", f },
                     value = auth[f],
-                    vault_name = "db/" .. c.name,
+                    vault_name = vname,
                 }
             end
         end

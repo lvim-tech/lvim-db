@@ -116,7 +116,10 @@ impl Driver for MssqlDriver {
         } else {
             config.trust_cert();
         }
-        let encrypted = tls.wanted();
+        // Report the padlock HONESTLY: only a Required-family mode guarantees the link is encrypted (connect
+        // fails otherwise). Prefer/On may come up unencrypted while still succeeding — tiberius exposes no
+        // negotiated-state getter, so we must not claim a lock we can't verify.
+        let encrypted = !matches!(tls.mode, crate::spec::TlsMode::Disable | crate::spec::TlsMode::Prefer);
 
         let tcp = TcpStream::connect(config.get_addr())
             .await
@@ -223,7 +226,11 @@ fn render_cell(row: &tiberius::Row, i: usize) -> Value {
 impl MssqlConnection {
     async fn run(&mut self, sql: &str) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>)> {
         let stream = self.client.query(sql, &[]).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        let rows = stream.into_first_result().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        // A multi-statement buffer produces several result sets (all statements DO run); `into_first_result`
+        // showed only the first. Take the LAST non-empty result set so a trailing SELECT after some DML is
+        // what the grid displays.
+        let results = stream.into_results().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let rows = results.into_iter().rev().find(|r| !r.is_empty()).unwrap_or_default();
         let mut columns = Vec::new();
         if let Some(r0) = rows.first() {
             columns = r0

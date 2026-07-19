@@ -205,7 +205,7 @@ local function winbar_text()
         return (" %%#LvimDbEditorIcon#%s %%#LvimDbEditorLabel#editor %s %%#LvimDbEditorConn#%s"):format(
             ico,
             arrow,
-            state.active
+            (state.active:gsub("%%", "%%%%")) -- escape % so a connection named `a%b` can't corrupt the winbar
         )
     end
     return (" %%#LvimDbEditorIcon#%s %%#LvimDbEditorLabel#editor %s %%#LvimDbEditorNone#(no connection)"):format(

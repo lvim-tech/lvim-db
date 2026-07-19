@@ -43,6 +43,15 @@ local function ensure_state_router()
             pcall(cb, params)
         end
     end)
+    -- On daemon death, fail every pending watcher so its call-log entry flips out of "running" (a stuck
+    -- RUNNING row's cancel key would otherwise no-op forever) and the watcher table does not leak.
+    daemon.on_teardown(function(err)
+        local dead = call_watchers
+        call_watchers = {}
+        for _, cb in pairs(dead) do
+            pcall(cb, { state = "failed", error = err or "daemon stopped" })
+        end
+    end)
 end
 
 -- ─── setup ───────────────────────────────────────────────────────────────────
@@ -340,6 +349,12 @@ function M.cell(call_id, row, col, cb)
     daemon.request("query.cell", { call_id = call_id, row = row, col = col }, function(result, err)
         cb(result and result.value, err)
     end)
+end
+
+--- Release a finished call's server-side buffer (frees its paged rows on the daemon). Fire-and-forget.
+---@param call_id integer
+function M.release(call_id)
+    daemon.request("query.release", { call_id = call_id }, function() end)
 end
 
 --- Cancel a running statement.

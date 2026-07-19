@@ -199,6 +199,10 @@ local function cell_display(v)
         if type(v.__oid) == "string" then
             return v.__oid, "LvimDbCellNumber"
         end
+        if type(v.__int) == "string" then
+            -- a big integer the daemon sent as exact decimal TEXT (JSON numbers lose precision above 2^53)
+            return v.__int, "LvimDbCellNumber"
+        end
         if type(v.__ext) == "string" then
             -- a tagged date/decimal (`{ __ext = "$date"|"$numberDecimal", v = text }`): show the readable
             -- value; a decimal takes the number tint.
@@ -212,6 +216,9 @@ local function cell_display(v)
     return tostring(v), nil
 end
 
+---@type fun()  forward declaration: paint_edit is defined far below but render_result (above it) re-applies it
+local paint_edit
+
 --- Write lines + extmark highlights into the dock buffer.
 ---@param lines string[]
 ---@param hls table[]  { line, col_start, col_end, group }
@@ -220,6 +227,9 @@ local function write_buf(lines, hls)
     api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
     vim.bo[state.buf].modifiable = false
     api.nvim_buf_clear_namespace(state.buf, state.ns, 0, -1)
+    -- ALSO clear the edit namespace: any buffer rewrite (e.g. switching to the call log) must not leave the
+    -- lock/pending-cell tints painted over the new content; render_result re-applies them when state.edit is set.
+    api.nvim_buf_clear_namespace(state.buf, state.ns_edit, 0, -1)
     for _, h in ipairs(hls) do
         pcall(api.nvim_buf_set_extmark, state.buf, state.ns, h[1], h[2], { end_col = h[3], hl_group = h[4] })
     end
@@ -245,11 +255,10 @@ local function render_log()
     for i = #state.calls, 1, -1 do
         local c = state.calls[i]
         local st = (c.state or "running"):upper()
-        local meta = ("%-9s %5sms  %-10s"):format(st, tostring(c.ms or "·"), c.conn or "")
-        local stmt = (c.statement or ""):gsub("[\n\r]+", " ")
-        if #stmt > 90 then
-            stmt = stmt:sub(1, 87) .. "…"
-        end
+        -- Pad/cut by DISPLAY CELLS (not bytes) so a Cyrillic conn name or SQL literal never misaligns the
+        -- columns or gets shredded mid-UTF-8 (the "cells, not bytes" canon).
+        local meta = ("%-9s %5sms  %s"):format(st, tostring(c.ms or "·"), pad_cells(c.conn or "", 10))
+        local stmt = (cut_cells((c.statement or ""):gsub("[\n\r]+", " "), 90))
         local line = " " .. meta .. "  " .. stmt
         local lineno = #lines
         lines[#lines + 1] = line
@@ -354,6 +363,11 @@ local function render_result()
     end
     write_buf(lines, hls)
     set_winbar(true)
+    -- A locked/edited row must survive a view round-trip (r ⇄ L) VISIBLY: re-apply the edit tints after the
+    -- grid repaint (write_buf cleared ns_edit). `M.run` owns killing state.edit, so this only fires mid-edit.
+    if state.edit then
+        paint_edit()
+    end
 end
 
 --- The STICKY column header — Neovim evaluates this on every redraw of the grid window (its `winbar` is
@@ -587,7 +601,13 @@ local function resolve_key(cb)
     if o.key then
         return cb(#o.key > 0 and o.key or nil)
     end
-    require("lvim-db").columns(state.conn_id, { name = o.object, schema = o.schema }, function(cols)
+    require("lvim-db").columns(state.conn_id, { name = o.object, schema = o.schema }, function(cols, err)
+        -- Do NOT cache a key on an RPC error — an empty result would remember the object as keyless
+        -- (read-only) forever. Surface the reason and leave `o.key` nil so the next attempt retries.
+        if err then
+            vim.notify("lvim-db: could not resolve key: " .. tostring(err), vim.log.levels.WARN)
+            return cb(nil)
+        end
         local key = {}
         for _, c in ipairs(cols or {}) do
             if c.primary then
@@ -643,25 +663,26 @@ local function fetch_total(origin)
         end
         db.page(cid, 0, 1, function(page)
             local row = page and page.rows and page.rows[1]
-            if not row then
-                return
-            end
-            -- the count is the first NUMBER in the one result row (SQL `COUNT(*) AS n`, mongo `{ n, ok }`, …)
-            local total
-            for _, v in ipairs(row) do
-                if type(v) == "number" then
-                    total = v
-                    break
+            if row then
+                -- the count is the first NUMBER in the one result row (SQL `COUNT(*) AS n`, mongo `{ n, ok }`, …)
+                local total
+                for _, v in ipairs(row) do
+                    if type(v) == "number" then
+                        total = v
+                        break
+                    end
+                end
+                if type(total) == "number" and state.origin == origin then
+                    origin.count = total
+                    vim.schedule(function()
+                        if state.surface and state.surface.set_header then
+                            pcall(state.surface.set_header, header_spec())
+                        end
+                    end)
                 end
             end
-            if type(total) == "number" and state.origin == origin then
-                origin.count = total
-                vim.schedule(function()
-                    if state.surface and state.surface.set_header then
-                        pcall(state.surface.set_header, header_spec())
-                    end
-                end)
-            end
+            -- the count call is a throwaway; free its server-side buffer immediately.
+            require("lvim-db").release(cid)
         end)
     end, function(call_id)
         cid = call_id
@@ -845,8 +866,12 @@ end
 ---@param orig any
 ---@param driver string
 ---@param coltype string?
+---@param colname string?
 ---@return any value, string? err
-local function coerce(text, orig, driver, coltype)
+local function coerce(text, orig, driver, coltype, colname)
+    if driver == "mongodb" and colname == "_document" then
+        return nil, "synthetic whole-document column — view only"
+    end
     local sty = structured_type(driver, coltype)
     if sty then
         return nil, sty
@@ -873,6 +898,10 @@ local function coerce(text, orig, driver, coltype)
         -- `field_editable`, which stops these before the field even opens; this is the last-line guard).
         if type(orig.__oid) == "string" then
             return { __oid = vim.trim(text) }
+        end
+        if type(orig.__int) == "string" then
+            -- keep the edited digits as an exact-integer tag so M.literal emits them verbatim (unquoted)
+            return { __int = vim.trim(text) }
         end
         if type(orig.__ext) == "string" then
             -- a tagged date/decimal: re-wrap the edited text under its extended-JSON key so the daemon's
@@ -905,8 +934,14 @@ end
 ---@param raw any
 ---@param driver string
 ---@param coltype string?
+---@param colname string?
 ---@return boolean ok, string? reason
-local function field_editable(raw, driver, coltype)
+local function field_editable(raw, driver, coltype, colname)
+    -- Mongo's synthetic trailing `_document` cell is the WHOLE document; editing it would write a literal
+    -- `_document` FIELD into the doc instead of replacing it. Its type is a normal json, so refuse by NAME.
+    if driver == "mongodb" and colname == "_document" then
+        return false, "synthetic whole-document column — view only"
+    end
     -- A type-name guard first: it catches hazards the value SHAPE hides (a Snowflake VARIANT / Postgres bytea
     -- both arrive as plain text). `structured_type` is nil for the common editable case.
     local sty = structured_type(driver, coltype)
@@ -922,6 +957,9 @@ local function field_editable(raw, driver, coltype)
     if type(raw.__oid) == "string" then
         return true -- an ObjectId, edited as its hex
     end
+    if type(raw.__int) == "string" then
+        return true -- a big integer edited as its exact decimal digits
+    end
     if driver == "mongodb" then
         return true -- a nested document / array, edited as extended JSON
     end
@@ -936,7 +974,7 @@ local refresh_footer
 --- Paint the locked row: its own tint, plus a stronger one on every field the user has changed but not yet
 --- written. A pending change has to be VISIBLE — it lives only in `state.edit` until `S`, and an edit you
 --- cannot see is an edit you lose.
-local function paint_edit()
+function paint_edit()
     local e, g = state.edit, state.grid
     if not (e and g and is_open()) then
         return
@@ -1057,10 +1095,18 @@ local function edit_cell()
     if not (col and cell) then
         return
     end
-    local raw = e.pending[ci] and e.pending[ci].value or e.row[ci]
+    -- A pending BOX exists precisely so a pending nil (NULL) / false is distinguishable — an `and/or` would
+    -- collapse it and re-seed the ORIGINAL value, silently undoing a NULL on re-open.
+    local box = e.pending[ci]
+    local raw
+    if box then
+        raw = box.value
+    else
+        raw = e.row[ci]
+    end
     -- Guard the field BEFORE opening: a binary / non-mongo-structured cell has no faithful text edit, so say
     -- so and do nothing rather than open a field whose save could only be refused or corrupt the value.
-    local ok_edit, why = field_editable(raw, state.driver, col.type)
+    local ok_edit, why = field_editable(raw, state.driver, col.type, col.name)
     if not ok_edit then
         vim.notify("lvim-db: " .. tostring(why), vim.log.levels.WARN)
         return
@@ -1078,7 +1124,7 @@ local function edit_cell()
             if not ok or not state.edit then
                 return
             end
-            local coerced, cerr = coerce(value, e.row[ci], state.driver, col.type)
+            local coerced, cerr = coerce(value, e.row[ci], state.driver, col.type, col.name)
             if cerr then
                 vim.notify("lvim-db: " .. cerr, vim.log.levels.WARN)
                 return
@@ -1226,7 +1272,8 @@ local function open_row_popup(ri, row, key, readonly)
                                                 -- Coerce per field; a field with no faithful text round-trip (binary,
                                                 -- non-mongo structured) or invalid JSON aborts the WHOLE save — never
                                                 -- send a partial/corrupt update.
-                                                local val, cerr = coerce(now, row[ci], state.driver, g.cols[ci].type)
+                                                local val, cerr =
+                                                    coerce(now, row[ci], state.driver, g.cols[ci].type, g.cols[ci].name)
                                                 if cerr then
                                                     vim.notify(
                                                         ("lvim-db: '%s' — %s"):format(g.cols[ci].name, cerr),
@@ -1709,8 +1756,14 @@ function M.run(conn_id, conn_name, driver, statement, origin, offset)
             end)
             return
         end
+        -- Release the PREVIOUS result's server-side buffer — only the current call_id is ever paged again, and
+        -- the call log reruns by statement, so a replaced call's buffered rows are dead weight on the daemon.
+        local prev = state.call_id
         entry.call_id = call_id
         state.call_id = call_id
+        if prev and prev ~= call_id then
+            require("lvim-db").release(prev)
+        end
     end)
 end
 

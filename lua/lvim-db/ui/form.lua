@@ -125,7 +125,7 @@ local function open_tabs(meta, existing)
                     options = { "none", "key", "password" },
                 },
                 srow("k_host", "SSH host", stun and stun.host),
-                srow("k_port", "SSH port", stun and tostring(stun.port) or "22"),
+                srow("k_port", "SSH port", stun and stun.port and tostring(stun.port) or "22"),
                 srow("k_user", "SSH user", stun and stun.user),
                 srow("k_path", "SSH private key path (key auth)", stun and stun.auth and stun.auth.path),
                 srow("k_secret", 'SSH passphrase/password ({{ env "VAR" }})', tunnel_secret(stun)),
@@ -253,11 +253,18 @@ local function open_tabs(meta, existing)
             )
             return false
         end
-        local enc = (spec.tls and spec.tls.mode ~= "disable") or spec.tunnel ~= nil
-        vim.notify(
-            ("lvim-db: saved '%s' (%s)"):format(name, enc and "encrypted" or "PLAINTEXT — no TLS/tunnel"),
-            enc and vim.log.levels.INFO or vim.log.levels.WARN
-        )
+        -- An embedded file engine has no network link, so a TLS/tunnel verdict is meaningless — just confirm
+        -- the save. Only the network engines get the encrypted / PLAINTEXT-warning distinction.
+        local is_network = not (meta.kind == "sqlite" or meta.kind == "duckdb")
+        if not is_network then
+            vim.notify(("lvim-db: saved '%s'"):format(name), vim.log.levels.INFO)
+        else
+            local enc = (spec.tls and spec.tls.mode ~= "disable") or spec.tunnel ~= nil
+            vim.notify(
+                ("lvim-db: saved '%s' (%s)"):format(name, enc and "encrypted" or "PLAINTEXT — no TLS/tunnel"),
+                enc and vim.log.levels.INFO or vim.log.levels.WARN
+            )
+        end
         local drawer = require("lvim-db.ui.drawer")
         if drawer.is_open() then
             drawer.open()

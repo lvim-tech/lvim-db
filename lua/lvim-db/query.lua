@@ -158,8 +158,13 @@ function M.rename_column(driver, schema, object, from, to)
         local function esc(s)
             return (s:gsub("'", "''"))
         end
-        local objname = (schema and schema ~= "") and ("%s.%s.%s"):format(schema, object, from)
-            or ("%s.%s"):format(object, from)
+        -- Bracket-quote each part so a DOT inside an identifier (`My.Table`) is not split into extra
+        -- multi-part segments; `]` is escaped by doubling. The whole literal is then '-doubled by esc().
+        local function part(s)
+            return "[" .. s:gsub("%]", "]]") .. "]"
+        end
+        local objname = (schema and schema ~= "") and ("%s.%s.%s"):format(part(schema), part(object), part(from))
+            or ("%s.%s"):format(part(object), part(from))
         return ("EXEC sp_rename '%s', '%s', 'COLUMN';"):format(esc(objname), esc(to))
     end
     if driver == "firebird" then
@@ -246,6 +251,10 @@ end
 function M.literal(driver, v)
     if v == nil or v == vim.NIL then
         return "NULL"
+    end
+    if type(v) == "table" and type(v.__int) == "string" then
+        -- a big integer tagged as exact decimal text (see spec.rs) — emit the digits verbatim, unquoted
+        return v.__int
     end
     if type(v) == "number" then
         return tostring(v)

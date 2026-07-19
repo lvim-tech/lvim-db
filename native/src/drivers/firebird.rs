@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use rsfbclient::{Column, Queryable, Row, SimpleConnection, SqlType};
+use rsfbclient::{Column, Execute, Queryable, Row, SimpleConnection, SqlType};
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
@@ -149,7 +149,16 @@ impl FirebirdConnection {
         let arc = self.conn.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let mut conn = arc.lock().unwrap();
-            let rows: Vec<Row> = conn.query(&sql, ()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Firebird DSQL: a SELECT is a cursor `query`; a non-SELECT (UPDATE/DELETE/DDL) is an `execute`
+            // and errors through `query`. Try the cursor first, then fall back to execute so the grid's
+            // generated UPDATE (and editor DDL) actually run instead of erroring.
+            let rows: Vec<Row> = match conn.query(&sql, ()) {
+                Ok(r) => r,
+                Err(qe) => {
+                    conn.execute(&sql, ()).map_err(|_| anyhow::anyhow!("{qe}"))?;
+                    return Ok((Vec::new(), Vec::new()));
+                }
+            };
             let mut columns: Vec<SpecColumn> = Vec::new();
             let mut out: Vec<Vec<Value>> = Vec::new();
             for row in &rows {

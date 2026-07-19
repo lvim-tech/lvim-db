@@ -158,12 +158,22 @@ function M.open()
     end
     state.origin_tab = api.nvim_get_current_tabpage()
     vim.cmd("tabnew")
+    -- `tabnew` opens a fresh listed [No Name] buffer; setup_editor swaps the editor scratch into the window
+    -- below, orphaning it — wipe it so repeated toggles don't leak a dead [No Name] per cycle.
+    local blank = api.nvim_get_current_buf()
     api.nvim_tabpage_set_var(api.nvim_get_current_tabpage(), "lvim_db_workspace", true)
     guard_chrome() -- one GLOBAL statusline in the tab, never per-window bars that split the layout (see above)
     -- The fresh tab's window becomes the EDITOR placeholder (captured BEFORE the drawer splits off the left,
     -- so it stays the top-right window). The drawer is the top-left tree (a left native split); a full-width
     -- result later docks at the bottom, wrapping the top row. Restore the previous result, if there was one.
     setup_editor(api.nvim_get_current_win())
+    -- the editor scratch has replaced `blank` in the window; wipe the orphan if nothing else shows it
+    if api.nvim_buf_is_valid(blank) and blank ~= api.nvim_get_current_buf() then
+        local name = api.nvim_buf_get_name(blank)
+        if name == "" and not vim.bo[blank].modified and #vim.fn.win_findbuf(blank) == 0 then
+            pcall(api.nvim_buf_delete, blank, {})
+        end
+    end
     require("lvim-db.ui.drawer").open(true)
     require("lvim-db.ui.result").reopen()
 end

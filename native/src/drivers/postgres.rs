@@ -370,10 +370,15 @@ impl Connection for PgConnection {
             Some(s) => format!("AND c.table_schema = '{}'", s.replace('\'', "''")),
             None => String::new(),
         };
-        let qual = match &obj.schema {
-            Some(s) => format!("{}.{}", s.replace('\'', "''"), obj.name.replace('\'', "''")),
-            None => obj.name.replace('\'', "''"),
+        // Build a DOUBLE-QUOTED identifier path so `::regclass` preserves case / special chars (unquoted
+        // regclass lowercases, so `"MyTable"` errored the whole statement → grid wrongly read-only), then
+        // '-escape the whole for the outer '...' literal.
+        let dq = |x: &str| x.replace('"', "\"\"");
+        let ident = match &obj.schema {
+            Some(s) => format!("\"{}\".\"{}\"", dq(s), dq(&obj.name)),
+            None => format!("\"{}\"", dq(&obj.name)),
         };
+        let qual = ident.replace('\'', "''");
         let sql = format!(
             "SELECT c.column_name, c.data_type, (pk.col IS NOT NULL) AS is_pk \
              FROM information_schema.columns c \

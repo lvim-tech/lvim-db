@@ -89,13 +89,25 @@ impl Driver for RedisDriver {
             .ok_or_else(|| anyhow::anyhow!("net resolved a malformed address"))?;
 
         // Build the redis:// URL, embedding credentials when present.
+        // Percent-encode the userinfo — a password with `@`, `/`, `#`, `:` or `%` would otherwise mis-parse
+        // the URL (wrong host, truncation at `#`, split auth), so a legitimate strong password can't connect.
+        fn pct(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            for b in s.bytes() {
+                match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+                    _ => out.push_str(&format!("%{b:02X}")),
+                }
+            }
+            out
+        }
         let auth = match &spec.auth {
             AuthSpec::Password { user, password } => {
-                let pw = password.resolve().await?;
+                let pw = pct(&password.resolve().await?);
                 if user.is_empty() {
                     format!(":{pw}@")
                 } else {
-                    format!("{user}:{pw}@")
+                    format!("{}:{pw}@", pct(user))
                 }
             }
             _ => String::new(),

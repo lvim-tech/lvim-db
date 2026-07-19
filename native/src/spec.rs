@@ -359,13 +359,37 @@ pub enum Value {
     },
 }
 
+/// Expand a leading `~` / `~/` to $HOME (a file path a driver will open). Shared so the form's Test path
+/// and the drivers' `connect` agree — otherwise Test reports a `~/db.sqlite` readable while connect fails.
+pub fn expand_tilde(path: &str) -> String {
+    match path.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => match std::env::var("HOME") {
+            Ok(home) => format!("{home}{rest}"),
+            Err(_) => path.to_string(),
+        },
+        _ => path.to_string(),
+    }
+}
+
 impl Serialize for Value {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         match self {
             Value::Null => s.serialize_none(),
             Value::Bool(b) => s.serialize_bool(*b),
-            Value::Int(i) => s.serialize_i64(*i),
+            Value::Int(i) => {
+                // A JSON number becomes a LuaJIT double on the client, losing precision above 2^53 (and
+                // %.14g even rounds 15-16 digit ints). Send a plain number only when it round-trips exactly;
+                // otherwise tag it as decimal TEXT (`{ "__int": "<digits>" }`) so the grid display and the
+                // generated UPDATE keep the exact value — mirrors the `__oid`/`__ext` tagging precedent.
+                if i.unsigned_abs() < (1u64 << 53) {
+                    s.serialize_i64(*i)
+                } else {
+                    let mut m = s.serialize_map(Some(1))?;
+                    m.serialize_entry("__int", &i.to_string())?;
+                    m.end()
+                }
+            }
             Value::Float(f) => s.serialize_f64(*f),
             Value::Text(t) => s.serialize_str(t),
             Value::Timestamp(t) => s.serialize_str(t),

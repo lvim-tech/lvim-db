@@ -31,18 +31,6 @@ type Conn = Arc<AsyncMutex<Box<dyn Connection>>>;
 /// blackholed address does not hang the form's Test button.
 const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Expand a leading `~` in a file-param path. The daemon is the one that opens
-/// the file, so it — not the Lua form — resolves the shorthand the user typed.
-fn expand_tilde(path: &str) -> String {
-    match path.strip_prefix("~") {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => match std::env::var("HOME") {
-            Ok(home) => format!("{home}{rest}"),
-            Err(_) => path.to_string(),
-        },
-        _ => path.to_string(),
-    }
-}
-
 /// A live connection plus the NetContext that owns its SSH tunnel (if any) — the
 /// tunnel stays up as long as this entry lives, and is torn down on disconnect.
 struct ConnEntry {
@@ -144,6 +132,12 @@ impl Server {
     /// Handle one request and emit its response line.
     pub async fn handle(&self, req: Request) {
         let id = req.id;
+        // query.execute sends its own response BEFORE spawning its worker (see `execute`), guaranteeing the
+        // response precedes any query.state notification for that call.
+        if req.method == "query.execute" {
+            self.execute(id, req.params).await;
+            return;
+        }
         let result = self.dispatch(&req.method, req.params).await;
         let line = match result {
             Ok(v) => rpc::response_ok(id, v),
@@ -164,9 +158,9 @@ impl Server {
             "schema.columns" => self.columns(params).await,
             "schema.indexes" => self.indexes(params).await,
             "schema.ddl" => self.ddl(params).await,
-            "query.execute" => self.execute(params).await,
             "query.page" => self.page(params).await,
             "query.cancel" => self.cancel(params).await,
+            "query.release" => self.release(params).await,
             "query.cell" => self.cell(params).await,
             other => Err(anyhow::anyhow!("unknown method '{other}'")),
         }
@@ -258,7 +252,7 @@ impl Server {
     async fn test_endpoint(spec: &ConnSpec, meta: &'static DriverMeta) -> anyhow::Result<String> {
         if let Some(fp) = meta.params.iter().find(|p| matches!(p.kind, ParamType::File)) {
             let raw = spec.param(fp.key)?;
-            let path = expand_tilde(raw);
+            let path = crate::spec::expand_tilde(raw);
             let md = std::fs::metadata(&path).map_err(|e| anyhow::anyhow!("cannot stat '{path}': {e}"))?;
             if !md.is_file() {
                 return Err(anyhow::anyhow!("'{path}' is not a regular file"));
@@ -455,20 +449,33 @@ impl Server {
 
     // ── query ────────────────────────────────────────────────────────────────
 
-    async fn execute(&self, params: Json) -> anyhow::Result<Json> {
+    /// query.execute is special: it sends its OWN response (the call_id) BEFORE spawning the worker, so the
+    /// response provably precedes any `query.state` notification that worker emits on the single-writer
+    /// channel — otherwise a microsecond statement could beat the response, and the Lua watcher (registered
+    /// in the response callback) would miss the state and show the call "running" forever.
+    async fn execute(&self, id: u64, params: Json) {
         #[derive(Deserialize)]
         struct P {
             conn_id: u64,
             statement: String,
         }
-        let p: P = serde_json::from_value(params)?;
-        let conn = self.conn(p.conn_id)?;
+        let p: P = match serde_json::from_value(params) {
+            Ok(p) => p,
+            Err(e) => return self.send(rpc::response_err(id, &e.to_string())),
+        };
+        let conn = match self.conn(p.conn_id) {
+            Ok(c) => c,
+            Err(e) => return self.send(rpc::response_err(id, &e.to_string())),
+        };
 
         let call_id = self.inner.next_call.fetch_add(1, Ordering::Relaxed);
         let call = Arc::new(AsyncMutex::new(Call::new()));
         self.inner.calls.lock().unwrap().insert(call_id, call.clone());
 
-        // Run the statement in the background; respond with the call_id now.
+        // Respond with the call_id NOW — before the worker below can emit a state notification.
+        self.send(rpc::response_ok(id, json!({ "call_id": call_id })));
+
+        // Run the statement in the background.
         let server = self.clone();
         tokio::spawn(async move {
             let started = Instant::now();
@@ -482,6 +489,9 @@ impl Server {
 
             let ms = started.elapsed().as_millis() as u64;
             let mut c = call.lock().await;
+            // Drop the cancel handle the moment the call leaves the running state — a stale handle taken by a
+            // late query.cancel would fire a connection-level cancel against whatever that connection runs NEXT.
+            c.cancel = None;
             if c.status == CallStatus::Cancelled {
                 server.notify_state(call_id, CallStatus::Cancelled, ms, None, None);
                 return;
@@ -502,8 +512,6 @@ impl Server {
                 }
             }
         });
-
-        Ok(json!({ "call_id": call_id }))
     }
 
     fn notify_state(&self, call_id: u64, status: CallStatus, ms: u64, error: Option<String>, affected: Option<u64>) {
@@ -605,6 +613,19 @@ impl Server {
         if let Some(h) = handle {
             h.cancel().await?;
         }
+        Ok(json!({}))
+    }
+
+    /// Drop a finished call's server-side buffer (all its paged rows). The Lua client releases the call_id it
+    /// replaces on the next run and the temporary count call, so the calls map does not grow without bound
+    /// across a long browsing session. The log's rerun re-executes by STATEMENT, never by old call_id.
+    async fn release(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            call_id: u64,
+        }
+        let p: P = serde_json::from_value(params)?;
+        self.inner.calls.lock().unwrap().remove(&p.call_id);
         Ok(json!({}))
     }
 

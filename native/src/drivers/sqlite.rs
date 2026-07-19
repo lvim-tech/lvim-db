@@ -63,7 +63,7 @@ impl Driver for SqliteDriver {
     }
 
     async fn connect(&self, spec: &ConnSpec, _net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
-        let file = spec.param("file")?.to_string();
+        let file = crate::spec::expand_tilde(spec.param("file")?);
         let conn = tokio::task::spawn_blocking(move || {
             if file == ":memory:" {
                 SqliteConn::open_in_memory()
@@ -106,12 +106,16 @@ impl SqliteConnection {
         let arc = self.conn.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let conn = arc.lock().unwrap();
-            let mut stmt = conn.prepare(&sql).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let stmt = conn.prepare(&sql).map_err(|e| anyhow::anyhow!("{e}"))?;
             let ncol = stmt.column_count();
             if ncol == 0 {
-                let affected = stmt.execute([]).map_err(|e| anyhow::anyhow!("{e}"))?;
-                return Ok((Vec::new(), Vec::new(), Some(affected as u64)));
+                // Run the ENTIRE batch — `prepare` parses only the FIRST statement, so a multi-statement
+                // migration would otherwise execute only its first `;` silently. execute_batch runs them all.
+                drop(stmt);
+                conn.execute_batch(&sql).map_err(|e| anyhow::anyhow!("{e}"))?;
+                return Ok((Vec::new(), Vec::new(), Some(conn.changes())));
             }
+            let mut stmt = stmt;
             let columns: Vec<Column> = stmt
                 .column_names()
                 .into_iter()

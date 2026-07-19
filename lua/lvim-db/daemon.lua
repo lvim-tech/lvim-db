@@ -147,6 +147,16 @@ local function on_stdout(data)
     end
 end
 
+---@type fun(err: string?)[] callbacks run when the daemon tears down (e.g. to fail in-flight call watchers)
+local teardown_hooks = {}
+
+--- Register a callback invoked whenever the daemon tears down (crash / exit / failed start). Used by the
+--- client layer to fail state watchers that `pending` (request callbacks) does not cover.
+---@param cb fun(err: string?)
+function M.on_teardown(cb)
+    teardown_hooks[#teardown_hooks + 1] = cb
+end
+
 --- Tear down all state after the process exits or fails to start.
 ---@param err string?
 local function teardown(err)
@@ -164,6 +174,10 @@ local function teardown(err)
     ensure_waiters = {}
     for _, cb in ipairs(waiters) do
         pcall(cb, false, err or "daemon stopped")
+    end
+    -- let the client layer fail anything requests/waiters do not cover (e.g. query.state watchers)
+    for _, hook in ipairs(teardown_hooks) do
+        pcall(hook, err)
     end
 end
 
@@ -183,7 +197,13 @@ local function handshake()
         local waiters = ensure_waiters
         ensure_waiters = {}
         if err or type(result) ~= "table" then
-            teardown(err or "handshake failed")
+            local msg = err or "handshake failed"
+            teardown(msg)
+            -- teardown flushes the (now-empty) module list, so the CAPTURED waiters must be answered here —
+            -- else every ensure/request caller hangs forever on a bad/malformed hello.
+            for _, cb in ipairs(waiters) do
+                pcall(cb, false, msg)
+            end
             return
         end
         proto = tonumber(result.proto)

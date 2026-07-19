@@ -773,7 +773,14 @@ local function toggle(open)
             -- cache). A refetch is the `refresh` key's job, not an accident of collapsing and reopening.
             local db = require("lvim-db")
             local ref = { name = obj.name, schema = row.schema.name }
-            local done = function(list)
+            local done = function(list, err)
+                -- On an RPC error do NOT cache an empty answer (that would remember the object as keyless /
+                -- column-less → wrongly read-only until a manual refresh) and do NOT open the branch — surface
+                -- the reason and let the next expand retry. "no X" and "could not ask X" must not look the same.
+                if err then
+                    vim.notify("lvim-db: " .. tostring(err), vim.log.levels.WARN)
+                    return
+                end
                 if h.id == "columns" then
                     obj.columns = list or {}
                 else
@@ -1124,6 +1131,12 @@ local function set_keys(chassis_map)
                 message = ("Delete saved connection '%s'?"):format(row.conn.name),
                 callback = function(yes)
                     if yes then
+                        -- Drop the LIVE daemon link (and any SSH tunnel it owns) before forgetting the row —
+                        -- else load_connections discards the conn_id and the daemon keeps the connection open
+                        -- until it exits.
+                        if row.conn.conn_id then
+                            require("lvim-db").disconnect(row.conn.conn_id, function() end)
+                        end
                         require("lvim-db").store.remove_connection(row.conn.name)
                         load_connections()
                         render()
