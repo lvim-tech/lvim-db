@@ -12,6 +12,7 @@ CONTENTS                                                          *lvim-db*
   7. Architecture ................... |lvim-db-architecture|
   8. API ............................ |lvim-db-api|
   9. Command ........................ |lvim-db-command|
+     The query editor ............... |lvim-db-editor|
   10. Health ........................ |lvim-db-health|
 
 ==============================================================================
@@ -68,14 +69,12 @@ setup() merges your options into the live config. The full defaults: >lua
       daemon_path = nil,              -- nil ⇒ probe $LVIM_DB_DAEMON, native/build,
                                       --      native/target/release
       page_size = 50,                 -- rows loaded per page (the N in `1–N/total`)
+      drawer_width = 36,              -- width (columns) of the drawer side panel
       confirm_destructive = true,     -- prompt before a destructive statement
-      destructive_patterns = {        -- case-insensitive Lua patterns
-          "^%s*drop%s",
-          "^%s*truncate%s",
-          "^%s*delete%s+from%s+[^;]-%s*;?%s*$",
-          "^%s*update%s+[^;]-%s+set%s+[^;]-%s*;?%s*$",
+      destructive_patterns = {        -- ALWAYS-destructive patterns (DROP/TRUNCATE);
+          "^%s*drop%s",               -- a DELETE/UPDATE with no WHERE is detected
+          "^%s*truncate%s",           -- separately (a negative check, not a pattern)
       },
-      notes_dir = nil,                -- nil ⇒ stdpath("state")/lvim-db/notes/<conn>/
       data_dir = nil,                 -- nil ⇒ stdpath("data")/lvim-db/
       connect_timeout_ms = 15000,
       warn_on_missing = true,
@@ -102,7 +101,17 @@ setup() merges your options into the live config. The full defaults: >lua
               cancel_edit = "c",      -- editing: discard
               yank = "y", export = "Y", close = "q",
           },
-          form = { test = "t", save = "s", close = "q" },
+          editor = {                  -- the query editor (an editable buffer —
+              run_statement = "<CR>", -- chords/leader sequences, never bare letters)
+              run_selection = "<CR>", -- VISUAL: run the selection
+              run_buffer = "<localleader>R",
+              save_query = "<localleader>w",
+              help = "<localleader>?",
+          },
+          form = {
+              test = "t", save = "s", close = "q",
+              keyring = "K",          -- Auth tab: store the secret in lvim-keyring
+          },
       },
   })
 <
@@ -294,8 +303,9 @@ All calls are asynchronous (the daemon is spawned + handshaken on first use).
                         the session (expanded/connected connections, the current
                         result / call log) is PRESERVED for the next open/toggle
 `:LvimDb add`           add a saved connection (the DriverMeta-driven tabs form)
-`:LvimDb notes`         open the notes picker for a saved connection
 `:LvimDb log`           show the call-log tab in the result dock
+`:LvimDb keyring-migrate`  move plaintext saved secrets into the lvim-keyring
+                        wallet (fields rewritten to `{{ vault "db/<name>" }}`)
 `:LvimDb status`        a one-line backend/store status snapshot
 `:LvimDb health`        open :checkhealth lvim-db
 
@@ -419,14 +429,55 @@ writing a quoted string where the engine expected a parsed value. MongoDB is the
 exception: a nested document / array edits as extended JSON, and an ObjectId /
 Date / Decimal128 round-trips through its BSON type.
 
-Notes: per-connection scratch SQL as real files under
-stdpath("state")/lvim-db/notes/<conn>/ (opened as `sql` buffers). In a note the
-run maps execute SQL against the connection:
-  <Plug>(LvimDbRunBuffer)     run the whole buffer     (default <localleader>r)
-  <Plug>(LvimDbRunSelection)  run the visual selection (default <localleader>r)
-Every free-text run passes the DESTRUCTIVE-STATEMENT GUARD: a DROP / TRUNCATE, or
-a DELETE / UPDATE with no WHERE, prompts a confirm before executing (config
-`confirm_destructive`).
+THE QUERY EDITOR                                           *lvim-db-editor*
+
+The workspace's top-right window is a real, editable SQL buffer that PERSISTS
+across :LvimDb close/reopen (unsaved SQL survives a teardown). It runs against
+the ACTIVE connection — bound by connecting/selecting a connection in the tree
+and shown in the editor's TITLE BAND (`EDITOR ➤ <conn>` — the blue centred winbar every
+lvim-tech panel carries); with none bound, a run
+first opens a picker of the saved connections.
+
+  <CR>              NORMAL: run the STATEMENT UNDER THE CURSOR (the buffer is
+                    split on top-level `;`, respecting strings and comments);
+                    VISUAL: run the selection verbatim
+  <localleader>R    run the whole buffer as one statement
+  <localleader>w    save the buffer as a NAMED QUERY (active connection)
+  <localleader>?    the editor's keymap cheatsheet
+
+The same actions are BUTTONS on a bar along the editor's bottom row (clickable,
+rebuilt from the live `keys.editor` config — a key set to `false` drops its
+chip).
+
+Saved queries live in lvim-db's own store and are listed in the tree under each
+connection's "Queries" branch; <CR> there loads one back into the editor (and
+binds its connection). Every free-text run passes the DESTRUCTIVE-STATEMENT
+GUARD: a DROP / TRUNCATE, or a DELETE / UPDATE with no WHERE, prompts a confirm
+before executing (config `confirm_destructive`).
+
+Language tooling ~
+
+The buffer's filetype is genuine `sql`. A scratch buffer never triggers
+lvim-installer's automatic on-open offer, so the editor asks for the unified
+install prompt itself the first time it opens — the `sql` treesitter parser
+(and any LSP tools registered for the filetype) are offered right there.
+
+Per-driver grammar: for a MongoDB connection the statements are extended-JSON
+commands, so binding one switches the buffer's treesitter GRAMMAR to `json`
+through lvim-ts's buffer-local `b:lvim_ts_lang` seam — the filetype does not
+change, so SQL tooling stays attached.
+
+Schema completion: lvim-db registers its own lvim-cmp source, fed by the
+daemon — a plain keyword completes the active connection's schema and object
+names (tables / views / collections), and `object.` completes that object's
+COLUMNS with their types. It works for every driver (including MongoDB and
+Redis, which no SQL language server covers) and never hands credentials to an
+external tool. Disable it via lvim-cmp: >lua
+  require("lvim-cmp").setup({ sources = { ["lvim-db"] = { enabled = false } } })
+<
+LSP: the filetype is real `sql`, so any SQL language server your config wires
+for that filetype attaches to the editor like to any file; lvim-db configures
+none itself.
 
 ==============================================================================
 10. HEALTH                                                 *lvim-db-health*

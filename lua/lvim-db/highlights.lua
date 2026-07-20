@@ -80,12 +80,7 @@ function M.build()
         LvimDbEmpty = { fg = c.comment, italic = true },
         LvimDbDriver = { fg = c.yellow }, -- a driver-kind badge
 
-        -- SQL editor winbar ("editor → <conn>"): the icon, the "editor" label, the bound connection name
-        -- (green — matches a live connection), and the "(no connection)" placeholder when nothing is bound.
-        LvimDbEditorIcon = { fg = c.blue },
-        LvimDbEditorLabel = { fg = c.fg_dark },
-        LvimDbEditorConn = { fg = c.green, bold = true },
-        LvimDbEditorNone = { fg = c.comment, italic = true },
+        -- (The editor's winbar is the shared native-title band — `LvimUiPeekTitle` — not per-plugin groups.)
 
         -- result grid
         LvimDbHeader = { fg = c.blue, bg = mtint(c.blue, 0.2), bold = true }, -- column header row

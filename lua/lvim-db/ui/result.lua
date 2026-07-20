@@ -1450,7 +1450,8 @@ function header_spec()
                 title_counter = true,
                 text = title_left(),
                 count = range_text,
-                hl = "LvimUiPeekTitle",
+                -- No `hl`/`text_hl`: the band takes the canon — a blue strip that deepens while the dock has
+                -- focus, with the title fg-only ON it — and the counter keeps its green badge.
                 count_hl = "LvimUiPeekCounter",
                 title_pos = "left",
             },

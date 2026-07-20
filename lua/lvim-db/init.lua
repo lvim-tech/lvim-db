@@ -97,6 +97,13 @@ function M.setup(opts)
     if ok_cursor and cursor.register then
         cursor.register({ panel_ft = { "lvim-db-drawer", "lvim-db-result" } })
     end
+    -- Register the schema completion source with lvim-cmp (pcall — lvim-cmp is optional): the
+    -- query editor completes schema/object names and, after `object.`, its columns — served by
+    -- the daemon (see lvim-db.cmp). Priority ABOVE the lsp source: the daemon knows the REAL
+    -- schema of the active connection; a generic SQL server only knows its keywords.
+    pcall(function()
+        require("lvim-cmp").register_source(require("lvim-db.cmp"), { priority = 110, min_keyword_length = 1 })
+    end)
     require("lvim-db.commands").setup()
 end
 
@@ -185,6 +192,7 @@ end
 ---@param conn_id integer
 ---@param cb? fun(err: string?)
 function M.disconnect(conn_id, cb)
+    require("lvim-db.cmp").invalidate(conn_id) -- drop the completion source's schema cache with the link
     daemon.request("conn.disconnect", { conn_id = conn_id }, function(_, err)
         if cb then
             cb(err)

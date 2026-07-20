@@ -2,7 +2,20 @@
 --
 -- A genuine EDITABLE scratch buffer (filetype `sql`, so treesitter / LSP / lvim-cmp all work on it),
 -- kept as a nofile scratch that PERSISTS across `:LvimDb close`/reopen — the module holds the buffer
--- handle, so its unsaved SQL survives a workspace teardown. The user writes SQL here and runs it:
+-- handle, so its unsaved SQL survives a workspace teardown.
+--
+-- LANGUAGE TOOLING — three layers, all through the ecosystem's own seams:
+--   • COLOURING (treesitter): the buffer is real `sql`; because a scratch buffer never triggers
+--     lvim-installer's automatic on-open offer, `ensure_buf` explicitly offers the unified install
+--     prompt for the `sql` tooling (parser + LSP tools) via the manual `offer` API. Per-DRIVER
+--     grammar: a MongoDB connection's statements are extended-JSON, so `set_active` switches the
+--     buffer's GRAMMAR (not its filetype) through lvim-ts's `b:lvim_ts_lang` seam (DRIVER_LANG).
+--   • LSP: the ft is genuine `sql`, so any SQL language server the user's config wires for that
+--     filetype attaches here like on any file — lvim-db configures none itself.
+--   • SCHEMA COMPLETION (lvim-cmp): `lvim-db.cmp` completes the ACTIVE connection's real
+--     schemas/objects/columns straight from the daemon — see that module.
+--
+-- The user writes SQL here and runs it:
 --   • NORMAL <CR>  — run the STATEMENT UNDER THE CURSOR (the buffer is split into statements on `;`,
 --                    respecting string literals and comments; the one spanning the cursor line runs).
 --   • VISUAL <CR>  — run the current selection verbatim.
@@ -33,6 +46,12 @@ local M = {}
 -- The buffer-local marker (a var, NOT the filetype — the filetype is real `sql`) by which the
 -- workspace re-finds the editor window on a reopen.
 local MARK = "lvim_db_editor"
+-- Per-DRIVER grammar for the editor buffer: the filetype stays real `sql` (so LSP servers and
+-- lvim-cmp attach to it), but the treesitter GRAMMAR follows the active connection's statement
+-- dialect — MongoDB statements are extended-JSON commands, not SQL. Applied through lvim-ts's
+-- buffer-local `b:lvim_ts_lang` seam; drivers absent from this map use the ft's own grammar (sql).
+---@type table<string, string>
+local DRIVER_LANG = { mongodb = "json" }
 -- The buffer-local var remembering which saved query (name) the buffer was last loaded from, so
 -- `save_query` can default to that name.
 local QNAME = "lvim_db_query_name"
@@ -196,22 +215,15 @@ local function with_conn(conn_name, cb)
     end)
 end
 
---- The editor window's winbar string for the current active connection.
+--- The editor window's winbar string for the current active connection — the NATIVE-SPLIT TITLE
+--- canon (the drawer's "DATABASES" band): the whole bar wears the blue peek-title tint (set as
+--- WinBar in the window's winhighlight, below) and the text sits centred: `EDITOR ➤ <conn>`.
 ---@return string
 local function winbar_text()
-    local ico = "" -- nf-fa-terminal (U+F120): the editor
     local arrow = "➤" -- the set-wide separator/pointer
-    if state.active then
-        return (" %%#LvimDbEditorIcon#%s %%#LvimDbEditorLabel#editor %s %%#LvimDbEditorConn#%s"):format(
-            ico,
-            arrow,
-            (state.active:gsub("%%", "%%%%")) -- escape % so a connection named `a%b` can't corrupt the winbar
-        )
-    end
-    return (" %%#LvimDbEditorIcon#%s %%#LvimDbEditorLabel#editor %s %%#LvimDbEditorNone#(no connection)"):format(
-        ico,
-        arrow
-    )
+    local name = state.active and (state.active:gsub("%%", "%%%%")) -- escape % against a `a%b` name
+        or "(no connection)"
+    return ("%%=EDITOR %s %s%%="):format(arrow, name)
 end
 
 --- Repaint the editor window's winbar (no-op when the workspace / editor window is not present).
@@ -219,16 +231,58 @@ function M.update_winbar()
     local win = require("lvim-db.ui.workspace").editor_win()
     if win and api.nvim_win_is_valid(win) then
         pcall(function()
+            -- The blue title band exactly like a native-split surface title (drawer/outline).
+            -- Deeper tint while the editor is the CURRENT window (WinBar), resting tint otherwise (WinBarNC).
+            vim.wo[win].winhighlight = "WinBar:LvimUiPeekTitleHover,WinBarNC:LvimUiPeekTitle"
             vim.wo[win].winbar = winbar_text()
         end)
     end
 end
 
---- Bind `conn_name` as the editor's active connection and refresh the winbar. nil clears it.
+--- Offer the unified install prompt for `ft`'s tooling (its treesitter parser + any missing
+--- LSP tools). The editor is a SCRATCH buffer, so lvim-installer's automatic on-open offer
+--- (real file buffers only, by design) never fires for it — the manual `offer` API is the
+--- sanctioned seam for exactly this. The installer dedupes/snoozes/persists declines itself,
+--- and shows nothing when nothing is missing.
+---@param ft string
+local function offer_tooling(ft)
+    local ok_installer, installer = pcall(require, "lvim-installer")
+    if ok_installer and installer.offer then
+        installer.offer(ft)
+    end
+end
+
+--- Re-resolve the editor buffer's treesitter GRAMMAR from the active connection's driver
+--- (see DRIVER_LANG) and re-activate lvim-ts when it changed. No-op before the buffer exists.
+local function apply_lang()
+    if not (state.buf and api.nvim_buf_is_valid(state.buf)) then
+        return
+    end
+    local lang = nil ---@type string?
+    if state.active then
+        local saved = require("lvim-db").store.get_connection(state.active)
+        lang = saved and DRIVER_LANG[saved.driver] or nil
+    end
+    if vim.b[state.buf].lvim_ts_lang == lang then
+        return
+    end
+    vim.b[state.buf].lvim_ts_lang = lang
+    if lang then
+        offer_tooling(lang) -- the override grammars map 1:1 to a filetype (json), so ft == lang
+    end
+    local ok_ts, ts = pcall(require, "lvim-ts")
+    if ok_ts and ts.activate then
+        ts.activate(state.buf)
+    end
+end
+
+--- Bind `conn_name` as the editor's active connection, refresh the winbar and re-resolve the
+--- buffer's grammar for the connection's dialect. nil clears it.
 ---@param conn_name string?
 function M.set_active(conn_name)
     state.active = conn_name
     M.update_winbar()
+    apply_lang()
 end
 
 -- ── running ───────────────────────────────────────────────────────────────────
@@ -427,6 +481,61 @@ local function show_help()
     })
 end
 
+-- ── the footer button bar ─────────────────────────────────────────────────────
+
+--- A key's DISPLAY form for the footer chips: `<localleader>` resolved to the user's actual
+--- leader (space reads "SPC"), `<CR>` to the return glyph — so a chip shows the key a finger
+--- actually presses, not the mapping notation.
+---@param lhs string|false
+---@return string?
+local function pretty_key(lhs)
+    if type(lhs) ~= "string" then
+        return nil
+    end
+    local ll = vim.g.maplocalleader or "\\"
+    if ll == " " then
+        ll = "SPC "
+    end
+    local s = lhs:gsub("<localleader>", ll):gsub("<CR>", "⏎"):gsub("<Esc>", "Esc")
+    return s
+end
+
+---@type table?  the attached footer-bar handle (an LvimUiWinFooter; closed with its window)
+local footer_handle = nil
+
+--- The editor's footer chips, from the LIVE `config.keys.editor` (a key set to `false` drops
+--- its chip). Display + click only — the keys themselves are bound buffer-locally in set_keys.
+---@return table[]
+local function footer_items()
+    local surface = require("lvim-ui.surface")
+    local k = config.keys.editor
+    local defs = {
+        { key = k.run_statement, name = "run", run = M.run_statement },
+        { key = k.run_buffer, name = "run buffer", run = M.run_buffer },
+        { key = k.save_query, name = "save query", run = M.save_query },
+        { key = k.help, name = "help", run = show_help },
+    }
+    local items = {}
+    for _, d in ipairs(defs) do
+        local disp = pretty_key(d.key)
+        if disp then
+            items[#items + 1] = surface.button({ name = d.name, key = disp, style = "action", run = d.run }, "action")
+        end
+    end
+    return items
+end
+
+--- Attach (or re-attach) the button bar to the editor's window — called by the workspace when it
+--- hosts the editor. The bar auto-closes with its window, so a re-open just attaches a fresh one.
+---@param win integer
+function M.attach_footer(win)
+    if footer_handle then
+        footer_handle.close()
+        footer_handle = nil
+    end
+    footer_handle = require("lvim-ui.winfooter").attach(win, { items = footer_items(), align = "center" })
+end
+
 -- ── buffer setup ──────────────────────────────────────────────────────────────
 
 --- Install the editor's buffer-local keymaps (all from `config.keys.editor`; a `false` value leaves
@@ -474,6 +583,9 @@ function M.ensure_buf()
     vim.bo[buf].swapfile = false
     vim.bo[buf].filetype = "sql" -- REAL sql, so treesitter / LSP / lvim-cmp all work here
     vim.b[buf][MARK] = true
+    -- lvim-cmp skips scratch buffers (they are usually UI); this one is a genuine editor —
+    -- opt it in through the buffer-local seam so completion runs like on a real file.
+    vim.b[buf].lvim_cmp_enable = true
     api.nvim_buf_set_lines(buf, 0, -1, false, {
         "-- lvim-db SQL editor",
         "-- <CR> runs the statement under the cursor · visual <CR> runs the selection",
@@ -482,6 +594,10 @@ function M.ensure_buf()
     })
     set_keys(buf)
     state.buf = buf
+    -- The scratch buffer never triggers lvim-installer's automatic offer, so ask for the sql
+    -- tooling (treesitter parser / LSP server) explicitly the one time the editor is created.
+    offer_tooling("sql")
+    apply_lang() -- a connection may already be active (bound from the drawer before the first open)
     return buf
 end
 
