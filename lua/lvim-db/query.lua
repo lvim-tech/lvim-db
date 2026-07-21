@@ -336,6 +336,34 @@ function M.update_row(driver, schema, object, set, where)
     return ("UPDATE %s;"):format(body)
 end
 
+--- REPLACE a whole MongoDB document, addressed by its `_id`. `doc` is the edited document as decoded
+--- extended JSON (`_id` as `{ ["$oid"] = … }`, dates as `{ ["$date"] = … }`, etc.) — exactly what the
+--- driver's `Bson::try_from` reads back into real BSON. The replacement `u` carries NO update operators, so
+--- mongo treats it as a full document replacement; `multi = false` keeps it to the one addressed document.
+---
+--- Mongo only: no other engine has a whole-row "replace this document" that a JSON edit maps onto (a SQL row
+--- is columns, edited per column through `update_row`).
+---@param driver string
+---@param object string          the collection
+---@param doc table              the edited document (decoded extended JSON)
+---@return string?, string?      the command, or nil + why
+function M.replace_document(driver, object, doc)
+    if driver ~= "mongodb" then
+        return nil, "whole-document replace is a MongoDB operation"
+    end
+    if type(doc) ~= "table" then
+        return nil, "the document is not a JSON object"
+    end
+    local id = doc._id
+    if id == nil then
+        return nil, "the document has no _id — it cannot be addressed for replacement"
+    end
+    return vim.json.encode({
+        update = object,
+        updates = { { q = { _id = id }, u = doc, multi = false } },
+    })
+end
+
 --- `CREATE INDEX` for `driver`. `columns` is a list; `unique` is ignored by engines that have no such notion.
 ---@param driver string
 ---@param schema string?

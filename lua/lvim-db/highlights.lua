@@ -85,6 +85,10 @@ function M.build()
         -- result grid
         LvimDbHeader = { fg = c.blue, bg = mtint(c.blue, 0.2), bold = true }, -- column header row
         LvimDbHeaderActive = { fg = c.blue, bg = mtint(c.blue, 0.4), bold = true },
+        -- Row-popup field boxes: the column-name is a RED tinted box (uniform for every field); the leading
+        -- type ICON gets its own YELLOW box — the two accents read apart, key vs kind.
+        LvimDbRowKey = { fg = c.red, bg = mtint(c.red, 0.2) }, -- a field's name box (uniform for every field)
+        LvimDbRowIcon = { fg = c.yellow, bg = mtint(c.yellow, 0.28) }, -- the field's type-icon box
         -- The dock's header TAB reflecting the active view (Result ⇄ Call log). A SOLID bg across the whole
         -- button — badge, label and padding all wear this one group, so the active tab reads as a filled block
         -- (not a fg-only accent), independent of which sector has focus. The inactive tab keeps the plain

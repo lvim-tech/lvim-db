@@ -186,6 +186,105 @@ local function rtrim(s)
     return (s:gsub("%s+$", ""))
 end
 
+--- Re-indent a COMPACT json string (what `vim.json.encode` emits — no whitespace) into a readable one.
+--- A string REFORMATTER, not a re-encoder: it walks the valid json text and inserts newlines + 2-space
+--- indent around structural punctuation, leaving values byte-for-byte intact. Working on the text (rather
+--- than re-encoding a Lua table) sidesteps the array-vs-object ambiguity of an empty Lua table, and keeps
+--- extended-JSON forms (`{"$oid": …}`) exactly as they were.
+---@param s string
+---@return string
+local function pretty_json(s)
+    local out, indent, i, n = {}, 0, 1, #s
+    local in_str, esc = false, false
+    local function nl()
+        out[#out + 1] = "\n" .. string.rep("  ", indent)
+    end
+    while i <= n do
+        local c = s:sub(i, i)
+        if in_str then
+            out[#out + 1] = c
+            if esc then
+                esc = false
+            elseif c == "\\" then
+                esc = true
+            elseif c == '"' then
+                in_str = false
+            end
+        elseif c == '"' then
+            in_str = true
+            out[#out + 1] = c
+        elseif c == "{" or c == "[" then
+            local nxt = s:sub(i + 1, i + 1)
+            if nxt == "}" or nxt == "]" then
+                out[#out + 1] = c .. nxt -- an empty container stays on one line
+                i = i + 1
+            else
+                indent = indent + 1
+                out[#out + 1] = c
+                nl()
+            end
+        elseif c == "}" or c == "]" then
+            indent = math.max(0, indent - 1)
+            nl()
+            out[#out + 1] = c
+        elseif c == "," then
+            out[#out + 1] = c
+            nl()
+        elseif c == ":" then
+            out[#out + 1] = ": "
+        else
+            out[#out + 1] = c
+        end
+        i = i + 1
+    end
+    return table.concat(out)
+end
+
+-- Per-VALUE type icons for the row popup's field keys (all single-width Nerd codepoints, verified). Built
+-- with nr2char so the glyphs are never mangled in source; a field shows WHAT KIND of value it holds.
+---@type table<string, string>
+local TYPE_ICON = {
+    key = vim.fn.nr2char(0xEA93), -- ObjectId / id
+    number = vim.fn.nr2char(0xEA90), -- number
+    date = vim.fn.nr2char(0xF00ED), -- date/time
+    bool = vim.fn.nr2char(0xEA8F), -- boolean
+    string = vim.fn.nr2char(0xEB8D), -- string
+    json = vim.fn.nr2char(0xEB0F), -- nested document / array / json
+    null = vim.fn.nr2char(0xEABD), -- null / bytes
+}
+
+--- The type icon for a raw cell value — ObjectId, number, date, bool, document, null, or plain string.
+---@param raw any
+---@return string
+local function value_icon(raw)
+    if raw == nil or raw == vim.NIL then
+        return TYPE_ICON.null
+    end
+    local t = type(raw)
+    if t == "number" then
+        return TYPE_ICON.number
+    end
+    if t == "boolean" then
+        return TYPE_ICON.bool
+    end
+    if t == "table" then
+        if raw.__oid ~= nil then
+            return TYPE_ICON.key
+        end
+        if raw.__int ~= nil then
+            return TYPE_ICON.number
+        end
+        if raw.__ext ~= nil then
+            return raw.__ext == "$date" and TYPE_ICON.date or TYPE_ICON.number
+        end
+        if raw.__bytes ~= nil then
+            return TYPE_ICON.null
+        end
+        return TYPE_ICON.json -- a nested document or array
+    end
+    return TYPE_ICON.string
+end
+
 --- Render one cell value to a display string + a highlight group.
 ---@param v any
 ---@return string text, string? hl
@@ -1121,6 +1220,28 @@ end
 --- would be several rows of chrome anchored to the cell, with the field itself landing over the wrong row.
 --- Seeded from the RAW value, never from the rendered cell, so a truncated or flattened value is edited
 --- whole.
+--- Which edit surface fits a value — see `edit_cell`. The rule the user asked for: a value that fits the
+--- CELL edits in the cell; one that overflows the cell but still fits the whole ROW edits across the row;
+--- anything longer, or MULTI-LINE / a document (JSON, code, paragraphs), edits in the full bottom PANEL.
+---@param disp string       the value's display text (may contain newlines)
+---@param is_doc boolean    a formatted value (document / json / multi-line) — always the panel
+---@param col_width integer the cell's column width, in cells
+---@param row_width integer the whole grid's usable width, in cells
+---@return "cell"|"row"|"panel"
+local function edit_mode(disp, is_doc, col_width, row_width)
+    if is_doc or disp:find("\n") then
+        return "panel"
+    end
+    local w = strwidth(flatten(disp))
+    if w <= col_width then
+        return "cell"
+    end
+    if w <= row_width then
+        return "row"
+    end
+    return "panel"
+end
+
 local function edit_cell()
     local e, g = state.edit, state.grid
     if not (e and g and state.win and api.nvim_win_is_valid(state.win)) then
@@ -1140,6 +1261,53 @@ local function edit_cell()
     else
         raw = e.row[ci]
     end
+
+    -- Mongo's synthetic `_document` cell is the WHOLE document (relaxed extended JSON). It is not a per-field
+    -- edit — it opens as pretty JSON in the panel editor and saves as a document REPLACE (by `_id`), a path
+    -- of its own that never touches the per-column pending set.
+    if state.driver == "mongodb" and col.name == "_document" then
+        local o = state.origin
+        if not (o and o.object) then
+            vim.notify("lvim-db: this result has no addressable collection", vim.log.levels.WARN)
+            return
+        end
+        local pretty = pretty_json((vim.json.encode(raw)))
+        require("lvim-ui").input({
+            title = "_document (JSON)",
+            -- A TALL bottom dock, not an anchor over the grid: the grid window is only as tall as its
+            -- current rows, so anchoring to it made a stubby editor. Docked to the bottom edge at a fixed
+            -- FRACTION OF THE SCREEN, the JSON editor is full-height whatever the grid holds.
+            position = "bottom",
+            width = 1.0,
+            height = math.max(10, math.floor(vim.o.lines * 0.7)),
+            -- Above the docked splits' own decoration layer, so nothing (a drawer/result active-row band)
+            -- shows over the editor.
+            zindex = 250,
+            -- Edit the document as JSON CODE: treesitter highlighting + a json LSP (validation/format) if one
+            -- attaches on the `json` filetype.
+            filetype = "json",
+            default = pretty,
+            callback = function(ok, value)
+                if not ok or not state.edit then
+                    return
+                end
+                local ok_json, doc = pcall(vim.json.decode, value)
+                if not ok_json or type(doc) ~= "table" then
+                    vim.notify("lvim-db: not valid JSON — the document was not saved", vim.log.levels.WARN)
+                    return
+                end
+                local stmt, jwhy = require("lvim-db.query").replace_document(state.driver, o.object, doc)
+                if not stmt then
+                    vim.notify("lvim-db: " .. tostring(jwhy), vim.log.levels.WARN)
+                    return
+                end
+                cancel_edit()
+                M.write(stmt)
+            end,
+        })
+        return
+    end
+
     -- Guard the field BEFORE opening: a binary / non-mongo-structured cell has no faithful text edit, so say
     -- so and do nothing rather than open a field whose save could only be refused or corrupt the value.
     local ok_edit, why = field_editable(raw, state.driver, col.type, col.name)
@@ -1147,52 +1315,109 @@ local function edit_cell()
         vim.notify("lvim-db: " .. tostring(why), vim.log.levels.WARN)
         return
     end
-    require("lvim-ui").input({
-        bare = true,
-        -- the cell's own spot in the grid window's 0-based text coordinates
-        at = { win = state.win, row = e.ri - 1, col = col.start },
-        -- EXACTLY the column's width, so the field sits ON the cell and never spills into the neighbour
-        -- column — the input scrolls a longer value inside itself. A too-long value is what `E` (the full-row
-        -- popup) is for; here the point is that the inline field aligns with the cell it edits.
-        width = col.width,
-        default = (cell_display(raw)),
-        callback = function(ok, value)
-            if not ok or not state.edit then
-                return
+
+    --- The one write path all three surfaces funnel into: coerce the typed text, stash it pending, and
+    --- repaint the cell (cut to the column width so the row stays aligned). Identical whichever editor
+    --- produced `value` — only the editor's geometry differs between the modes.
+    ---@param ok boolean
+    ---@param value any
+    local function apply(ok, value)
+        if not ok or not state.edit then
+            return
+        end
+        local coerced, cerr = coerce(value, e.row[ci], state.driver, col.type, col.name)
+        if cerr then
+            vim.notify("lvim-db: " .. cerr, vim.log.levels.WARN)
+            return
+        end
+        e.pending[ci] = { value = coerced }
+        local text = cut_cells(flatten((cell_display(e.pending[ci].value))), col.width)
+        vim.bo[state.buf].modifiable = true
+        api.nvim_buf_set_text(
+            state.buf,
+            e.ri - 1,
+            cell.bstart,
+            e.ri - 1,
+            cell.bstart + cell.blen,
+            { pad_cells(text, col.width) }
+        )
+        vim.bo[state.buf].modifiable = false
+        -- the byte length of this cell just changed; re-derive the row's geometry so the marks and the
+        -- next edit land on the right bytes
+        local bpos = 1
+        for i = 1, #g.cols do
+            g.rows[e.ri][i].bstart = bpos
+            if i == ci then
+                g.rows[e.ri][i].blen = #pad_cells(text, col.width)
+                g.rows[e.ri][i].text = text
             end
-            local coerced, cerr = coerce(value, e.row[ci], state.driver, col.type, col.name)
-            if cerr then
-                vim.notify("lvim-db: " .. cerr, vim.log.levels.WARN)
-                return
+            bpos = bpos + g.rows[e.ri][i].blen + #SEP
+        end
+        paint_edit()
+    end
+
+    local disp = (cell_display(raw))
+    local win_w = api.nvim_win_get_width(state.win)
+    -- A document/json cell (a NESTED table, or a json/jsonb column) always earns the panel — its text is
+    -- formatted and a one-line field cannot show it. But a TAGGED SCALAR is also a table (`{__oid}` for an
+    -- ObjectId, `{__int}` a big int, `{__ext}` a date/decimal, `{__bytes}`) and renders as a SHORT string —
+    -- it is not a document and must be placed by width like any scalar, so an `_id` edits on its cell, not in
+    -- the panel. A plain string is placed purely by how wide it is.
+    local tagged_scalar = type(raw) == "table"
+        and (raw.__oid ~= nil or raw.__int ~= nil or raw.__ext ~= nil or raw.__bytes ~= nil)
+    local is_doc = (type(raw) == "table" and not tagged_scalar)
+        or (type(col.type) == "string" and col.type:upper():find("JSON") ~= nil)
+        or disp:find("\n") ~= nil
+    local mode = edit_mode(disp, is_doc, col.width, win_w - 2)
+
+    if mode == "panel" then
+        -- A TALL bottom-docked editor for a long or formatted value (code, JSON, paragraphs). Docked at a
+        -- fraction of the SCREEN rather than anchored over the grid window (which is only as tall as its
+        -- current rows), so it is full-height regardless. A JSON value (a document, or a `{`/`[`-leading
+        -- string) opens PRETTY-PRINTED so it reads as code; the engine re-parses the whitespace on save.
+        local seed, ft = disp, nil
+        if type(raw) == "table" or disp:match("^%s*[%[{]") then
+            local okp, pj = pcall(pretty_json, disp)
+            if okp then
+                seed, ft = pj, "json" -- edit as JSON code (treesitter + a json LSP if one attaches)
             end
-            e.pending[ci] = { value = coerced }
-            -- Show it: the cell repaints to the new value, cut to the COLUMN's width so the row stays
-            -- aligned with every other row (the grid's widths were measured before this value existed).
-            local text = cut_cells(flatten((cell_display(e.pending[ci].value))), col.width)
-            vim.bo[state.buf].modifiable = true
-            api.nvim_buf_set_text(
-                state.buf,
-                e.ri - 1,
-                cell.bstart,
-                e.ri - 1,
-                cell.bstart + cell.blen,
-                { pad_cells(text, col.width) }
-            )
-            vim.bo[state.buf].modifiable = false
-            -- the byte length of this cell just changed; re-derive the row's geometry so the marks and the
-            -- next edit land on the right bytes
-            local bpos = 1
-            for i = 1, #g.cols do
-                g.rows[e.ri][i].bstart = bpos
-                if i == ci then
-                    g.rows[e.ri][i].blen = #pad_cells(text, col.width)
-                    g.rows[e.ri][i].text = text
-                end
-                bpos = bpos + g.rows[e.ri][i].blen + #SEP
-            end
-            paint_edit()
-        end,
-    })
+        end
+        require("lvim-ui").input({
+            title = col.name,
+            position = "bottom",
+            width = 1.0,
+            height = math.max(10, math.floor(vim.o.lines * 0.7)),
+            zindex = 250,
+            filetype = ft,
+            default = seed,
+            callback = apply,
+        })
+    elseif mode == "row" then
+        -- The full row width: the value overflows its cell but is a single line that fits the grid — a bare
+        -- field spanning the row, so the whole value is visible while typing. Anchored at the grid's current
+        -- LEFTCOL (the leftmost VISIBLE column), not text column 0: when the grid is scrolled right, column 0
+        -- is off-screen and a col-0 anchor would land the field off the left edge. Leftcol pins it to the
+        -- window's left edge whatever the scroll.
+        local leftcol = api.nvim_win_call(state.win, function()
+            return vim.fn.winsaveview().leftcol
+        end)
+        require("lvim-ui").input({
+            bare = true,
+            at = { win = state.win, row = e.ri - 1, col = leftcol },
+            width = win_w - 2,
+            default = disp,
+            callback = apply,
+        })
+    else
+        -- On the cell: the field sits EXACTLY on the column, aligned with the value it edits.
+        require("lvim-ui").input({
+            bare = true,
+            at = { win = state.win, row = e.ri - 1, col = col.start },
+            width = col.width,
+            default = disp,
+            callback = apply,
+        })
+    end
 end
 
 --- `save_edit`: write every changed field as ONE statement.
@@ -1264,16 +1489,61 @@ local function open_row_popup(ri, row, key, readonly)
         -- One typed row per column, holding the value as TEXT. `cell_display` (not tostring) so a NULL shows
         -- as the same `NULL` sentinel the grid uses and round-trips through `coerce` unchanged.
         local rows, orig = {}, {}
+        -- Every label is PADDED to one width, so the coloured key boxes form a single uniform column (the
+        -- tint reaches the same right edge on every row) and the values line up beside them — a keymap
+        -- cheatsheet, not ragged tags. Width is measured in display cells (a Cyrillic column name counts).
+        local key_w = 0
+        for _, col in ipairs(g.cols) do
+            local name = col.name .. (keyed[col.name] and "  (key)" or "")
+            key_w = math.max(key_w, strwidth(name))
+        end
         for ci, col in ipairs(g.cols) do
-            local text = (cell_display(row[ci]))
+            local raw = row[ci]
+            local text = (cell_display(raw))
             orig[ci] = text
+            local name = col.name .. (keyed[col.name] and "  (key)" or "")
+            -- A field is JSON/document when its value is a NESTED table (not a tagged scalar like an
+            -- ObjectId/date) or a json column — same rule as the grid cell editor. Those get the SPECIAL
+            -- float (tall, bottom-docked, treesitter-highlighted, pretty-printed); everything else gets a
+            -- WIDER single-line input than the default.
+            local tagged = type(raw) == "table"
+                and (raw.__oid ~= nil or raw.__int ~= nil or raw.__ext ~= nil or raw.__bytes ~= nil)
+            local is_json = (type(raw) == "table" and not tagged)
+                or (type(col.type) == "string" and col.type:upper():find("JSON") ~= nil)
+                or (col.name == "_document")
+            local edit
+            if is_json then
+                local okp, pj = pcall(pretty_json, text)
+                edit = {
+                    position = "bottom",
+                    width = 1.0,
+                    height = math.max(10, math.floor(vim.o.lines * 0.7)),
+                    zindex = 250,
+                    filetype = "json",
+                    default = okp and pj or text,
+                }
+            else
+                -- FULL width, matching the row popup it opens over — both cover the drawer, so its icons
+                -- never peek beside them, and the whole width makes a long value easy to read/edit.
+                edit = { width = 1.0, width_fixed = true }
+            end
             rows[#rows + 1] = {
                 type = "string",
                 name = "c" .. ci,
-                -- the key columns are marked: they are what addresses the row, and the WHERE uses the value
-                -- they had on open regardless of what is typed here
-                label = col.name .. (keyed[col.name] and "  (key)" or ""),
+                -- A per-VALUE type icon (flat: it REPLACES the generic string glyph), so the key column shows
+                -- what kind each field is — an ObjectId, a date, a number, a document, … The icon wears its
+                -- own YELLOW box that runs from the row start, cushioned by a space on each side.
+                flat = true,
+                icon = " " .. value_icon(raw) .. " ",
+                icon_hl = "LvimDbRowIcon",
+                -- the key columns are marked (a `(key)` suffix): they are what addresses the row, and the
+                -- WHERE uses the value they had on open regardless of what is typed here.
+                -- The name is a RED key box, padded to ONE width and cushioned by a space on each side (air
+                -- inside the tint); every box is the same width AND the same tint, so they form one column.
+                label = " " .. pad_cells(name, key_w) .. " ",
                 value = text,
+                edit = edit,
+                text_hl = "LvimDbRowKey",
             }
         end
 
@@ -1285,6 +1555,17 @@ local function open_row_popup(ri, row, key, readonly)
                 or ("Edit row — %s"):format(o and o.object or ""),
             title_pos = "center",
             layout = "float",
+            -- Above the docked grid/drawer splits' decoration layer, so their active-row band never draws
+            -- over this popup.
+            zindex = 250,
+            -- FULL editor width. A centred canonical float (0.9) leaves the left DRAWER split's columns
+            -- visible beside it, and its bright devicons read as covering the popup's left edge. Full width
+            -- reaches column 0, so the drawer is covered rather than peeking. (The BACKDROP is still the
+            -- canonical float veil from the central geometry — only the width is overridden here.)
+            width = 1.0,
+            -- No body lead pad: the field rows are icon/name BOXES that carry their own padding, so the tint
+            -- starts right after the frame border instead of two indent spaces in.
+            pad = 0,
             tabs = {
                 {
                     label = "Row",
