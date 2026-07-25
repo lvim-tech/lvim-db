@@ -40,6 +40,12 @@ local subcommands = {
         require("lvim-db.ui.workspace").toggle()
     end,
 
+    --- Toggle the RESULT dock layout: full-width across the bottom (default) ⇄ under the editor (tree
+    --- full-height). The shared lvim-ui.workspace State-1 ⟷ State-2 switch.
+    dock = function()
+        require("lvim-db.ui.workspace").toggle_dock()
+    end,
+
     --- Add a new saved connection (the DriverMeta-driven form).
     add = function()
         require("lvim-db.ui.form").open()

@@ -1941,13 +1941,22 @@ local function open_dock()
     -- sector nav, whose TOP-edge `<C-k>` steps back up to the tree or editor above the cursor column
     -- (escape_to_neighbor). A `<C-j>` from either top window descends onto the result (the chassis WinEnter
     -- hook enters the docked panel).
+    -- The dock geometry comes from the SHARED workspace layout state (`:LvimDb dock` toggles it): "full"
+    -- (default) docks full-width at the tabpage far edge under tree+editor; "stacked" anchors it under the
+    -- editor (tree full-height). One place decides both, so every lvim-tech workspace docks identically.
+    local geom = require("lvim-ui.workspace").dock_split(
+        "lvim-db",
+        require("lvim-db.ui.workspace").editor_win(),
+        { stacked = 0.66, full = 0.35 }
+    )
     state.surface = surface.open({
         mode = "split",
-        dock = "below",
+        dock = geom.dock,
+        anchor = geom.anchor,
         -- No `title` on the surface: the title lives in the header's FIRST band (a `title_counter` row —
         -- `db ➤ object` left, the 1–20/536 counter right — see `header_spec`), so a separate centred brand
         -- would only duplicate it.
-        size = { height = { fixed = math.max(8, math.floor(vim.o.lines * 0.35)) } },
+        size = geom.size,
         -- NO panel border on the result grid — `border = "none"` (not CONTENT_BORDER, the shared blank " "
         -- ring every other content panel uses). The ring's 1-cell side inset is what stopped the STICKY HEADER
         -- (the winbar) from reaching the window edge: its blue filled the text area but not the gutter, so the
