@@ -42,8 +42,6 @@
 
 ---@class LvimDbResultKeys
 ---@field help       string|false  Open the result dock's keymap cheatsheet
----@field result_tab string|false  Show the RESULT view (header button)
----@field log_tab    string|false  Show the CALL LOG view (header button)
 ---@field view_result string|false Switch to the result view (body key)
 ---@field view_log   string|false  Switch to the call-log view (body key)
 ---@field rerun      string|false  Call log: re-run the focused call
@@ -131,8 +129,8 @@ return {
         },
         result = {
             help = "g?", -- the set-wide cheatsheet chord
-            result_tab = "1",
-            log_tab = "2",
+            -- The result / call-log HEADER TABS are keyless (click / hover, `[ ]`-braced on the cursor) — no `1`/`2`
+            -- shortcut. The view still switches from the body with `view_result` / `view_log`.
             view_result = "r",
             view_log = "L",
             rerun = "<CR>",

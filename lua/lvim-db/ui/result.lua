@@ -1659,8 +1659,8 @@ end
 -- and a key the user set to `false` drops its row.
 ---@type { [1]: string, [2]: string }[]
 local HELP = {
-    { "result_tab", "show the RESULT view (header tab)" },
-    { "log_tab", "show the CALL LOG view (header tab)" },
+    -- The result / call-log HEADER TABS are now keyless (click / hover), so they have no cheatsheet row; the
+    -- view still switches from the body with `view_result` / `view_log` below.
     { "view_result", "switch to the result view" },
     { "view_log", "switch to the call-log view" },
     { "rerun", "call log: re-run the focused call" },
@@ -1710,20 +1710,27 @@ end
 -- our own to leak, and the bar can never advertise a key that is not live.
 
 -- (declared above `set_view`, which rebuilds the header on a view switch)
--- The two header tabs, with the CURRENT view's tab marked `active` — the badge and the label each DEEPEN to
--- their own selected tint (blue / yellow), so the active tab reads as the stronger block and shows which view
--- is open regardless of focus, instead of only lighting up while the header bar is the focused sector. The
--- `active` render, unlike hover, does not bracket the label, so nothing eats the side padding.
-function header_spec()
-    local k = config.keys.result
-    -- ACTIVE = the SELECTED tint of the shared footer canon: each box KEEPS ITS OWN HUE — blue key badge,
-    -- yellow label — and merely DEEPENS, exactly like every other button's hover/selected pair. This used to
-    -- point BOTH boxes at one blue group, which turned the active tab's LABEL blue instead of a stronger
-    -- yellow (the badge and the caption then read as the same colour).
-    local ACTIVE = {
-        icon = { active = "LvimUiFooterKeyHover" },
-        text = { active = "LvimUiFooterLabelHover" },
+
+--- The view-tab button BOX-COLOUR override (the record's `hl`, NOT `style` — `style` names an M.STYLES KIND,
+--- `hl` is the per-state colour merged over it). The lvim-installer toolbar canon, identical to lvim-rest's
+--- dock tabs: a keyless single-part caption with symmetric padding so ui.button auto-braces the hovered tab in
+--- `[ ]`; the YELLOW family fg-ONLY — dim inactive, light-yellow-bold active, yellow-bold cursor.
+---@return table
+local function tab_hl()
+    return {
+        text = {
+            padding = { 1, 1 }, -- the cells the hover `[ ]` consume, so bracketing never reflows the bar
+            normal = "LvimDbTabInactive",
+            active = "LvimDbTabActive",
+            hover = "LvimDbTabHover",
+            hover_active = "LvimDbTabHover",
+        },
     }
+end
+
+-- The two header tabs read like the lvim-rest dock tabs: keyless captions in the yellow family, the OPEN view
+-- light-yellow-bold, the sector cursor bracketing the hovered tab in `[ ]`.
+function header_spec()
     return {
         bars = {
             -- The TITLE row: `db ➤ object` on the LEFT, the range counter (1–20/536) pushed to the RIGHT — a
@@ -1739,21 +1746,23 @@ function header_spec()
                 count_hl = "LvimUiPeekCounter",
                 title_pos = "left",
             },
+            -- The view tabs, styled EXACTLY like the lvim-rest response-dock tabs (the lvim-installer toolbar
+            -- canon): KEYLESS single-part captions (so ui.button braces the hovered tab in `[ ]`), a YELLOW
+            -- family carried fg-ONLY via `hl` per state — dim inactive, light-yellow-bold active, yellow-bold
+            -- cursor — over the row's own yellow `LvimUiBarFill` strip. `hl` (NOT `style`, which names a KIND).
             surface.bar({ { "result_tab", "log_tab" } }, {
                 result_tab = {
                     name = "result",
-                    key = k.result_tab or nil,
                     active = state.view == "result",
-                    hl = state.view == "result" and ACTIVE or nil,
+                    hl = tab_hl(),
                     run = function()
                         set_view("result")
                     end,
                 },
                 log_tab = {
-                    name = "call log",
-                    key = k.log_tab or nil,
+                    name = "log",
                     active = state.view == "log",
-                    hl = state.view == "log" and ACTIVE or nil,
+                    hl = tab_hl(),
                     run = function()
                         set_view("log")
                     end,

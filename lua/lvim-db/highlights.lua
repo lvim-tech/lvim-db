@@ -35,6 +35,15 @@ function M.build()
         LvimDbSchema = { fg = c.blue, bold = true }, -- a schema / database
         LvimDbTable = { fg = c.yellow }, -- a table
         LvimDbView = { fg = c.cyan }, -- a view
+
+        -- Result dock view-tab bar (result / call log) — the lvim-installer TOOLBAR canon, matching lvim-rest's
+        -- dock tabs: a YELLOW family, fg-ONLY (the row's own yellow `LvimUiBarFill` strip is the background).
+        -- The open view reads light-yellow-bold, the other a dimmer yellow, and the sector cursor braces the
+        -- hovered tab in `[ ]` (auto ui.button — the tabs are keyless single-part).
+        LvimDbTabInactive = { fg = mtint(c.yellow, 0.6) }, -- not selected: dim yellow
+        LvimDbTabActive = { fg = c.yellow, bold = true }, -- the open view: light yellow bold
+        LvimDbTabHover = { fg = c.yellow, bold = true }, -- the cursor (+ `[ ]` brackets), fg-only
+
         LvimDbCollection = { fg = c.orange }, -- a (mongo) collection
         LvimDbColumn = { fg = c.teal }, -- the "Columns" facet header + every column/field leaf (teal, exactly like Indexes)
         LvimDbKey = { fg = c.orange }, -- a redis key (its own driver context)
