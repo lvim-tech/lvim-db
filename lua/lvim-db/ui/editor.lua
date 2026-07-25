@@ -52,6 +52,30 @@ local MARK = "lvim_db_editor"
 -- buffer-local `b:lvim_ts_lang` seam; drivers absent from this map use the ft's own grammar (sql).
 ---@type table<string, string>
 local DRIVER_LANG = { mongodb = "json" }
+-- Per-DRIVER starter PLACEHOLDER for an untouched editor. Most engines are SQL, but a MongoDB statement is
+-- a JSON command document and a Redis statement is a command line — a SQL comment there fails cryptically
+-- ("statement must be a JSON document"), so those two show a runnable example of the right shape instead.
+-- Swapped in on `set_active` ONLY while the buffer still shows the placeholder (never over typed content).
+---@type table<string, string[]>
+local DRIVER_HINT = {
+    sql = {
+        "-- lvim-db SQL editor",
+        "-- <CR> runs the statement under the cursor · visual <CR> runs the selection",
+        "",
+        "",
+    },
+    -- No comment line for these two — a `//` / `#` would break the JSON / command parse if run as-is. The
+    -- example document / command is itself runnable (an unknown collection just returns empty), so `<CR>`
+    -- on it works, and it teaches the shape by being the shape.
+    mongodb = {
+        '{ "find": "collection", "limit": 20 }',
+        "",
+    },
+    redis = {
+        "KEYS *",
+        "",
+    },
+}
 -- The buffer-local var remembering which saved query (name) the buffer was last loaded from, so
 -- `save_query` can default to that name.
 local QNAME = "lvim_db_query_name"
@@ -60,6 +84,7 @@ local QNAME = "lvim_db_query_name"
 local state = {
     buf = nil, ---@type integer?  the persistent scratch SQL buffer
     active = nil, ---@type string?  the bound ("active") connection name
+    placeholder = nil, ---@type string[]?  the starter placeholder currently shown (nil once the user typed / loaded a query)
 }
 
 -- ── statement splitting ───────────────────────────────────────────────────────
@@ -276,6 +301,31 @@ local function apply_lang()
     end
 end
 
+--- Swap the starter PLACEHOLDER to the active connection's dialect (a JSON command document for MongoDB, a
+--- command for Redis, the SQL hint otherwise) — but ONLY while the buffer still shows the placeholder we
+--- last set (or is empty), NEVER over content the user typed or a loaded query. Resolves the driver the
+--- same way `apply_lang` does.
+local function apply_placeholder()
+    if not (state.buf and api.nvim_buf_is_valid(state.buf)) then
+        return
+    end
+    local driver = nil
+    if state.active then
+        local saved = require("lvim-db").store.get_connection(state.active)
+        driver = saved and saved.driver or nil
+    end
+    local lines = DRIVER_HINT[driver] or DRIVER_HINT.sql
+    local cur = api.nvim_buf_get_lines(state.buf, 0, -1, false)
+    local untouched = (state.placeholder and vim.deep_equal(cur, state.placeholder))
+        or (#cur == 0)
+        or (#cur == 1 and cur[1] == "")
+    if not untouched or (state.placeholder and vim.deep_equal(state.placeholder, lines)) then
+        return
+    end
+    api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
+    state.placeholder = vim.deepcopy(lines)
+end
+
 --- Bind `conn_name` as the editor's active connection, refresh the winbar and re-resolve the
 --- buffer's grammar for the connection's dialect. nil clears it.
 ---@param conn_name string?
@@ -283,6 +333,7 @@ function M.set_active(conn_name)
     state.active = conn_name
     M.update_winbar()
     apply_lang()
+    apply_placeholder() -- if the buffer is still the untouched starter, show this dialect's example
 end
 
 -- ── running ───────────────────────────────────────────────────────────────────
@@ -427,6 +478,7 @@ function M.load_query(conn_name, name)
     local buf = M.ensure_buf()
     vim.bo[buf].modifiable = true
     api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(q.sql or "", "\n", { plain = true }))
+    state.placeholder = nil -- real content now, never a placeholder to swap
     vim.b[buf][QNAME] = name
     M.set_active(conn_name)
     require("lvim-db.ui.workspace").focus_editor()
@@ -445,6 +497,7 @@ function M.load_text(conn_name, text)
     local buf = M.ensure_buf()
     vim.bo[buf].modifiable = true
     api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(text or "", "\n", { plain = true }))
+    state.placeholder = nil -- real content now, never a placeholder to swap
     vim.b[buf][QNAME] = nil
     M.set_active(conn_name)
     require("lvim-db.ui.workspace").focus_editor()
@@ -586,18 +639,15 @@ function M.ensure_buf()
     -- lvim-cmp skips scratch buffers (they are usually UI); this one is a genuine editor —
     -- opt it in through the buffer-local seam so completion runs like on a real file.
     vim.b[buf].lvim_cmp_enable = true
-    api.nvim_buf_set_lines(buf, 0, -1, false, {
-        "-- lvim-db SQL editor",
-        "-- <CR> runs the statement under the cursor · visual <CR> runs the selection",
-        "",
-        "",
-    })
+    api.nvim_buf_set_lines(buf, 0, -1, false, DRIVER_HINT.sql)
+    state.placeholder = vim.deepcopy(DRIVER_HINT.sql)
     set_keys(buf)
     state.buf = buf
     -- The scratch buffer never triggers lvim-installer's automatic offer, so ask for the sql
     -- tooling (treesitter parser / LSP server) explicitly the one time the editor is created.
     offer_tooling("sql")
     apply_lang() -- a connection may already be active (bound from the drawer before the first open)
+    apply_placeholder() -- and if so, show its dialect's starter example
     return buf
 end
 

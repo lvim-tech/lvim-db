@@ -97,7 +97,7 @@ function M.open()
         workspace.focus(ID)
         setup_editor(M.editor_win() or api.nvim_get_current_win())
         require("lvim-db.ui.drawer").open(true)
-        require("lvim-db.ui.result").reopen()
+        require("lvim-db.ui.result").ensure_open()
         return
     end
     local handle = workspace.open({
@@ -121,7 +121,7 @@ function M.open()
             require("lvim-db.ui.drawer").open(true)
         end,
         dock = function()
-            require("lvim-db.ui.result").reopen() -- only paints if a result / call log survives
+            require("lvim-db.ui.result").ensure_open() -- persistent: the result pane shows from the start
         end,
     })
     setup_editor(handle.editor) -- winbar + footer (the buffer is already parked by the shell)
@@ -165,7 +165,7 @@ function M.toggle_dock()
     workspace.toggle_layout(ID, function(new_state)
         local result = require("lvim-db.ui.result")
         result.close()
-        result.reopen() -- rebuilds the dock in the new state's geometry (no-op if nothing has run yet)
+        result.ensure_open() -- rebuild the dock in the new state's geometry (even with no result yet)
         vim.notify("lvim-db: dock layout → " .. new_state, vim.log.levels.INFO)
     end)
 end

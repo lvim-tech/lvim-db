@@ -433,10 +433,12 @@ local function render_result()
     -- affected-count / empty statements have no columns
     if #cols == 0 then
         set_winbar(false)
-        local msg = page.affected ~= nil and (("%d row(s) affected"):format(page.affected)) or "(no result)"
-        vim.bo[state.buf].modifiable = true
-        api.nvim_buf_set_lines(state.buf, 0, -1, false, { "", "  " .. msg })
-        vim.bo[state.buf].modifiable = false
+        if page.affected ~= nil then
+            write_buf({ "", "  " .. ("%d row(s) affected"):format(page.affected) }, {})
+        else
+            -- Nothing has run yet (the persistent dock) — the same dim placeholder style as the call log's.
+            write_buf({ "", "  no result yet" }, { { 1, 0, 15, "LvimDbEmpty" } })
+        end
         return
     end
 
@@ -590,7 +592,8 @@ end
 ---@return string
 local function title_left()
     if state.view == "log" then
-        return ("Call log  (%d calls)"):format(#state.calls)
+        local n = #state.calls
+        return n > 0 and ("Call log  (%d calls)"):format(n) or "Call log"
     end
     local o = state.origin
     if o and o.object then
@@ -1760,6 +1763,20 @@ function header_spec()
     }
 end
 
+--- The result dock's `close` action. The dock is one of the workspace's THREE parts, so `q` (and the
+--- footer close) tears the WHOLE workspace tab down — closing just this panel would strand a two-part
+--- workspace. Routed through `workspace.close()`, whose teardown calls `M.close()` (the surface path), so
+--- there is no recursion. Outside a workspace (defensive) it just closes the dock. Mirrors the drawer's
+--- `request_close`.
+local function request_close()
+    local ws = require("lvim-db.ui.workspace")
+    if ws.is_open() then
+        ws.close()
+    else
+        M.close()
+    end
+end
+
 --- The BROWSE footer: paging, the row editors, yank/export, help, close.
 ---@return table
 local function browse_footer()
@@ -1808,9 +1825,7 @@ local function browse_footer()
                 close = {
                     name = "close",
                     key = k.close or nil,
-                    run = function(s)
-                        s.close()
-                    end,
+                    run = request_close, -- close the WHOLE workspace, not just this dock
                 },
             }),
         },
@@ -1864,6 +1879,7 @@ local function open_dock()
             chassis_map(lhs, fn)
         end
         map(k.help, show_help)
+        map(k.close, request_close) -- close the whole workspace tab (this dock is one of its three parts)
         map(k.view_result, function()
             set_view("result")
         end)
@@ -1968,7 +1984,9 @@ local function open_dock()
         content = { blocks = { { id = "result", provider = provider, border = "none" } } },
         header = header_spec(),
         footer = browse_footer(),
-        close_keys = k.close and { k.close } or {},
+        -- NOT a surface close_key: `k.close` is bound in `set_keys` to `request_close` so `q` tears down the
+        -- WHOLE workspace (this dock is one of its three parts), never just this panel.
+        close_keys = {},
         -- Vertical layer nav, past the dock's own edges: `<C-j>` off the BOTTOM sector descends into the
         -- message zone below (lvim-msgarea), `<C-k>` off the TOP sector is already handled by the chassis
         -- (escape_to_neighbor → the editor/tree above). The dock is the bottom LAYER of the workspace, and the
@@ -2003,6 +2021,17 @@ function M.reopen()
         return
     end
     open_dock()
+    render()
+end
+
+--- Ensure the result dock is OPEN even with no result yet — so the workspace shows all THREE parts (tree +
+--- editor + result) from the moment it opens. Renders whatever is in state (an empty page shows "(no
+--- result)" via `render_result`). Used by the workspace open + the layout toggle; `run` still drives the
+--- real result. Idempotent.
+function M.ensure_open()
+    if not is_open() then
+        open_dock()
+    end
     render()
 end
 
