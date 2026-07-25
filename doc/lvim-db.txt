@@ -294,10 +294,11 @@ All calls are asynchronous (the daemon is spawned + handshaken on first use).
 ==============================================================================
 9. COMMAND                                                *lvim-db-command*
 
-`:LvimDb open`          open the db WORKSPACE — the whole client moves into its
+`:LvimDb`               open the db WORKSPACE — the whole client moves into its
                         own dedicated tabpage (top row: drawer top-left + query
                         editor top-right; a FULL-WIDTH result docked along the
-                        bottom), never over your code; a second `open` switches
+                        bottom), never over your code; idempotent (a second call
+                        just switches to it)
 `:LvimDb toggle`        toggle the workspace tab, keeping the session state
 `:LvimDb close`         close the workspace tab, returning to where you were —
                         the session (expanded/connected connections, the current
@@ -311,7 +312,7 @@ All calls are asynchronous (the daemon is spawned + handshaken on first use).
 
 THE WORKSPACE TAB                                        *lvim-db-workspace*
 
-:LvimDb open hosts the client in its OWN tabpage (marked internally so it is
+:LvimDb hosts the client in its OWN tabpage (marked internally so it is
 always found again, never over your buffers). Its three regions are REAL tiled
 windows in a two-row layout — a top row of the tree (top-left) and the query
 editor (top-right), and a FULL-WIDTH result docked along the bottom (spanning

@@ -238,7 +238,7 @@ This also covers token-style provider auth, e.g. an AWS RDS IAM token:
 
 ## Commands
 
-- `:LvimDb open` — open the db **workspace**: the whole client moves into its own dedicated
+- `:LvimDb` — open the db **workspace**: the whole client moves into its own dedicated
   tabpage — a top row of the connections drawer (top-left) and the query editor (top-right), with
   the result as a **full-width** dock along the bottom — never drawn over your code.
   Idempotent — a second `open` just switches to the tab.
@@ -298,7 +298,7 @@ generated statement makes that impossible to do silently.
 
 ### The workspace tab
 
-`:LvimDb open` hosts the client in its OWN tabpage (marked internally so it is always found again,
+`:LvimDb` hosts the client in its OWN tabpage (marked internally so it is always found again,
 never over your buffers). Its three regions are **real tiled windows** in a two-row layout — a top
 row of the tree (top-left) and the query editor (top-right), and a **full-width result** docked
 along the bottom (spanning under both, so the tree shrinks to the top row and its footer stays

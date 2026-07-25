@@ -30,12 +30,7 @@ local subcommands = {
         vim.cmd("checkhealth lvim-db")
     end,
 
-    --- Open the db workspace: move the whole client into its OWN tabpage (drawer + result + editor). Idempotent.
-    open = function()
-        require("lvim-db.ui.workspace").open()
-    end,
-
-    --- Toggle the db workspace tab (open ⇄ close, keeping the session state).
+    --- Toggle the db workspace tab (open ⇄ close, keeping the session state). Bare `:LvimDb` just opens.
     toggle = function()
         require("lvim-db.ui.workspace").toggle()
     end,
@@ -77,7 +72,11 @@ function M.setup()
 
     vim.api.nvim_create_user_command("LvimDb", function(opts)
         local args = opts.fargs
-        local sub = args[1] or "status"
+        local sub = args[1]
+        if not sub then
+            require("lvim-db.ui.workspace").open() -- bare `:LvimDb` OPENS the workspace
+            return
+        end
         local fn = subcommands[sub]
         if not fn then
             vim.notify(("lvim-db: unknown subcommand '%s'"):format(sub), vim.log.levels.ERROR)
