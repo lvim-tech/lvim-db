@@ -2046,7 +2046,9 @@ end
 ---       passes it; an ad-hoc statement passes nothing and its result stays read-only.
 ---@param offset? integer  which page to land on (default 0). The refresh after a row is written passes the
 ---       page the user was ON, so saving an edit does not throw them back to the top of a long table.
-function M.run(conn_id, conn_name, driver, statement, origin, offset)
+---@param on_done fun()?  fired when the statement resolves (success OR failure) — lets a caller run the NEXT
+---                       statement of a multi-statement buffer only after this one finished (see the editor).
+function M.run(conn_id, conn_name, driver, statement, origin, offset, on_done)
     local db = require("lvim-db")
     -- A LOCKED row belongs to the result being replaced. Its `where` was captured from THAT object's key, so
     -- carrying it into a new result would let `S` build an UPDATE addressing the old table with the new
@@ -2107,6 +2109,9 @@ function M.run(conn_id, conn_name, driver, statement, origin, offset)
                     ("lvim-db: query %s%s"):format(st.state, st.error and (": " .. st.error) or ""),
                     st.state == "failed" and vim.log.levels.ERROR or vim.log.levels.WARN
                 )
+                if on_done then
+                    on_done() -- chain on even after a failure, so `run buffer` attempts every statement
+                end
             end)
             return
         end
@@ -2114,6 +2119,9 @@ function M.run(conn_id, conn_name, driver, statement, origin, offset)
             state.view = "result"
             open_dock()
             goto_page(offset or 0)
+            if on_done then
+                on_done()
+            end
         end)
     end, function(call_id, err)
         if err then
@@ -2211,7 +2219,8 @@ end
 ---@param conn_name string
 ---@param driver string
 ---@param statement string
-function M.run_guarded(conn_id, conn_name, driver, statement, origin)
+---@param on_done fun()?  forwarded to `M.run` (fired when the statement resolves) — for multi-statement runs.
+function M.run_guarded(conn_id, conn_name, driver, statement, origin, on_done)
     local db = require("lvim-db")
     if db.is_destructive(statement) then
         require("lvim-ui").confirm({
@@ -2221,12 +2230,14 @@ function M.run_guarded(conn_id, conn_name, driver, statement, origin)
                 .. "\n\nRun it anyway?",
             callback = function(yes)
                 if yes then
-                    M.run(conn_id, conn_name, driver, statement, origin)
+                    M.run(conn_id, conn_name, driver, statement, origin, nil, on_done)
+                elseif on_done then
+                    on_done() -- declined: still advance the chain so the rest of the buffer runs
                 end
             end,
         })
     else
-        M.run(conn_id, conn_name, driver, statement, origin)
+        M.run(conn_id, conn_name, driver, statement, origin, nil, on_done)
     end
 end
 

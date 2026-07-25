@@ -166,7 +166,7 @@ return {
         editor = {
             run_statement = "<CR>", -- NORMAL: run the statement under the cursor
             run_selection = "<CR>", -- VISUAL: run the selection (same key, visual mode)
-            run_buffer = "<C-CR>", -- Ctrl+Enter: run the WHOLE buffer (off the leader, no <Space>r-group clash)
+            run_buffer = "<localleader>e", -- run the WHOLE buffer (execute-all); <C-CR> needs terminal extended-keys, unreliable in tmux
             new_query = "<localleader>n", -- start a NEW query (blank editor + unbind the loaded name)
             save_query = "<localleader>w", -- save the buffer as a named query (active connection)
             help = "g?", -- the editor's keymap cheatsheet (same chord as the drawer / result)
