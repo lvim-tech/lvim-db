@@ -105,6 +105,11 @@ function M.open()
         -- db's canonical arrangement is state 2: the result docks FULL WIDTH under tree+editor. `:LvimDb dock`
         -- toggles to "editor" (result under the editor, tree full-height).
         layout = "full",
+        -- Appear in the shared <Leader>m dock menu; restorable (reopen) even after it was closed.
+        menu = { name = "Database", icon = (require("lvim-db.config").icons or {}).database },
+        restore = function()
+            M.open()
+        end,
         -- The editor pane hosts the persisted `sql` scratch (marks itself `b:lvim_db_editor`).
         editor = {
             buf = function()
