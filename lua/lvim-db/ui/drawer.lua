@@ -382,6 +382,24 @@ local function render()
             end
         end
 
+        -- SCHEMA gate: expanded but NOT connected → a single row. Opening it (or running a query) is what
+        -- connects — prompting the keyring for a vaulted secret — so browsing a connection needs no password
+        -- until you actually want its schema. Once connected, `conn.nodes` is set and the real tree renders.
+        if conn.expanded and not conn.nodes then
+            push_row(
+                lines,
+                hls,
+                { kind = "schema_gate", conn = conn },
+                1,
+                CARET_CLOSED,
+                KIND.schema.icon,
+                KIND.schema.hl,
+                "Schema",
+                KIND.schema.hl,
+                "(connect)"
+            )
+        end
+
         if conn.expanded and conn.nodes then
             for _, schema in ipairs(conn.nodes) do
                 local skey = schema.name
@@ -553,15 +571,24 @@ end
 --- it becomes the SQL editor's active connection. The row expands IMMEDIATELY (so the saved-queries branch
 --- shows at once — it needs no live link); the schema tree fills in asynchronously once the connect resolves.
 ---@param conn LvimDbDrawerConn
+--- Expand a connection — LAZILY: bind it as the editor's active connection and show its children (the
+--- local saved Queries + a "Schema" gate), but do NOT connect. Browsing a connection needs no live link
+--- (and no keyring prompt for a vaulted secret); the connect is DEFERRED to `load_schema` (opening the
+--- Schema gate) or to actually running a query.
 local function expand_connection(conn)
-    local db = require("lvim-db")
-    -- Selecting/connecting a connection binds it as the editor's active connection.
-    require("lvim-db.ui.editor").set_active(conn.name)
+    require("lvim-db.ui.editor").set_active(conn.name) -- bind (does not connect); a run/gate connects on demand
     conn.expanded = true
     render()
+end
+
+--- Connect the saved connection (prompting the keyring for a vaulted secret) and load its schema tree —
+--- the DEFERRED half of expanding a connection. Called when the user opens the "Schema" gate, and by the
+--- editor's `adopt` after a query-triggered connect. Idempotent (a live/loading link returns at once).
+local function load_schema(conn)
     if conn.conn_id then
         return
     end
+    local db = require("lvim-db")
     db.connect_saved(conn.name, function(conn_id, err, info)
         if err or not conn_id then
             vim.notify("lvim-db: connect '" .. conn.name .. "' failed: " .. tostring(err), vim.log.levels.ERROR)
@@ -578,6 +605,23 @@ local function expand_connection(conn)
             conn.nodes = nodes or {}
             M.refresh()
         end)
+    end)
+end
+
+--- Adopt a connection the EDITOR opened (a query-triggered connect) into the drawer, so the tree reflects
+--- the live link (the Schema gate becomes the real tree) and later runs reuse the one connection instead of
+--- opening a second. Loads the structure once. No-op for an unknown / already-live connection.
+---@param conn_name string
+---@param conn_id integer
+function M.adopt(conn_name, conn_id)
+    local conn = state.conns and state.conns[conn_name]
+    if not conn or conn.conn_id then
+        return
+    end
+    conn.conn_id = conn_id
+    require("lvim-db").structure(conn_id, function(nodes)
+        conn.nodes = nodes or {}
+        M.refresh()
     end)
 end
 
@@ -748,6 +792,10 @@ local function toggle(open)
         if open then
             require("lvim-db.ui.editor").load_query(row.conn.name, row.query.name)
         end
+    elseif row.kind == "schema_gate" then
+        if open then
+            load_schema(row.conn) -- deferred connect (keyring prompt) + schema load
+        end
     elseif row.kind == "schema" then
         row.conn.open[row.schema.name] = open or nil
         render()
@@ -809,6 +857,8 @@ local function default_action()
     end
     if row.kind == "connection" then
         expand_connection(row.conn)
+    elseif row.kind == "schema_gate" then
+        load_schema(row.conn) -- deferred connect (keyring prompt) + schema load
     elseif row.kind == "queries" then
         toggle(not row.conn.queries_open)
     elseif row.kind == "query" then

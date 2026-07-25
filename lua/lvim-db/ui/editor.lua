@@ -182,15 +182,98 @@ local function split_statements(text)
     return stmts
 end
 
---- The statement (text) spanning `cursor_line` in `buf`: the one whose line span contains the
---- cursor, else the nearest statement starting at or before the cursor, else the first. nil when
+--- Split MongoDB `text` into top-level JSON command documents (brace-balanced, string/escape aware) — each
+--- `{ … }` is one statement, so a buffer of several `{...}` documents runs one per `<CR>`, not all as one
+--- (which the mongo driver rejects: "statement must be a JSON document: trailing characters"). Braces
+--- inside a `"…"` string never count.
+---@param text string
+---@return { sql: string, sline: integer, eline: integer }[]
+local function split_json_docs(text)
+    local stmts, seg, seg_start, line = {}, {}, nil, 1
+    local depth, instr, esc = 0, false, false
+    local function push(ch)
+        seg[#seg + 1] = ch
+        if seg_start == nil and not ch:match("%s") then
+            seg_start = line
+        end
+    end
+    local function flush(endline)
+        local s = vim.trim(table.concat(seg))
+        if s ~= "" then
+            stmts[#stmts + 1] = { sql = s, sline = seg_start or endline, eline = endline }
+        end
+        seg, seg_start = {}, nil
+    end
+    for i = 1, #text do
+        local ch = text:sub(i, i)
+        push(ch)
+        if instr then
+            if esc then
+                esc = false
+            elseif ch == "\\" then
+                esc = true
+            elseif ch == '"' then
+                instr = false
+            end
+        elseif ch == '"' then
+            instr = true
+        elseif ch == "{" then
+            depth = depth + 1
+        elseif ch == "}" then
+            depth = depth - 1
+            if depth == 0 then
+                flush(line)
+            end
+        end
+        if ch == "\n" then
+            line = line + 1
+        end
+    end
+    flush(line) -- any trailing remainder (an unbalanced tail)
+    return stmts
+end
+
+--- Split `text` into one statement per NON-blank, non-comment line — the Redis shape (a command per line;
+--- `#` / `//` lines are comments).
+---@param text string
+---@return { sql: string, sline: integer, eline: integer }[]
+local function split_lines(text)
+    local stmts = {}
+    local line = 0
+    for _, l in ipairs(vim.split(text, "\n", { plain = true })) do
+        line = line + 1
+        local t = vim.trim(l)
+        if t ~= "" and not t:match("^#") and not t:match("^//") then
+            stmts[#stmts + 1] = { sql = t, sline = line, eline = line }
+        end
+    end
+    return stmts
+end
+
+--- Split `text` into statements for `driver`: `;`-delimited for SQL, brace-balanced JSON documents for
+--- MongoDB, one-per-line for Redis. The ONE place statement boundaries are decided.
+---@param text string
+---@param driver string?
+---@return { sql: string, sline: integer, eline: integer }[]
+local function split(text, driver)
+    if driver == "mongodb" then
+        return split_json_docs(text)
+    elseif driver == "redis" then
+        return split_lines(text)
+    end
+    return split_statements(text)
+end
+
+--- The statement (text) spanning `cursor_line` in `buf`, split per the active `driver`: the one whose line
+--- span contains the cursor, else the nearest statement starting at or before it, else the first. nil when
 --- the buffer holds no statement.
 ---@param buf integer
 ---@param cursor_line integer  1-based
+---@param driver string?
 ---@return string?
-local function statement_at(buf, cursor_line)
+local function statement_at(buf, cursor_line, driver)
     local text = table.concat(api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-    local stmts = split_statements(text)
+    local stmts = split(text, driver)
     if #stmts == 0 then
         return nil
     end
@@ -235,6 +318,9 @@ local function with_conn(conn_name, cb)
             end)
             return
         end
+        -- A query-triggered connect: hand the live link to the drawer so its tree reflects it (the Schema
+        -- gate becomes the real tree) and later runs reuse this one connection instead of opening a second.
+        pcall(require("lvim-db.ui.drawer").adopt, conn_name, conn_id)
         local saved = db.store.get_connection(conn_name)
         cb(conn_id, saved and saved.driver or "")
     end)
@@ -279,15 +365,23 @@ end
 
 --- Re-resolve the editor buffer's treesitter GRAMMAR from the active connection's driver
 --- (see DRIVER_LANG) and re-activate lvim-ts when it changed. No-op before the buffer exists.
+--- The driver of the active connection (nil when nothing is bound). Drives the per-dialect grammar +
+--- starter placeholder.
+---@return string?
+local function active_driver()
+    if not state.active then
+        return nil
+    end
+    local saved = require("lvim-db").store.get_connection(state.active)
+    return saved and saved.driver or nil
+end
+
 local function apply_lang()
     if not (state.buf and api.nvim_buf_is_valid(state.buf)) then
         return
     end
-    local lang = nil ---@type string?
-    if state.active then
-        local saved = require("lvim-db").store.get_connection(state.active)
-        lang = saved and DRIVER_LANG[saved.driver] or nil
-    end
+    local driver = active_driver()
+    local lang = driver and DRIVER_LANG[driver] or nil ---@type string?
     if vim.b[state.buf].lvim_ts_lang == lang then
         return
     end
@@ -389,7 +483,7 @@ function M.run_statement()
     local win = require("lvim-db.ui.workspace").editor_win()
     local line = (win and api.nvim_win_is_valid(win)) and api.nvim_win_get_cursor(win)[1]
         or api.nvim_win_get_cursor(0)[1]
-    local stmt = statement_at(buf, line)
+    local stmt = statement_at(buf, line, active_driver())
     if not stmt then
         vim.notify("lvim-db: no statement under the cursor", vim.log.levels.WARN)
         return
@@ -406,10 +500,33 @@ function M.run_selection()
     run(table.concat(lines, "\n"))
 end
 
---- Run the whole buffer as one statement.
+--- Run the whole buffer. SQL sends it as one batch (the driver runs the `;`-separated statements). For
+--- MongoDB / Redis a buffer of SEVERAL documents / commands CANNOT be one request (the mongo driver rejects
+--- it: "trailing characters"), so a single statement runs directly and multiple are reported — press `<CR>`
+--- on one to run it.
 function M.run_buffer()
     local buf = M.ensure_buf()
-    run(table.concat(api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
+    local text = table.concat(api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    local driver = active_driver()
+    if driver == "mongodb" or driver == "redis" then
+        local stmts = split(text, driver)
+        if #stmts == 0 then
+            vim.notify("lvim-db: nothing to run", vim.log.levels.WARN)
+        elseif #stmts == 1 then
+            run(stmts[1].sql)
+        else
+            local what = driver == "mongodb" and "documents" or "commands"
+            vim.notify(
+                ("lvim-db: the buffer has %d %s — press <CR> on one to run it (run-buffer sends the whole buffer as one)"):format(
+                    #stmts,
+                    what
+                ),
+                vim.log.levels.WARN
+            )
+        end
+        return
+    end
+    run(text) -- SQL: the whole buffer as one batch
 end
 
 -- ── saving / loading queries ──────────────────────────────────────────────────
@@ -503,6 +620,19 @@ function M.load_text(conn_name, text)
     require("lvim-db.ui.workspace").focus_editor()
 end
 
+--- Start a NEW query: blank the editor to the active driver's starter placeholder and UNBIND the loaded
+--- query name, so the next `save_query` prompts for a FRESH name (a new saved query) instead of defaulting
+--- to — and overwriting — the one that was loaded. Focuses the editor.
+function M.new_query()
+    local buf = M.ensure_buf()
+    vim.b[buf][QNAME] = nil -- the next save is a NEW query, not a re-save of the loaded one
+    local lines = DRIVER_HINT[active_driver()] or DRIVER_HINT.sql
+    vim.bo[buf].modifiable = true
+    api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    state.placeholder = vim.deepcopy(lines) -- it IS the placeholder again (swaps with a later connect)
+    require("lvim-db.ui.workspace").focus_editor()
+end
+
 -- ── the help window (the canonical cheatsheet) ───────────────────────────────
 
 -- Key id → description, in display order. Built from the LIVE `config.keys.editor`, so a rebind
@@ -512,6 +642,7 @@ local HELP = {
     { "run_statement", "run the statement under the cursor" },
     { "run_selection", "run the visual selection" },
     { "run_buffer", "run the whole buffer" },
+    { "new_query", "start a new query (blank editor)" },
     { "save_query", "save the buffer as a named query" },
     { "help", "this help" },
 }
@@ -549,7 +680,7 @@ local function pretty_key(lhs)
     if ll == " " then
         ll = "SPC "
     end
-    local s = lhs:gsub("<localleader>", ll):gsub("<CR>", "⏎"):gsub("<Esc>", "Esc")
+    local s = lhs:gsub("<localleader>", ll):gsub("<[Cc]%-CR>", "⌃⏎"):gsub("<CR>", "⏎"):gsub("<Esc>", "Esc")
     return s
 end
 
@@ -565,6 +696,7 @@ local function footer_items()
     local defs = {
         { key = k.run_statement, name = "run", run = M.run_statement },
         { key = k.run_buffer, name = "run buffer", run = M.run_buffer },
+        { key = k.new_query, name = "new", run = M.new_query },
         { key = k.save_query, name = "save query", run = M.save_query },
         { key = k.help, name = "help", run = show_help },
     }
@@ -612,6 +744,7 @@ local function set_keys(buf)
         end, { buffer = buf, nowait = true, silent = true, desc = "lvim-db: run selection" })
     end
     nmap(k.run_buffer, M.run_buffer, "lvim-db: run whole buffer")
+    nmap(k.new_query, M.new_query, "lvim-db: new query")
     nmap(k.save_query, M.save_query, "lvim-db: save query")
     nmap(k.help, show_help, "lvim-db: editor keymaps")
     -- Region navigation: the tree, editor and full-width result are one coherent set of tiled windows

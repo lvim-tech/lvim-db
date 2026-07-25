@@ -69,6 +69,7 @@
 ---@field run_statement string|false  NORMAL: run the statement under the cursor
 ---@field run_selection string|false  VISUAL: run the selection (same key, visual mode)
 ---@field run_buffer    string|false  Run the whole buffer as one statement
+---@field new_query     string|false  Start a NEW query (blank editor, unbind the loaded name)
 ---@field save_query    string|false  Save the buffer as a named query (under the active connection)
 ---@field help          string|false  Open the editor's keymap cheatsheet
 
@@ -165,9 +166,10 @@ return {
         editor = {
             run_statement = "<CR>", -- NORMAL: run the statement under the cursor
             run_selection = "<CR>", -- VISUAL: run the selection (same key, visual mode)
-            run_buffer = "<localleader>R", -- run the whole buffer as one statement
+            run_buffer = "<C-CR>", -- Ctrl+Enter: run the WHOLE buffer (off the leader, no <Space>r-group clash)
+            new_query = "<localleader>n", -- start a NEW query (blank editor + unbind the loaded name)
             save_query = "<localleader>w", -- save the buffer as a named query (active connection)
-            help = "<localleader>?", -- the editor's keymap cheatsheet
+            help = "g?", -- the editor's keymap cheatsheet (same chord as the drawer / result)
         },
         form = {
             test = "t",
