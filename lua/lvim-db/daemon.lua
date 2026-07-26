@@ -25,7 +25,7 @@
 --
 ---@module "lvim-db.daemon"
 
-local uv = vim.uv or vim.loop
+local uv = vim.uv
 local config = require("lvim-db.config")
 
 local M = {}
