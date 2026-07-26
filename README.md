@@ -83,6 +83,12 @@ require("lvim-db").setup({
     -- n / p page by. The daemon streams the object and serves slices on demand, so this
     -- bounds how many rows Neovim holds at once, never how many exist.
     page_size = 50,
+    -- Cache each call's fetched page in the session call log.
+    --   enabled = true (default): the log's OPEN key shows a call's cached result instantly (no re-run), and
+    --     a separate "re-run" appends a NEW log row. false: nothing is cached and the open key just re-runs
+    --     (the log footer buttons change to match).
+    --   size: the number of most-recent calls whose page is kept in memory (at most size × page_size rows).
+    cache = { enabled = true, size = 50 },
     -- Width (columns) of the connections drawer side panel.
     drawer_width = 36,
     -- Prompt before running a statement that matches destructive_patterns.
@@ -121,11 +127,10 @@ require("lvim-db").setup({
         -- the result dock (grid + call log)
         result = {
             help = "g?", -- the keymap CHEATSHEET (also a `help` chip on the dock's bar)
-            result_tab = "1", -- header button: the result view
-            log_tab = "2", -- header button: the call-log view
             view_result = "r", -- body key: switch to the result view
             view_log = "L", -- body key: switch to the call-log view
-            rerun = "<CR>", -- call log: re-run the focused call
+            rerun = "<CR>", -- call log: open the focused call's cached result (or re-run when cache is off)
+            run_new = "R", -- call log: re-run the focused call as a NEW row (cache on)
             cancel = "x", -- call log: cancel the focused running call
             next_page = "n",
             prev_page = "p",
@@ -370,12 +375,15 @@ cursor is hidden while the panel is focused (shown again in the code beside it).
 A bottom dock spanning the full width. Its header carries, on one row, the **title** on the left —
 `database ➤ object` for a table/collection browse (the connection name for an ad-hoc query) — and a
 **counter** on the right: `1–50/536`, which rows of the total are loaded. Below it are two tabs, the
-**result grid** and the **call log**, switchable with `1`/`2` (or `r`/`L`):
+**result grid** and the **call log**, switchable with `r` / `L` (or by clicking the tab). Each view carries
+its **own footer buttons**:
 
 - Result: `n` / `p` — next / previous PAGE · `<C-n>` / `<C-p>` — next / previous column · `e` / `E` —
   edit the focused row · `y` — yank the page as TSV · `Y` — export · `q` — close
-- Call log: one row per call with a state accent (running / done / failed); `<CR>` re-runs a call,
-  `x` cancels a running one.
+- Call log: one row per call with a state accent (running / done / failed). With result caching on (the
+  default), `<CR>` **opens the focused call's cached result** — no re-execution — and `R` **re-runs** it as a
+  new row; `x` cancels a running one. With caching off (`cache = { enabled = false }`), nothing is stored, so
+  `<CR>` simply re-runs — and the footer buttons change to match.
 
 Opening a table/collection's **Data** facet BROWSES the whole object: the daemon streams it and the
 grid pages `page_size` rows at a time (`n`/`p`), so you can page all the way through — the counter's

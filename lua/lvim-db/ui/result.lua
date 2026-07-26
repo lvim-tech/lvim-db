@@ -64,7 +64,7 @@ local state = {
     ---@type LvimDbEdit?  the row LOCKED for editing — see `start_edit`. nil when not editing.
     edit = nil,
     page = nil, ---@type table?  the current page { columns, rows, from, has_more, total, affected }
-    ---@type table[]  the session CALL LOG (newest last): { call_id, conn_id, conn, driver, statement, state, ms, rows }
+    ---@type table[]  the session CALL LOG (newest last): { call_id, conn_id, conn, driver, statement, origin, state, ms, rows, offset }
     calls = {},
     log_rows = {}, ---@type table[]  line → call descriptor for the log view
     ---@type table?  where the current rows CAME FROM — `{ schema, object, key }` — set only when the run was
@@ -635,9 +635,14 @@ end
 ---@type fun(): table
 local header_spec
 
---- Switch the active tab and re-render + re-title. Rebuilds the header too, so the ACTIVE tab (a solid
---- highlight, see `header_spec`) follows the view — the tab is the persistent "which view am I in" marker,
---- independent of which sector has focus.
+--- Re-derive the FOOTER for the current mode — declared here (defined below) so `set_view` can call it, since
+--- the result and call-log views carry DIFFERENT footer buttons.
+---@type fun()
+local refresh_footer
+
+--- Switch the active tab and re-render + re-title. Rebuilds the header AND the footer too, so the ACTIVE tab
+--- (a solid highlight, see `header_spec`) and the mode-specific footer buttons both follow the view — the tab
+--- is the persistent "which view am I in" marker, independent of which sector has focus.
 ---@param view "result"|"log"
 local function set_view(view)
     state.view = view
@@ -648,6 +653,10 @@ local function set_view(view)
     if state.surface and state.surface.set_header then
         pcall(state.surface.set_header, header_spec())
     end
+    -- The footer differs by view (grid actions vs call-log actions), so re-derive it too.
+    if refresh_footer then
+        refresh_footer()
+    end
 end
 
 --- Fetch a page at `offset` and re-render.
@@ -656,12 +665,22 @@ local function goto_page(offset)
     if not state.call_id then
         return
     end
-    require("lvim-db").page(state.call_id, offset, config.page_size, function(page, err)
+    local cid = state.call_id -- bind: the callback must attribute the page to THIS call, not a later run's
+    ---@cast cid integer
+    require("lvim-db").page(cid, offset, config.page_size, function(page, err)
         if err or not page or not page.ready then
             return
         end
         state.offset = page.from or offset
         state.page = page
+        -- Remember the viewed position on this call's LOG entry, so re-opening the cached call restores the
+        -- page the user paged to (n/p), not always page 0.
+        for _, e in ipairs(state.calls) do
+            if e.call_id == cid then
+                e.offset = state.offset
+                break
+            end
+        end
         vim.schedule(function()
             render()
             -- rebuild the header so the range counter (1–20/536) follows the new page
@@ -1103,11 +1122,6 @@ local function field_editable(raw, driver, coltype, colname)
     end
     return false, "structured value — view only (no faithful text form on this engine)"
 end
-
---- Swap the dock's footer between browsing and editing — declared here, defined with the footer specs below
---- (it needs the browse bar, which needs `edit_row`).
----@type fun()
-local refresh_footer
 
 --- Paint the locked row: its own tint, plus a stronger one on every field the user has changed but not yet
 --- written. A pending change has to be VISIBLE — it lives only in `state.edit` until `S`, and an edit you
@@ -1663,7 +1677,8 @@ local HELP = {
     -- view still switches from the body with `view_result` / `view_log` below.
     { "view_result", "switch to the result view" },
     { "view_log", "switch to the call-log view" },
-    { "rerun", "call log: re-run the focused call" },
+    { "rerun", "call log: open the focused call's cached result (or re-run when cache is off)" },
+    { "run_new", "call log: re-run the focused call as a new row" },
     { "cancel", "call log: cancel the running call" },
     { "next_page", "result: next page" },
     { "prev_page", "result: previous page" },
@@ -1731,6 +1746,27 @@ end
 -- The two header tabs read like the lvim-rest dock tabs: keyless captions in the yellow family, the OPEN view
 -- light-yellow-bold, the sector cursor bracketing the hovered tab in `[ ]`.
 function header_spec()
+    -- `snap_active`: on a set_header rebuild the tab bar's selection FOLLOWS the active tab, so switching the
+    -- view from the body (open / re-run) never leaves a stale `[ ]` hover on the old tab.
+    local tabs = surface.bar({ { "result_tab", "log_tab" } }, {
+        result_tab = {
+            name = "result",
+            active = state.view == "result",
+            hl = tab_hl(),
+            run = function()
+                set_view("result")
+            end,
+        },
+        log_tab = {
+            name = "log",
+            active = state.view == "log",
+            hl = tab_hl(),
+            run = function()
+                set_view("log")
+            end,
+        },
+    })
+    tabs.snap_active = true
     return {
         bars = {
             -- The TITLE row: `db ➤ object` on the LEFT, the range counter (1–20/536) pushed to the RIGHT — a
@@ -1746,28 +1782,10 @@ function header_spec()
                 count_hl = "LvimUiPeekCounter",
                 title_pos = "left",
             },
-            -- The view tabs, styled EXACTLY like the lvim-rest response-dock tabs (the lvim-installer toolbar
-            -- canon): KEYLESS single-part captions (so ui.button braces the hovered tab in `[ ]`), a YELLOW
-            -- family carried fg-ONLY via `hl` per state — dim inactive, light-yellow-bold active, yellow-bold
-            -- cursor — over the row's own yellow `LvimUiBarFill` strip. `hl` (NOT `style`, which names a KIND).
-            surface.bar({ { "result_tab", "log_tab" } }, {
-                result_tab = {
-                    name = "result",
-                    active = state.view == "result",
-                    hl = tab_hl(),
-                    run = function()
-                        set_view("result")
-                    end,
-                },
-                log_tab = {
-                    name = "log",
-                    active = state.view == "log",
-                    hl = tab_hl(),
-                    run = function()
-                        set_view("log")
-                    end,
-                },
-            }),
+            -- The view tabs (built above so `snap_active` can be set): KEYLESS single-part captions (so ui.button
+            -- braces the hovered tab in `[ ]`), a YELLOW family fg-ONLY via `hl` per state — dim inactive,
+            -- light-yellow-bold active, yellow-bold cursor — over the row's own yellow `LvimUiBarFill` strip.
+            tabs,
         },
     }
 end
@@ -1855,11 +1873,106 @@ local function edit_footer()
     }
 end
 
+--- The log row under the cursor (in the dock's grid window), or nil.
+---@return table?
+local function focused_call()
+    if not (state.win and api.nvim_win_is_valid(state.win)) then
+        return nil
+    end
+    return state.log_rows[api.nvim_win_get_cursor(state.win)[1]]
+end
+
+--- Open a log entry's CACHED result — NO re-execution. Its daemon buffer is still ALIVE (kept by `M.run` while
+--- cached), so this just re-points `state.call_id` at it and re-pages: the view is then IDENTICAL to a fresh
+--- run — fully pageable, and editable when it was an object browse (`origin`). Used by the log's open key and
+--- its footer "open" button. A released call (beyond `cache.size`) has no `call_id`, so the caller re-runs.
+---@param c table?  a log-row entry (must carry a live `call_id`)
+local function open_cached(c)
+    if not (c and c.call_id) then
+        return
+    end
+    state.conn, state.driver, state.conn_id = c.conn, c.driver, c.conn_id
+    state.statement, state.call_id = c.statement, c.call_id
+    state.origin = c.origin and { schema = c.origin.schema, object = c.origin.object } or nil
+    state.offset = c.offset or 0
+    if state.origin then
+        fetch_total(state.origin) -- restore the header's total counter for an object browse
+    end
+    set_view("result") -- switch the view + header/footer …
+    goto_page(state.offset) -- … then re-page the live buffer at the LAST viewed position (fully functional)
+end
+
+--- Re-run the focused log call as a NEW row.
+local function rerun_call()
+    local c = focused_call()
+    if c and c.conn_id then
+        M.run(c.conn_id, c.conn, c.driver, c.statement)
+    end
+end
+
+--- The CALL-LOG footer — its buttons depend on `config.cache.enabled`. Cache ON: `open` shows the focused
+--- call's cached result and `re-run` re-executes it as a new row. Cache OFF: nothing is cached, so `re-run`
+--- (the same open key) just re-executes. Cancel / help / close are shared.
+---@return table
+local function log_footer()
+    local k = config.keys.result
+    local cancel = {
+        name = "cancel",
+        key = k.cancel or nil,
+        run = function()
+            local c = focused_call()
+            if c and c.state == "running" and c.call_id then
+                require("lvim-db").cancel(c.call_id)
+            end
+        end,
+    }
+    local help = { name = "help", key = k.help or nil, run = show_help }
+    local close = { name = "close", key = k.close or nil, run = request_close }
+    if config.cache.enabled then
+        return {
+            bars = {
+                surface.bar({ { "open", "rerun" }, { "cancel" }, { "help", "close" } }, {
+                    open = {
+                        name = "open",
+                        key = k.rerun or nil,
+                        run = function()
+                            open_cached(focused_call())
+                        end,
+                    },
+                    rerun = { name = "re-run", key = k.run_new or nil, run = rerun_call },
+                    cancel = cancel,
+                    help = help,
+                    close = close,
+                }),
+            },
+        }
+    end
+    return {
+        bars = {
+            surface.bar({ { "rerun" }, { "cancel" }, { "help", "close" } }, {
+                rerun = { name = "re-run", key = k.rerun or nil, run = rerun_call },
+                cancel = cancel,
+                help = help,
+                close = close,
+            }),
+        },
+    }
+end
+
 -- (declared above `cancel_edit`, which swaps the footer back)
 function refresh_footer()
-    if state.surface and state.surface.set_footer then
-        pcall(state.surface.set_footer, state.edit and edit_footer() or browse_footer())
+    if not (state.surface and state.surface.set_footer) then
+        return
     end
+    local spec
+    if state.edit then
+        spec = edit_footer()
+    elseif state.view == "log" then
+        spec = log_footer()
+    else
+        spec = browse_footer()
+    end
+    pcall(state.surface.set_footer, spec)
 end
 
 --- Open (or refresh) the dock with the current result.
@@ -1898,6 +2011,9 @@ local function open_dock()
         -- `<CR>` is the "act on what is under the cursor" key, and what that means depends on what the dock is
         -- showing: a call in the log → re-run it; a field of a LOCKED row → open it. Sharing the key keeps
         -- both as the same gesture instead of inventing a second one for the grid.
+        -- `<CR>` is the "act on what is under the cursor" key, and what that means depends on what the dock is
+        -- showing: a LOCKED grid cell → open it; a call in the log → OPEN ITS CACHED RESULT (no re-run) when
+        -- `cache_results` is on, else re-run it. The explicit re-run (new row) is `run_new` below.
         map(k.rerun, function()
             if state.view == "result" then
                 if state.edit then
@@ -1905,9 +2021,21 @@ local function open_dock()
                 end
                 return
             end
-            local c = state.log_rows[api.nvim_win_get_cursor(0)[1]]
-            if c and c.conn_id then
-                M.run(c.conn_id, c.conn, c.driver, c.statement)
+            local c = focused_call()
+            if not c then
+                return
+            end
+            if config.cache.enabled and c.call_id then
+                open_cached(c) -- re-page the still-alive buffer — no re-run
+            elseif c.conn_id then
+                M.run(c.conn_id, c.conn, c.driver, c.statement) -- buffer gone / cache off → re-run
+            end
+        end)
+        -- Explicit RE-RUN of the focused call as a NEW log row (only meaningful with caching on, where `<CR>`
+        -- opens the cache instead of re-running).
+        map(k.run_new, function()
+            if state.view == "log" then
+                rerun_call()
             end
         end)
         map(k.cancel, function()
@@ -1992,7 +2120,7 @@ local function open_dock()
         -- block with NO border key falls back to a drawn rounded ring.)
         content = { blocks = { { id = "result", provider = provider, border = "none" } } },
         header = header_spec(),
-        footer = browse_footer(),
+        footer = state.view == "log" and log_footer() or browse_footer(),
         -- NOT a surface close_key: `k.close` is bound in `set_keys` to `request_close` so `q` tears down the
         -- WHOLE workspace (this dock is one of its three parts), never just this panel.
         close_keys = {},
@@ -2077,13 +2205,16 @@ function M.run(conn_id, conn_name, driver, statement, origin, offset, on_done)
         fetch_total(state.origin)
     end
 
-    -- A pending entry in the session call log (accent = running until it resolves).
+    -- A pending entry in the session call log (accent = running until it resolves). `origin` lets the log's
+    -- open key restore an editable object-browse; `call_id` (set on registration) stays live while cached, and
+    -- is what the open key re-pages.
     local entry = {
         call_id = nil,
         conn_id = conn_id,
         conn = conn_name,
         driver = driver,
         statement = statement,
+        origin = state.origin,
         state = "running",
         ms = nil,
         rows = nil,
@@ -2139,12 +2270,26 @@ function M.run(conn_id, conn_name, driver, statement, origin, offset, on_done)
             end)
             return
         end
-        -- Release the PREVIOUS result's server-side buffer — only the current call_id is ever paged again, and
-        -- the call log reruns by statement, so a replaced call's buffered rows are dead weight on the daemon.
         local prev = state.call_id
         entry.call_id = call_id
         state.call_id = call_id
-        if prev and prev ~= call_id then
+        if config.cache.enabled then
+            -- Keep this call's server-side buffer ALIVE so the log's open key re-pages it (no re-run) — opening
+            -- a cached call is then IDENTICAL to a fresh one (paging, editing, everything), because it IS the
+            -- same buffer. Bounded: release the buffers of every call older than the `cache.size` most-recent
+            -- LIVE ones; a released call's `call_id` is cleared so its open key falls back to re-run.
+            local live = {}
+            for _, e in ipairs(state.calls) do
+                if e.call_id then
+                    live[#live + 1] = e
+                end
+            end
+            for i = 1, #live - config.cache.size do
+                require("lvim-db").release(live[i].call_id)
+                live[i].call_id = nil
+            end
+        elseif prev and prev ~= call_id then
+            -- Caching off: only the current call's buffer is ever paged again, so release the previous one.
             require("lvim-db").release(prev)
         end
     end)

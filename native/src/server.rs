@@ -579,7 +579,13 @@ impl Server {
             }
         }
 
-        let total = if c.exhausted { Some(c.buffer.len()) } else { None };
+        // Total, best source first: a driver's UP-FRONT count (e.g. Mongo `count_documents` for a find),
+        // else the exact buffered length once the stream has been read to the end, else unknown.
+        let total = c
+            .stream
+            .as_ref()
+            .and_then(|s| s.total())
+            .or(if c.exhausted { Some(c.buffer.len()) } else { None });
         let start = p.from.min(c.buffer.len());
         let end = need.min(c.buffer.len());
         let rows = &c.buffer[start..end];

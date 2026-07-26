@@ -7,9 +7,14 @@
 --
 ---@module "lvim-db.config"
 
+---@class LvimDbCache
+---@field enabled boolean  Cache each call's page so the log's open key shows it without re-running
+---@field size    integer  Number of most-recent calls whose result page is kept cached (memory bound)
+
 ---@class LvimDbConfig
 ---@field daemon_path      string?                 Explicit path to the lvim-db-daemon binary; nil = auto-probe
 ---@field page_size        integer                 Rows fetched per result page (the pagination band's page)
+---@field cache            LvimDbCache             Cache call results in the log so the open key shows them (no re-run)
 ---@field drawer_width     integer                 Width (columns) of the connections drawer side panel
 ---@field confirm_destructive boolean              Confirm before running a statement matching `destructive_patterns`
 ---@field destructive_patterns string[]            Lua patterns (case-insensitive) that trigger the destructive guard
@@ -44,7 +49,8 @@
 ---@field help       string|false  Open the result dock's keymap cheatsheet
 ---@field view_result string|false Switch to the result view (body key)
 ---@field view_log   string|false  Switch to the call-log view (body key)
----@field rerun      string|false  Call log: re-run the focused call
+---@field rerun      string|false  Call log: open the focused call's cached result (or re-run when cache is off)
+---@field run_new    string|false  Call log: re-run the focused call as a new row (cache on)
 ---@field cancel     string|false  Call log: cancel the focused running call
 ---@field next_page  string|false  Result: next page
 ---@field prev_page  string|false  Result: previous page
@@ -87,6 +93,17 @@ return {
     -- many exist; the total is counted separately (COUNT / countDocuments). Raise it to see
     -- more per page, lower it for a lighter redraw.
     page_size = 50,
+    -- Cache call results in the session call log by keeping their daemon result-buffers ALIVE.
+    --   enabled = true (default): the log's OPEN key re-opens a call's result instantly (no re-execution) —
+    --     fully pageable and editable, because it re-points at the same live buffer — and a separate "re-run"
+    --     action re-executes the statement as a NEW log row. false: each new query releases the previous
+    --     buffer (only one alive), so the open key simply re-runs (the log footer buttons change to match).
+    --   size: how many of the MOST-RECENT calls keep their buffer alive on the daemon. Older ones are released
+    --     (their open key then re-runs). The memory lives on the daemon, bounded by this count.
+    cache = {
+        enabled = true,
+        size = 50,
+    },
     -- Width (columns) of the connections drawer side panel.
     drawer_width = 36,
     -- Guard destructive statements: prompt via lvim-ui.confirm before executing one
@@ -133,7 +150,8 @@ return {
             -- shortcut. The view still switches from the body with `view_result` / `view_log`.
             view_result = "r",
             view_log = "L",
-            rerun = "<CR>",
+            rerun = "<CR>", -- log: open the focused call's CACHED result (or re-run it when cache is off)
+            run_new = "R", -- log: RE-RUN the focused call as a new row (only when cache is on)
             cancel = "x",
             next_page = "n",
             prev_page = "p",

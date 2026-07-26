@@ -44,6 +44,17 @@ impl ResultStream for BufferedStream {
         }
     }
 
+    fn total(&self) -> Option<usize> {
+        // The whole result is materialised here, so the total is exact and known up front — every driver
+        // that buffers (all of them except the Mongo live cursor) gets its `1–50 / N` counter for free. A
+        // pure write (rows empty, an affected count) has no row total.
+        if self.rows.is_empty() && self.affected.is_some() {
+            None
+        } else {
+            Some(self.rows.len())
+        }
+    }
+
     async fn next_page(&mut self, n: usize) -> anyhow::Result<Option<Vec<Vec<Value>>>> {
         if self.pos >= self.rows.len() {
             return Ok(None);

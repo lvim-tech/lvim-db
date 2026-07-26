@@ -296,22 +296,32 @@ impl MongoConnection {
         if let Ok(coll) = doc.get_str("find") {
             let filter = doc.get_document("filter").cloned().unwrap_or_default();
             let handle = db.collection::<Document>(coll);
+            let limit = doc
+                .get_i64("limit")
+                .ok()
+                .or_else(|| doc.get_i32("limit").ok().map(|i| i as i64));
+            // UP-FRONT total: count the matching documents (cheap, index-assisted) so the result counter
+            // reads `1–50 / N` instead of `?`. Capped by an explicit `limit`, since the result is capped too.
+            let total = handle
+                .count_documents(filter.clone())
+                .await
+                .ok()
+                .map(|n| match limit {
+                    Some(l) if l > 0 => (n as usize).min(l as usize),
+                    _ => n as usize,
+                });
             let mut f = handle.find(filter);
             if let Ok(sort) = doc.get_document("sort") {
                 f = f.sort(sort.clone());
             }
-            if let Some(limit) = doc
-                .get_i64("limit")
-                .ok()
-                .or_else(|| doc.get_i32("limit").ok().map(|i| i as i64))
-            {
-                f = f.limit(limit);
+            if let Some(l) = limit {
+                f = f.limit(l);
             }
             if let Ok(proj) = doc.get_document("projection") {
                 f = f.projection(proj.clone());
             }
             let cursor = f.await.map_err(|e| anyhow::anyhow!("{e}"))?;
-            return MongoCursorStream::open(cursor).await;
+            return MongoCursorStream::open(cursor, total).await;
         }
 
         if let Ok(coll) = doc.get_str("aggregate") {
@@ -321,7 +331,8 @@ impl MongoConnection {
             };
             let handle = db.collection::<Document>(coll);
             let cursor = handle.aggregate(pipeline).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-            return MongoCursorStream::open(cursor).await;
+            // No cheap up-front count for an aggregation (the pipeline can transform the row count).
+            return MongoCursorStream::open(cursor, None).await;
         }
 
         // Raw command: run it and render the single result document.
@@ -464,10 +475,14 @@ struct MongoCursorStream {
     columns: Vec<Column>,
     first: Option<Document>,
     done: bool,
+    total: Option<usize>,
 }
 
 impl MongoCursorStream {
-    async fn open(mut cursor: Cursor<Document>) -> anyhow::Result<Box<dyn ResultStream>> {
+    async fn open(
+        mut cursor: Cursor<Document>,
+        total: Option<usize>,
+    ) -> anyhow::Result<Box<dyn ResultStream>> {
         let first = match cursor.next().await {
             Some(Ok(doc)) => Some(doc),
             Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),
@@ -481,6 +496,7 @@ impl MongoCursorStream {
             columns,
             first,
             done: false,
+            total,
         }))
     }
 }
@@ -489,6 +505,10 @@ impl MongoCursorStream {
 impl ResultStream for MongoCursorStream {
     fn columns(&self) -> &[Column] {
         &self.columns
+    }
+
+    fn total(&self) -> Option<usize> {
+        self.total
     }
 
     async fn next_page(&mut self, n: usize) -> anyhow::Result<Option<Vec<Vec<Value>>>> {

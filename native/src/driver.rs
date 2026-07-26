@@ -101,6 +101,13 @@ pub trait ResultStream: Send {
         None
     }
 
+    /// A total row count known UP FRONT — without exhausting the stream — when the driver can
+    /// supply one cheaply (e.g. a MongoDB `count_documents` for a find). `None` ⇒ the total is
+    /// only known once the stream is exhausted (the server falls back to the buffered length).
+    fn total(&self) -> Option<usize> {
+        None
+    }
+
     /// Pull up to `n` more rows. `Ok(None)` once the stream is exhausted.
     async fn next_page(&mut self, n: usize) -> anyhow::Result<Option<Vec<Vec<Value>>>>;
 }
