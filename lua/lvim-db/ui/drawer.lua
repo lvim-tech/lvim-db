@@ -1223,9 +1223,10 @@ local function set_keys(chassis_map)
     end)
     map(k.close, request_close)
     -- Region navigation: the tree, the editor and the full-width result are one coherent set of tiled
-    -- windows, so `<C-h/j/k/l>` move between them (directional `<C-w>` nav — the tree is top-left, so `<C-l>`
-    -- reaches the editor and `<C-j>` descends onto the result below). `h`/`l` remain the tree's own
-    -- collapse/expand — only the Ctrl chords navigate. Matches the lvim-ui chassis sector-nav convention.
+    -- windows, so `<C-h/j/k/l>` move between them (directional `<C-w>` nav). `h`/`l` remain the tree's own
+    -- collapse/expand — only the Ctrl chords navigate. `<C-j>` (down) is LAYER-BY-LAYER: the surface
+    -- `footer_nav` intercepts it so the FIRST `<C-j>` enters the drawer's own footer chips, and the footer's
+    -- own `<C-j>` runs THIS `wincmd j` to descend onto the result below — the footer is never skipped.
     for lhs, nav in pairs({ ["<C-h>"] = "h", ["<C-j>"] = "j", ["<C-k>"] = "k", ["<C-l>"] = "l" }) do
         chassis_map(lhs, function()
             pcall(vim.cmd, "wincmd " .. nav)
@@ -1300,6 +1301,11 @@ function M.open(enter)
         -- the focused connection row before the always-present help + close chips; the CursorMoved autocmd
         -- swaps it via `set_footer` when the focused row's connect-state changes.
         footer = build_footer("none"),
+        -- `<C-j>` on the drawer steps DOWN into the footer chips (connect / disconnect / help / close) — the
+        -- drawer no longer binds `<C-j>` for region-nav (see set_keys), so this owns it cleanly. `<C-l>`/`<C-h>`
+        -- move between chips, `<CR>` runs one, `<C-k>`/`q` step back up. (The result grid is reached from the
+        -- editor: `<C-l>` to the editor, then its own `<C-j>`.)
+        footer_nav = true,
     })
     state.footer_ctx = "none"
     -- The cursor opens on the first row (often a connection) — sync the chip to it once the surface exists.

@@ -677,7 +677,15 @@ function M.attach_footer(win)
         footer_handle.close()
         footer_handle = nil
     end
-    footer_handle = require("lvim-ui.winfooter").attach(win, { items = footer_items(), align = "center" })
+    footer_handle = require("lvim-ui.winfooter").attach(win, {
+        items = footer_items(),
+        align = "center",
+        -- Keyboard footer nav: the bar is a layer between the editor and the result below it. `<C-j>` on the
+        -- editor enters the bar (see set_keys); the bar's own `<C-j>` runs THIS to descend onto the result.
+        nav_down = function()
+            pcall(vim.cmd, "wincmd j")
+        end,
+    })
 end
 
 -- ── buffer setup ──────────────────────────────────────────────────────────────
@@ -707,12 +715,21 @@ local function set_keys(buf)
     nmap(k.save_query, M.save_query, "lvim-db: save query")
     nmap(k.help, show_help, "lvim-db: editor keymaps")
     -- Region navigation: the tree, editor and full-width result are one coherent set of tiled windows
-    -- (see the workspace), so `<C-h/j/k/l>` step between them — matching the drawer/result chords.
-    for lhs, nav in pairs({ ["<C-h>"] = "h", ["<C-j>"] = "j", ["<C-k>"] = "k", ["<C-l>"] = "l" }) do
+    -- (see the workspace), so `<C-h/k/l>` step between them. `<C-j>` (down) is LAYER-BY-LAYER: it enters the
+    -- editor's OWN footer bar first (the bar's `<C-j>` then descends onto the result), so the footer chips
+    -- are keyboard-reachable and never skipped.
+    for lhs, nav in pairs({ ["<C-h>"] = "h", ["<C-k>"] = "k", ["<C-l>"] = "l" }) do
         vim.keymap.set("n", lhs, function()
             pcall(vim.cmd, "wincmd " .. nav)
         end, { buffer = buf, nowait = true, silent = true, desc = "lvim-db: focus " .. nav .. " region" })
     end
+    vim.keymap.set("n", "<C-j>", function()
+        if footer_handle and footer_handle.enter then
+            footer_handle.enter()
+        else
+            pcall(vim.cmd, "wincmd j")
+        end
+    end, { buffer = buf, nowait = true, silent = true, desc = "lvim-db: enter the editor footer bar" })
 end
 
 --- Ensure the persistent editor scratch buffer exists (creating + configuring it once) and return
