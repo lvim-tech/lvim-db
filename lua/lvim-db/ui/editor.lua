@@ -677,7 +677,7 @@ function M.attach_footer(win)
         footer_handle.close()
         footer_handle = nil
     end
-    footer_handle = require("lvim-ui.winfooter").attach(win, {
+    footer_handle = require("lvim-ui.winband").attach(win, {
         items = footer_items(),
         align = "center",
         -- Keyboard footer nav: the bar is a layer between the editor and the result below it. `<C-j>` on the

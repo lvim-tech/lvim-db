@@ -80,7 +80,7 @@ local function setup_editor(win)
     local editor = require("lvim-db.ui.editor")
     api.nvim_win_set_buf(win, editor.ensure_buf())
     editor.update_winbar()
-    editor.attach_footer(win) -- the button bar riding the window's bottom row (lvim-ui.winfooter)
+    editor.attach_footer(win) -- the button bar riding the window's bottom row (lvim-ui.winband)
 end
 
 --- Whether the workspace tab is open.
