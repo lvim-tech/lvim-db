@@ -683,7 +683,7 @@ function M.attach_footer(win)
         -- Keyboard footer nav: the bar is a layer between the editor and the result below it. `<C-j>` on the
         -- editor enters the bar (see set_keys); the bar's own `<C-j>` runs THIS to descend onto the result.
         nav_down = function()
-            pcall(vim.cmd, "wincmd j")
+            pcall(vim.cmd.wincmd, "j")
         end,
     })
 end
@@ -720,14 +720,14 @@ local function set_keys(buf)
     -- are keyboard-reachable and never skipped.
     for lhs, nav in pairs({ ["<C-h>"] = "h", ["<C-k>"] = "k", ["<C-l>"] = "l" }) do
         vim.keymap.set("n", lhs, function()
-            pcall(vim.cmd, "wincmd " .. nav)
+            pcall(vim.cmd.wincmd, nav)
         end, { buffer = buf, nowait = true, silent = true, desc = "lvim-db: focus " .. nav .. " region" })
     end
     vim.keymap.set("n", "<C-j>", function()
         if footer_handle and footer_handle.enter then
             footer_handle.enter()
         else
-            pcall(vim.cmd, "wincmd j")
+            pcall(vim.cmd.wincmd, "j")
         end
     end, { buffer = buf, nowait = true, silent = true, desc = "lvim-db: enter the editor footer bar" })
 end

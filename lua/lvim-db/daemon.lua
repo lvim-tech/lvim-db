@@ -183,9 +183,13 @@ end
 
 -- ─── lifecycle ───────────────────────────────────────────────────────────────
 
---- Send a raw request object (must be called only when `job` is live).
+--- Send a raw request object. Callers only reach this once the daemon is up, but the handle is
+--- re-checked here rather than assumed: `stop()` clears it, and a queued send must not index nil.
 ---@param obj table
 local function send(obj)
+    if not job then
+        return
+    end
     vim.fn.chansend(job, vim.json.encode(obj) .. "\n")
 end
 

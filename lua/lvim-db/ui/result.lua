@@ -176,16 +176,6 @@ local function pad_cells(s, w)
     return s .. string.rep(" ", math.max(0, w - strwidth(s)))
 end
 
---- Drop trailing spaces. The grid pads every cell to its column width, so a cell's trailing run of spaces is
---- indistinguishable from its padding — see `save_edit`, which compares TRIMMED text on both sides so a
---- value that genuinely ends in a space is read as unchanged (and left alone) rather than silently rewritten
---- without it.
----@param s string
----@return string
-local function rtrim(s)
-    return (s:gsub("%s+$", ""))
-end
-
 --- Re-indent a COMPACT json string (what `vim.json.encode` emits — no whitespace) into a readable one.
 --- A string REFORMATTER, not a re-encoder: it walks the valid json text and inserts newlines + 2-space
 --- indent around structural punctuation, leaving values byte-for-byte intact. Working on the text (rather
@@ -891,7 +881,7 @@ local function track_column()
     local ci = cursor_column()
     if ci ~= state.active_col then
         state.active_col = ci
-        pcall(vim.cmd, "redrawstatus")
+        pcall(vim.cmd.redrawstatus)
     end
 end
 
@@ -931,7 +921,7 @@ local function goto_column(ci)
         end
     end)
     state.active_col = ci
-    pcall(vim.cmd, "redrawstatus")
+    pcall(vim.cmd.redrawstatus)
 end
 
 --- `next_column`: the column after the cursor's, wrapping at the last.
@@ -1475,11 +1465,10 @@ end
 --- may change it — the grid truncates at `MAX_CELL` and flattens a document to one line, so this is the only
 --- place some values are legible at all. A read-only row simply gets no save button and says why in its
 --- title, instead of the key refusing to show you your own data.
----@param ri integer      the result row
 ---@param row any[]       its RAW values
 ---@param key string[]?   its key columns — nil when the row cannot be addressed
 ---@param readonly string?  why it cannot be written, or nil when it can
-local function open_row_popup(ri, row, key, readonly)
+local function open_row_popup(_, row, key, readonly)
     local g = state.grid
     local o = state.origin
     if not (g and row) then

@@ -439,7 +439,7 @@ local function render()
                             -- rendered before — one level deeper, but never taken away.
                             for _, h in ipairs(helpers_for(conn)) do
                                 local hkey = okey .. "#" .. h.id
-                                local km = KIND[h.kind]
+                                local hkm = KIND[h.kind]
                                 local hcaret = ""
                                 if h.branch then
                                     hcaret = conn.open[hkey] and CARET_OPEN or CARET_CLOSED
@@ -450,10 +450,10 @@ local function render()
                                     { kind = "helper", conn = conn, schema = schema, obj = obj, helper = h },
                                     3,
                                     hcaret,
-                                    km.icon,
-                                    km.hl,
+                                    hkm.icon,
+                                    hkm.hl,
                                     h.label,
-                                    km.hl
+                                    hkm.hl
                                 )
                                 if h.id == "columns" and conn.open[hkey] and obj.columns then
                                     for _, col in ipairs(obj.columns) do
@@ -1229,7 +1229,7 @@ local function set_keys(chassis_map)
     -- own `<C-j>` runs THIS `wincmd j` to descend onto the result below — the footer is never skipped.
     for lhs, nav in pairs({ ["<C-h>"] = "h", ["<C-j>"] = "j", ["<C-k>"] = "k", ["<C-l>"] = "l" }) do
         chassis_map(lhs, function()
-            pcall(vim.cmd, "wincmd " .. nav)
+            pcall(vim.cmd.wincmd, nav)
         end)
     end
 end

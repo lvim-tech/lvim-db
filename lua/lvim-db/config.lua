@@ -22,6 +22,7 @@
 ---@field connect_timeout_ms integer               How long a connect / handshake may take before it is abandoned
 ---@field warn_on_missing  boolean                 Notify once (INFO) when the daemon binary is not built
 ---@field keys             LvimDbKeys              Every key lvim-db binds in its own UI surfaces
+---@field icons?           { database?: string }   Glyphs lvim-db shows outside its own panels (the shared dock menu entry); no defaults are shipped — set them through `setup()`
 
 --- The keys lvim-db binds inside its OWN windows (the drawer, the result dock, the
 --- connection form) — buffer-local to those panels, so they never touch the editor's
@@ -78,6 +79,7 @@
 ---@field help          string|false  Open the editor's keymap cheatsheet
 
 ---@class LvimDbFormKeys
+---@field keyring string|false  Auth tab: move the typed secret into the lvim-keyring wallet
 ---@field test  string|false  Test the ACTIVE tab's layer (endpoint / auth / tls / tunnel)
 ---@field save  string|false  Save the connection (from any tab) and close the form
 ---@field close string|false  Close the form without saving
