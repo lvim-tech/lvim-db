@@ -168,6 +168,11 @@ fn duck_text(v: &DuckValue) -> String {
                 .join(", ")
         ),
         DuckValue::Union(b) => duck_text(b),
+        // duckdb::types::Value is #[non_exhaustive]: a newer duckdb crate can add a variant this
+        // match predates. Debug is not a re-parseable literal (the reason the arms above are
+        // hand-written), but it is a safe, panic-free rendering for a variant that did not exist
+        // when this was written — and the only place `cell`'s `ref other` catch-all can land.
+        _ => format!("{:?}", v),
     }
 }
 
