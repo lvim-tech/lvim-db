@@ -1,9 +1,10 @@
 -- lvim-db.commands: the `:LvimDb` user command.
 -- Registered from setup(). A single command with subcommands (the lvim-tech
--- convention — no plugin/ bootstrap file; setup() owns command creation). The
--- windowed subcommands (open / connect / query …) are wired to the lvim-ui UI in
--- a later phase; the foundation ships `status` and `health` so the backend and
--- store can be inspected from the editor immediately.
+-- convention — no plugin/ bootstrap file; setup() owns command creation). A bare
+-- `:LvimDb` OPENS the workspace tab; the subcommands are the workspace verbs
+-- (toggle / close / dock / add / log), the wallet migration (keyring-migrate) and
+-- the two inspection verbs (status / health). Connecting and querying are actions
+-- INSIDE the workspace (the drawer and the query editor), not subcommands.
 --
 ---@module "lvim-db.commands"
 

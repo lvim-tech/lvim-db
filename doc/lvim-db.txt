@@ -303,6 +303,9 @@ All calls are asynchronous (the daemon is spawned + handshaken on first use).
 `:LvimDb close`         close the workspace tab, returning to where you were —
                         the session (expanded/connected connections, the current
                         result / call log) is PRESERVED for the next open/toggle
+`:LvimDb dock`          toggle the result dock's layout: full-width along the
+                        bottom (default) ⇄ under the query editor only, with
+                        the drawer full-height
 `:LvimDb add`           add a saved connection (the DriverMeta-driven tabs form)
 `:LvimDb log`           show the call-log tab in the result dock
 `:LvimDb keyring-migrate`  move plaintext saved secrets into the lvim-keyring

@@ -251,6 +251,8 @@ This also covers token-style provider auth, e.g. an AWS RDS IAM token:
 - `:LvimDb close` — close the workspace tab and return to where you were. The in-memory session
   (the drawer's expanded/connected connections and the current result/call log) is **preserved**,
   so the next `open`/`toggle` restores the workspace exactly as you left it.
+- `:LvimDb dock` — toggle the result dock's layout: full-width along the bottom (default) ⇄ under the
+  query editor only, with the drawer full-height
 - `:LvimDb add` — add a saved connection (the DriverMeta-driven `lvim-ui.tabs` form)
 - `:LvimDb log` — show the call-log tab in the result dock
 - `:LvimDb keyring-migrate` — move plaintext saved secrets into the lvim-keyring wallet
