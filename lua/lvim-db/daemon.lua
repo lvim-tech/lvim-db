@@ -1,8 +1,17 @@
--- lvim-db.daemon: the backend process lifecycle + JSON-RPC client.
+-- lvim-db.daemon: the engine process lifecycle + JSON-RPC client.
 --
--- The database work happens in a SEPARATE process — the Rust `lvim-db-daemon`
--- (native/), spawned once per Neovim and spoken to over newline-delimited JSON
--- on its stdin/stdout (see native/src/rpc.rs). This module owns that process:
+-- The database work happens in a SEPARATE process — the `lode` engine, binary
+-- `loded` (https://github.com/lvim-tech/lode) — spawned once per Neovim and
+-- spoken to over newline-delimited JSON on its stdin/stdout.
+--
+-- The engine used to live in this repository, under `native/`. It is its own
+-- project now because it is no longer only ours to use: the same binary backs
+-- the lode desktop GUI, and the saved connections / queries / history live
+-- INSIDE it (see store.lua), so the two clients share one set. lvim-db is a
+-- CLIENT of that engine and nothing more. A pre-lode `native/` build is still
+-- accepted for the transition (see `candidate_paths`).
+--
+-- This module owns that process:
 -- it probes the binary, spawns it, performs the `rpc.hello` handshake (recording
 -- the protocol version + the driver set the backend was built with), correlates
 -- responses to requests by id, and routes unsolicited notifications
@@ -10,10 +19,10 @@
 --
 -- Out-of-process (not an FFI cdylib like lvim-fuzzy) because DB drivers need a
 -- tokio runtime, pools, TLS and cancellation, and a driver/C-dep crash must take
--- down the daemon — NOT the editor. If the binary is missing the plugin still
--- loads and every action degrades gracefully with one INFO notification (build
--- it with `sh native/build.sh`); there is no pure-Lua fallback because a faked
--- DB client would be a hack, not a fallback.
+-- down the engine — NOT the editor. If the binary is missing the plugin still
+-- loads and every action degrades gracefully with one INFO notification (install
+-- lode and run its `scripts/build`); there is no pure-Lua fallback because a
+-- faked DB client would be a hack, not a fallback.
 --
 -- Public API:
 --   • require("lvim-db.daemon").ensure(cb)          start + handshake, cb(ok, err)
@@ -21,6 +30,7 @@
 --   • require("lvim-db.daemon").on(method, handler) subscribe to a notification
 --   • require("lvim-db.daemon").drivers()           the backend's DriverMeta list
 --   • require("lvim-db.daemon").proto()             the negotiated protocol version
+--   • require("lvim-db.daemon").engine()            which engine/version is running
 --   • require("lvim-db.daemon").is_running()        whether the process is up
 --
 ---@module "lvim-db.daemon"
@@ -41,6 +51,10 @@ local job
 local ready = false
 ---@type integer? the negotiated protocol version
 local proto
+---@type LvimDbEngine? what the backend identified itself as at hello
+local engine
+---@type string? the binary path the running backend was spawned from
+local engine_path
 ---@type table[] the DriverMeta list the backend reported at hello
 local driver_metas = {}
 ---@type string the partial trailing line carried between stdout chunks
@@ -58,20 +72,51 @@ local warned_missing = false
 
 -- ─── binary discovery ────────────────────────────────────────────────────────
 
---- Candidate paths for the daemon binary, in probe order.
+--- Candidate paths for the engine binary, in probe order.
+---
+--- The backend is now a SEPARATE project — `lode` (https://github.com/lvim-tech/lode),
+--- binary `loded` — shared with the lode desktop GUI, so the probe looks for an
+--- INSTALLED engine first: an explicit config path, `$LODE_DAEMON`, then `loded`
+--- on `$PATH`, then a checkout next to this plugin.
+---
+--- The two `native/` paths stay at the END of the list, for the transition: a
+--- user who has built the old in-plugin daemon keeps working with it until they
+--- install lode. They are the LAST resort rather than the first, so an installed
+--- engine always wins over a stale bundled build.
+---
+--- `$LVIM_DB_DAEMON` is still honoured (it is in people's configs) but `$LODE_DAEMON`
+--- is checked first, since it names the thing that actually exists now.
 ---@return string[]
 local function candidate_paths()
     local paths = {}
     if config.daemon_path and config.daemon_path ~= "" then
         paths[#paths + 1] = config.daemon_path
     end
-    local env = vim.env.LVIM_DB_DAEMON
-    if env and env ~= "" then
-        paths[#paths + 1] = env
+    for _, var in ipairs({ "LODE_DAEMON", "LVIM_DB_DAEMON" }) do
+        local env = vim.env[var]
+        if env and env ~= "" then
+            paths[#paths + 1] = env
+        end
+    end
+    -- An installed engine on $PATH — the normal case once lode is packaged.
+    local on_path = vim.fn.exepath("loded")
+    if on_path and on_path ~= "" then
+        paths[#paths + 1] = on_path
     end
     -- this file is <root>/lua/lvim-db/daemon.lua → strip to the plugin root
     local src = vim.fs.normalize(debug.getinfo(1, "S").source:sub(2))
     local root = src:gsub("/lua/lvim%-db/daemon%.lua$", "")
+    -- A lode checkout beside this one, or beside the whole plugin tree — the two
+    -- shapes a developer actually has (plugins/ next to lode/, or lua/ next to rust/).
+    for _, rel in ipairs({
+        "/../lode/build/loded",
+        "/../lode/target/release/loded",
+        "/../../rust/lode/build/loded",
+        "/../../rust/lode/target/release/loded",
+    }) do
+        paths[#paths + 1] = vim.fs.normalize(root .. rel)
+    end
+    -- Transition only: the daemon that used to be bundled in this plugin.
     paths[#paths + 1] = root .. "/native/build/lvim-db-daemon"
     paths[#paths + 1] = root .. "/native/target/release/lvim-db-daemon"
     return paths
@@ -94,8 +139,9 @@ local function warn_missing()
         warned_missing = true
         vim.schedule(function()
             vim.notify(
-                "lvim-db: backend not built — run `sh native/build.sh` (needs a Rust toolchain) to enable "
-                    .. "database connections.",
+                "lvim-db: no database engine found — install lode (https://github.com/lvim-tech/lode): clone it "
+                    .. "and run `scripts/build`, then put `loded` on $PATH or set `daemon_path`. Needs a Rust "
+                    .. "toolchain.",
                 vim.log.levels.INFO
             )
         end)
@@ -162,6 +208,8 @@ end
 local function teardown(err)
     ready = false
     job = nil
+    engine = nil
+    engine_path = nil
     stdout_tail = ""
     -- fail every in-flight request so callers never hang
     local dead = pending
@@ -220,6 +268,16 @@ local function handshake()
             return
         end
         driver_metas = result.drivers or {}
+        -- WHICH backend is this? lode reports `engine` + `version`; the old
+        -- in-plugin daemon reported neither, so an absent `engine` means a
+        -- legacy build and is recorded as such rather than guessed at.
+        engine = {
+            name = type(result.engine) == "string" and result.engine or "lvim-db-daemon (legacy)",
+            version = type(result.version) == "string" and result.version or "unknown",
+            proto = proto,
+            path = engine_path or "?",
+            legacy = type(result.engine) ~= "string",
+        }
         ready = true
         for _, cb in ipairs(waiters) do
             pcall(cb, true, nil)
@@ -271,6 +329,7 @@ function M.ensure(cb)
         return
     end
     job = handle
+    engine_path = bin
     handshake()
 end
 
@@ -309,6 +368,25 @@ end
 ---@return integer?
 function M.proto()
     return proto
+end
+
+---@class LvimDbEngine
+---@field name string     "lode", or "lvim-db-daemon (legacy)" for a pre-lode backend
+---@field version string  the engine's own version, "unknown" on a legacy backend
+---@field proto integer   the protocol version it reported
+---@field path string     the binary it was spawned from
+---@field legacy boolean  true when the backend did not identify itself (pre-lode)
+
+--- Which backend is actually running: name, version, protocol and the binary it
+--- came from. nil before the handshake completes.
+---
+--- The plugin can be talking to EITHER the lode engine or the daemon that used
+--- to ship inside it, and the two are not interchangeable (lode carries the
+--- saved state; the old one does not), so "which one am I on" has to be
+--- answerable — `:checkhealth lvim-db` prints it.
+---@return LvimDbEngine?
+function M.engine()
+    return engine
 end
 
 --- Whether the daemon process is currently running and handshaken.

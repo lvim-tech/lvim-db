@@ -1,19 +1,23 @@
 # lvim-db
 
 A full database client for Neovim — connections, schema browsing, a query editor,
-a paged results grid, and a call log — backed by an **out-of-process Rust daemon**.
+a paged results grid, and a call log — and nothing more: the database work itself
+belongs to the **[lode](https://github.com/lvim-tech/lode) engine**, and lvim-db
+is a **client** of it.
 
-Unlike an in-process approach, the database work runs in a separate `lvim-db-daemon`
-process that Neovim spawns once and talks to over newline-delimited JSON-RPC on
-stdio. Database drivers need an async runtime, connection pools, TLS and query
-cancellation, and a driver (or a native C dependency) crashing must take down the
-daemon — **not the editor**. If the daemon binary is not built the plugin still
-loads and every action degrades gracefully with a single notification.
+lode is a separate project: a Rust binary (`loded`) that Neovim spawns once and
+talks to over newline-delimited JSON-RPC on stdio. Database drivers need an async
+runtime, connection pools, TLS and query cancellation, and a driver (or a native
+C dependency) crashing must take down the engine — **not the editor**. The engine
+also owns the SAVED STATE (connections, saved queries, history), so the Neovim
+client and the lode desktop client see one set rather than two. If no engine is
+installed the plugin still loads and every action degrades gracefully with a
+single notification.
 
 Database types are **plugin types**: each driver lives behind one trait + a
-registry in the Rust backend, and the Lua side discovers the available drivers
-(and builds each connection form) from the backend at runtime — so a new database
-type is added without touching the core or any Lua.
+registry in the engine, and the Lua side discovers the available drivers (and
+builds each connection form) from the engine at runtime — so a new database type
+is added without touching the core or any Lua.
 
 Connections are **encrypted by default** — every network driver negotiates real
 rustls TLS, and an SSH tunnel provides an encrypted channel for engines without
@@ -32,21 +36,23 @@ Oracle is available as an opt-in build feature (it needs the Oracle Instant Clie
 at runtime, so it is excluded from the self-contained standard build):
 
 ```sh
-sh native/build.sh --features oracle
+scripts/build --features oracle   # in the lode checkout
 ```
 
 ## Requirements
 
-- Neovim 0.10+
+- Neovim 0.12+
 - [lvim-utils](https://github.com/lvim-tech/lvim-utils) — palette, store, UI helpers
 - [lvim-ui](https://github.com/lvim-tech/lvim-ui) — the windowed UI primitives
-- A Rust toolchain (`cargo`) to build the daemon
-- `sqlite.lua` (optional) — enables saved connections + query history
+- [lode](https://github.com/lvim-tech/lode) — the database engine (`loded`), plus a
+  Rust toolchain (`cargo`) to build it
+- `sqlite.lua` (optional) — only for the LEGACY local store, used when no engine
+  with a store is found
 
 ## Install
 
 Install with the lvim-tech installer (**lvim-installer**) or Neovim's native
-`vim.pack`, then build the daemon.
+`vim.pack`, then install the engine.
 
 Native `vim.pack`:
 
@@ -60,15 +66,44 @@ vim.pack.add({
 require("lvim-db").setup()
 ```
 
-Then build the backend once (from the plugin directory):
+Then install the engine once:
 
 ```sh
-sh native/build.sh
+git clone https://github.com/lvim-tech/lode
+cd lode && scripts/build
+# put it where the plugin will find it — either on $PATH:
+install -Dm755 build/loded ~/.local/bin/loded
 ```
 
-This compiles `lvim-db-daemon` into `native/build/` (git-ignored). Run
-`:checkhealth lvim-db` to confirm the backend is found and to see the driver set
-it was built with.
+The plugin probes, in order: `config.daemon_path`, `$LODE_DAEMON`,
+`$LVIM_DB_DAEMON`, `loded` on `$PATH`, a `lode` checkout beside the plugin, and
+finally the old in-plugin `native/build/lvim-db-daemon` (kept working for the
+transition). Run `:checkhealth lvim-db` to see which engine answered, its
+version, the driver set it was built with, and where the saved state lives.
+
+## Migrating from the bundled daemon
+
+The backend used to live in this repository, under `native/`. It is now the
+separate [lode](https://github.com/lvim-tech/lode) project, because the same
+engine also backs the lode desktop client — and the saved connections, saved
+queries and history live inside it, so both clients see one set.
+
+Nothing breaks if you do nothing: a built `native/build/lvim-db-daemon` is still
+accepted, and the saved state then stays in the old Neovim-local file.
+
+To move over:
+
+1. Build and install the engine (see Install above).
+2. Start Neovim and open lvim-db once. The first time the engine's store is
+   reached, the old `stdpath("data")/lvim-db/lvim-db.db` is imported into it —
+   additively, and the file is only READ. A marker
+   (`stdpath("data")/lvim-db/migrated-to-lode`) records what moved.
+3. Check it: `:checkhealth lvim-db` names the engine, its version, and says the
+   saved state is "in the lode engine".
+4. Only then, if you want to: drop the build hook that compiled the old daemon
+   from your plugin spec, and delete this plugin's `native/` directory. Neither
+   is done for you — your old daemon keeps working until you remove it, and the
+   old store file stays on disk as a fallback.
 
 ## Configuration
 
@@ -76,8 +111,9 @@ it was built with.
 
 ```lua
 require("lvim-db").setup({
-    -- Absolute path to the daemon binary. nil ⇒ probe: $LVIM_DB_DAEMON, then the
-    -- plugin's own native/build/, then native/target/release/ (a local dev build).
+    -- Absolute path to the engine binary (lode's `loded`). nil ⇒ probe:
+    -- $LODE_DAEMON, $LVIM_DB_DAEMON, `loded` on $PATH, a lode checkout beside the
+    -- plugin, then the old in-plugin native/ build (transition only).
     daemon_path = nil,
     -- Rows loaded per page — the "N" in the dock's `1–N / total` counter, and the step
     -- n / p page by. The daemon streams the object and serves slices on demand, so this
@@ -100,12 +136,14 @@ require("lvim-db").setup({
         "^%s*drop%s",
         "^%s*truncate%s",
     },
-    -- lvim-db's OWN store (saved connections + query history + saved queries) — its own
-    -- SQLite db. nil ⇒ stdpath("data")/lvim-db/.
+    -- Where the LEGACY local store lives, and where the migration marker is written.
+    -- With a lode engine the saved state lives in the ENGINE (see `LODE_DATA_DIR`),
+    -- and this directory is only read once, to import the old data.
+    -- nil ⇒ stdpath("data")/lvim-db/.
     data_dir = nil,
     -- Abandon a connect/handshake that takes longer than this (ms).
     connect_timeout_ms = 15000,
-    -- Notify once (INFO) the first time an action needs the daemon but it is not built.
+    -- Notify once (INFO) the first time an action needs the engine but none is installed.
     warn_on_missing = true,
     -- The keys lvim-db binds INSIDE its own panels (buffer-local — nothing global is
     -- touched). Remap any of them, or set one to `false` to leave it unbound.

@@ -39,11 +39,15 @@ end
 local function check_daemon(h)
     local bin = daemon.binary_path()
     if not bin then
-        h.warn("daemon binary not found — database connections are unavailable")
-        h.info("build it with `sh native/build.sh` (needs a Rust toolchain: cargo)")
+        h.warn("no database engine found — database connections are unavailable")
+        h.info(
+            "install lode (https://github.com/lvim-tech/lode): clone it, run `scripts/build`, then put "
+                .. "`loded` on $PATH or set `daemon_path`. Needs a Rust toolchain (cargo)."
+        )
+        h.info("probed, in order: daemon_path, $LODE_DAEMON, $LVIM_DB_DAEMON, loded on $PATH, a lode checkout")
         return
     end
-    h.ok("daemon binary: " .. bin)
+    h.ok("engine binary: " .. bin)
 
     -- Drive the handshake and wait for it (checkhealth is allowed to block briefly).
     local done, ok_flag, err_msg = false, false, nil
@@ -58,7 +62,22 @@ local function check_daemon(h)
         h.error("daemon failed to start / handshake: " .. tostring(err_msg))
         return
     end
-    h.ok(("backend protocol %d (running)"):format(daemon.proto() or 0))
+    -- WHICH engine is on the other end of the pipe. The plugin accepts both the
+    -- lode engine and the daemon that used to ship inside it, and they are not
+    -- equivalent — only lode carries the shared saved state — so the report
+    -- names the one that actually answered rather than just its protocol number.
+    local eng = daemon.engine()
+    if eng and not eng.legacy then
+        h.ok(("engine: %s %s, protocol %d"):format(eng.name, eng.version, eng.proto or 0))
+    elseif eng then
+        h.warn(("engine: %s, protocol %d"):format(eng.name, eng.proto or 0))
+        h.info(
+            "this is the OLD in-plugin daemon (native/). It still works, but the saved connections, queries "
+                .. "and history stay local to Neovim — install lode to share them with the desktop client."
+        )
+    else
+        h.ok(("backend protocol %d (running)"):format(daemon.proto() or 0))
+    end
 
     local metas = daemon.drivers()
     if #metas == 0 then
@@ -135,13 +154,38 @@ end
 --- losing saved connections / call-log history.
 ---@param h table
 local function check_store(h)
-    local ok, s = pcall(require, "lvim-utils.store")
-    if ok and s.health then
-        s.health(h, false)
-    elseif store.available() then
-        h.ok("persistence store available")
+    -- WHERE the saved state lives is now a real question with two answers, and
+    -- the user needs to know which one they got: in the engine (shared with any
+    -- other lode client) or in the old Neovim-local file.
+    local backend = store.backend()
+    if backend == "engine" then
+        h.ok("saved state: in the lode engine — shared with any other lode client")
+        local eng = daemon.engine()
+        if eng and eng.legacy then
+            h.warn("…but the running backend reports no engine name; this should not happen")
+        end
+        local dir = config.data_dir or (vim.fn.stdpath("data") .. "/lvim-db")
+        local marker = dir .. "/migrated-to-lode"
+        if vim.uv.fs_stat(marker) then
+            local lines = vim.fn.readfile(marker)
+            h.info("migration: " .. (lines[1] or "done"))
+        elseif vim.uv.fs_stat(dir .. "/lvim-db.db") then
+            h.warn("an old local store is still at " .. dir .. "/lvim-db.db and has NOT been imported yet")
+            h.info("it is imported automatically the first time the engine store is used, in this session")
+        end
+    elseif backend == "legacy" then
+        h.warn("saved state: in the OLD Neovim-local file — not shared with other clients")
+        h.info(
+            "the running backend carries no store (protocol < 2, or none found), so lvim-db kept using its "
+                .. "own database. Install lode and the data is imported on the next start."
+        )
+        local ok, s = pcall(require, "lvim-utils.store")
+        if ok and s.health then
+            s.health(h, false)
+        end
     else
-        h.info("persistence store unavailable (saved connections / history disabled)")
+        h.info("saved state unavailable (saved connections / queries / history disabled)")
+        h.info("needs either the lode engine (protocol ≥ 2) or sqlite.lua for the local fallback")
     end
 end
 

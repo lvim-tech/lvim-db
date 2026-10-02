@@ -1,4 +1,4 @@
-*lvim-db.txt*        A full database client backed by an out-of-process Rust daemon
+*lvim-db.txt*      A database client for Neovim, a client of the lode engine
 
 ==============================================================================
 CONTENTS                                                          *lvim-db*
@@ -19,46 +19,68 @@ CONTENTS                                                          *lvim-db*
 1. INTRODUCTION                                             *lvim-db-intro*
 
 lvim-db is a database client for Neovim: connections, schema browsing, a query
-editor, a paged results grid and a call log. The database work runs in a
-SEPARATE process — the Rust `lvim-db-daemon` — which Neovim spawns once and
-talks to over newline-delimited JSON-RPC on stdio.
+editor, a paged results grid and a call log. The database work itself is NOT
+here — it belongs to the `lode` engine (https://github.com/lvim-tech/lode), a
+separate Rust binary (`loded`) that Neovim spawns once and talks to over
+newline-delimited JSON-RPC on stdio. lvim-db is a CLIENT of that engine.
 
 Out-of-process (not an in-editor library) because database drivers need an
 async runtime, connection pools, TLS and query cancellation, and a driver — or
-a native C dependency — crashing must take down the daemon, NOT the editor. If
-the daemon binary is not built the plugin still loads and every action degrades
+a native C dependency — crashing must take down the engine, NOT the editor.
+
+The engine also owns the SAVED STATE: the saved connections, the saved queries
+and the call-log history live in lode's own database, not in Neovim, so the
+editor client and the lode desktop client see ONE set. When no engine with a
+store is found, lvim-db falls back to its old Neovim-local SQLite file and
+keeps working; the first time an engine store is reached, that old file is
+imported (additively, and the file itself is only read).
+
+If no engine is installed the plugin still loads and every action degrades
 gracefully with a single notification.
 
 Database types are PLUGIN TYPES: each driver is one trait + a registry entry in
-the Rust backend, and the Lua side discovers the available drivers (and builds
-each connection form) from the backend at runtime — so a new database type is
-added without touching the core or any Lua.
+the engine, and the Lua side discovers the available drivers (and builds each
+connection form) from the engine at runtime — so a new database type is added
+without touching the core or any Lua.
 
 ==============================================================================
 2. REQUIREMENTS                                      *lvim-db-requirements*
 
-  - Neovim 0.10+
+  - Neovim 0.12+
   - lvim-utils   (palette, store, UI helpers)
   - lvim-ui      (windowed UI primitives)
-  - A Rust toolchain (cargo) to build the daemon
-  - sqlite.lua   (optional) — saved connections + query history
+  - lode         (the database engine) + a Rust toolchain (cargo) to build it
+  - sqlite.lua   (optional) — only for the LEGACY local store, used when no
+                 engine with a store is found
 
 ==============================================================================
 3. INSTALL / BUILD                                        *lvim-db-install*
 
 Install with the lvim-tech installer (lvim-installer) or Neovim's native
-|vim.pack|, call setup(), then build the backend once from the plugin dir: >sh
+|vim.pack| and call setup(). Then install the engine ONCE — it is a separate
+project, shared with the lode desktop client: >sh
 
-  sh native/build.sh
+  git clone https://github.com/lvim-tech/lode
+  cd lode && scripts/build
+  install -Dm755 build/loded ~/.local/bin/loded
 <
-This compiles `lvim-db-daemon` into native/build/ (git-ignored). To include an
-opt-in driver that needs a system library at runtime (Oracle Instant Client),
-pass its feature: >sh
+To include an opt-in driver that needs a system library at runtime, pass its
+feature: >sh
 
-  sh native/build.sh --features oracle
+  scripts/build --features oracle
 <
-Run `:checkhealth lvim-db` to confirm the backend is found and to see the
-driver set it was built with.
+The plugin probes for the engine in this order:
+
+  1. config.daemon_path
+  2. $LODE_DAEMON
+  3. $LVIM_DB_DAEMON
+  4. `loded` on $PATH
+  5. a `lode` checkout beside the plugin tree
+  6. native/build/lvim-db-daemon        (the OLD in-plugin daemon — transition
+     native/target/release/lvim-db-daemon  only; it has no shared store)
+
+Run `:checkhealth lvim-db` to see which engine answered, its version, the
+driver set it was built with, and where the saved state lives.
 
 ==============================================================================
 4. SETUP / CONFIGURATION                                    *lvim-db-setup*
@@ -66,8 +88,9 @@ driver set it was built with.
 setup() merges your options into the live config. The full defaults: >lua
 
   require("lvim-db").setup({
-      daemon_path = nil,              -- nil ⇒ probe $LVIM_DB_DAEMON, native/build,
-                                      --      native/target/release
+      daemon_path = nil,              -- nil ⇒ probe $LODE_DAEMON, $LVIM_DB_DAEMON,
+                                      --      `loded` on $PATH, a lode checkout,
+                                      --      then the old native/ build
       page_size = 50,                 -- rows loaded per page (the N in `1–N/total`)
       drawer_width = 36,              -- width (columns) of the drawer side panel
       confirm_destructive = true,     -- prompt before a destructive statement
@@ -75,7 +98,9 @@ setup() merges your options into the live config. The full defaults: >lua
           "^%s*drop%s",               -- a DELETE/UPDATE with no WHERE is detected
           "^%s*truncate%s",           -- separately (a negative check, not a pattern)
       },
-      data_dir = nil,                 -- nil ⇒ stdpath("data")/lvim-db/
+      data_dir = nil,                 -- the LEGACY local store + migration marker;
+                                      -- nil ⇒ stdpath("data")/lvim-db/. With an
+                                      -- engine the state lives in $LODE_DATA_DIR
       connect_timeout_ms = 15000,
       warn_on_missing = true,
       keys = {                        -- the keys lvim-db binds in its OWN panels
@@ -222,17 +247,22 @@ This also covers token-style provider auth, e.g. an AWS RDS IAM token via
 ==============================================================================
 7. ARCHITECTURE                                      *lvim-db-architecture*
 
-  Neovim (Lua)                      lvim-db-daemon (Rust, tokio)
+  Neovim (Lua)                      loded — the lode engine (Rust, tokio)
     lvim-db.daemon  ── JSON-RPC ──►  registry + Driver/Connection traits
     (spawn, stdio)  ◄── stdout ───   one driver per database type
                                       connect / schema / execute / page / cancel
+    lvim-db.store   ── store.* ───►  the SHARED saved state (its own SQLite db)
+
+  lode desktop client ──────────►   the same engine, the same saved state
 
 Every driver presents results as uniform, paged tables of typed cells, so the
 grid renders any database identically. The whole result is buffered in the
-daemon and paged out to Neovim a page at a time (the editor holds one page).
+engine and paged out to Neovim a page at a time (the editor holds one page).
 
-The protocol is versioned: the Lua side accepts any daemon reporting a protocol
-version >= its minimum, so an additively-grown backend stays compatible.
+The protocol is versioned: the Lua side accepts any engine reporting a protocol
+version >= its minimum, so an additively-grown engine stays compatible. Version
+2 added the `store.*` family (the shared saved state); an engine reporting 1
+still works, with the local store as the fallback.
 
 ==============================================================================
 8. API                                                        *lvim-db-api*
@@ -486,8 +516,10 @@ none itself.
 ==============================================================================
 10. HEALTH                                                 *lvim-db-health*
 
-`:checkhealth lvim-db` reports whether the daemon binary is built and where it
-was found, the negotiated protocol version, the driver set the backend was
-compiled with, and whether the persistence store (sqlite.lua) is available.
+`:checkhealth lvim-db` reports which engine answered (lode and its version, or
+the old in-plugin daemon), where its binary was found, the negotiated protocol
+version, the driver set it was built with, which engines answer which
+introspection facets, and WHERE the saved state lives — in the engine (shared)
+or in the legacy local file — including whether the one-off import has run.
 
 vim:tw=78:ts=8:ft=help:norl:
