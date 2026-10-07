@@ -162,7 +162,11 @@ function M.connect_saved(name, cb)
         cb(nil, ("no saved connection named '%s'"):format(name))
         return
     end
-    local spec = vim.tbl_extend("keep", { driver = conn.driver }, conn.spec or {})
+    -- `name` goes with the spec so the engine's audit log can say WHICH
+    -- connection a statement ran on, in the word a person would search for. The
+    -- engine does not use it to connect; a spec without it produces a record
+    -- that names the driver and leaves the name empty.
+    local spec = vim.tbl_extend("keep", { driver = conn.driver, name = conn.name or name }, conn.spec or {})
     M.connect(spec, cb)
 end
 
