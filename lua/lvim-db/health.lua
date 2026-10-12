@@ -122,15 +122,15 @@ local function check_daemon(h)
         -- Which engines can have a ROW written back from the grid. Same reasoning as the facets above: the
         -- editor is offered per-engine, so a user who finds `e` read-only on one connection and live on
         -- another should be able to read WHY here instead of guessing.
-        local q = require("lvim-db.query")
+        -- The driver's OWN claim (`caps.edit`), not a list of driver names here: a driver claims it only if
+        -- it binds every value and can roll back a write that turned out to match more than one row.
         local rw, ro = {}, {}
         for _, m in ipairs(metas) do
             local name = m.display or m.kind
-            local ok, why = q.can_update_row(m.kind)
-            if ok then
+            if (m.caps or {}).edit then
                 rw[#rw + 1] = name
             else
-                ro[#ro + 1] = ("%s (%s)"):format(name, why)
+                ro[#ro + 1] = ("%s (the driver does not claim it)"):format(name)
             end
         end
         table.sort(rw)

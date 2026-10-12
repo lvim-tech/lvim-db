@@ -274,21 +274,65 @@ end
 --- `rpc.hello` metadata. Empty table for an unknown kind, so a caller can index it without guarding.
 --- The drawer offers a per-object helper ONLY where its driver claims the capability — so no engine ever
 --- grows a row that dead-ends.
+---
+--- A wrapper over `proto.caps`: the declarations are read in ONE module, and this
+--- name stays because it is the one every call site already uses.
 ---@param kind string
 ---@return table
 function M.caps(kind)
-    for _, meta in ipairs(daemon.drivers() or {}) do
-        if meta.kind == kind then
-            return meta.caps or {}
-        end
-    end
-    return {}
+    return require("lvim-db.proto").caps(kind)
 end
 
 -- ─── statements ──────────────────────────────────────────────────────────────
 
+--- Is this statement destructive, and WHY — the engine's answer where there is one.
+---
+--- `query.classify` (protocol 4) is asked, because this is not a question a
+--- client can answer: what `DROP` means, whether an empty MongoDB filter deletes
+--- the whole collection, whether `FLUSHALL` is even a word — those are facts
+--- about a LANGUAGE, and the engine holds all twenty of them. It also comes back
+--- with prose rather than a flag: "DELETE with no WHERE clause removes EVERY
+--- row" is what makes somebody stop, and "this looks destructive" is not.
+---
+--- It takes a DRIVER, not a connection: the question is about the language, so
+--- the answer is the same whether or not anything is open.
+---
+--- The pattern list is the fallback for an engine too old to ask (the daemon
+--- this plugin used to carry) and for the moment before the handshake. The
+--- engine's answer WINS wherever there is one — a second, softer check in Lua
+--- would only ever disagree with the one that matters.
+---
+--- `confirm_destructive = false` is honoured here rather than at each call site,
+--- so "do not stop me" means the same thing on every path.
+---@param driver string
+---@param statement string
+---@param cb fun(dangerous: boolean, reason: string?)
+function M.classify(driver, statement, cb)
+    if not config.confirm_destructive then
+        cb(false, nil)
+        return
+    end
+    if (daemon.proto() or 0) < 4 then
+        cb(M.is_destructive(statement), nil)
+        return
+    end
+    daemon.request("query.classify", { driver = driver, statement = statement }, function(result, err)
+        if err or type(result) ~= "table" then
+            -- The engine could not be asked. Fall back to the patterns rather
+            -- than to "safe": a failed question about a DROP is not a no.
+            cb(M.is_destructive(statement), nil)
+            return
+        end
+        cb(result.dangerous == true, type(result.reason) == "string" and result.reason or nil)
+    end)
+end
+
 --- Whether `statement` matches the configured destructive patterns (DROP /
---- TRUNCATE / unqualified DELETE|UPDATE). Callers gate on this to prompt first.
+--- TRUNCATE / unqualified DELETE|UPDATE).
+---
+--- The FALLBACK half of `M.classify` — a regex over text, which is why it is not
+--- what gets asked first: it knows one dialect's words and reads every other
+--- engine's statement as if it were SQL.
 ---@param statement string
 ---@return boolean
 function M.is_destructive(statement)
@@ -378,6 +422,47 @@ function M.cancel(call_id, cb)
             cb(err)
         end
     end)
+end
+
+-- ─── writing one row ────────────────────────────────────────────────────────
+
+--- Add, change or remove ONE row: VALUES, never a statement.
+---
+--- The engine builds the statement in the driver's dialect and BINDS every value,
+--- which is why nothing on this side quotes anything — a value that never travels
+--- as text cannot become syntax. It also keeps the three rules a client must not
+--- be trusted with: the key has to be exactly the object's key (not a subset, not
+--- the other columns standing in for one), nothing is written without `confirm`,
+--- and a write that turns out to match more than one row is rolled back.
+---
+--- TWO STEPS, deliberately. With `confirm = false` nothing is written and the
+--- answer is `{ applied = false, statement, dangerous, reason }` — the statement
+--- the driver WOULD run, with its placeholders, for a person to read. The same
+--- call with `confirm = true` performs it and answers `{ applied = true,
+--- statement, affected }`. A client cannot skip the question by not asking it.
+---
+--- `key` and `set` are ORDERED pairs (`{ { "id", 7 }, { "note", "x" } }`) so the
+--- statement comes out the same way twice. An INSERT sends no key and the whole
+--- of the new row in `set`; a DELETE sends the key and nothing else.
+---
+--- Values go back as they ARRIVED. The engine's tagged forms (`__oid`, `__int`,
+--- `__bytes`) are read back as the types they stand for, so an ObjectId stays an
+--- ObjectId instead of being flattened to its hex — which would match no document
+--- at all and report success for changing nothing.
+---@param conn_id integer
+---@param plan { obj: table, key: table[]?, set: table[]?, delete: boolean?, insert: boolean? }
+---@param confirm boolean
+---@param cb fun(result: table?, err: string?)
+function M.row_write(conn_id, plan, confirm, cb)
+    daemon.request("row.write", {
+        conn_id = conn_id,
+        obj = plan.obj,
+        key = plan.key or {},
+        set = plan.set or {},
+        delete = plan.delete == true,
+        insert = plan.insert == true,
+        confirm = confirm == true,
+    }, cb)
 end
 
 --- The saved-connection / history store (require("lvim-db").store).

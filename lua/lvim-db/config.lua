@@ -14,10 +14,11 @@
 ---@class LvimDbConfig
 ---@field daemon_path      string?                 Explicit path to the lvim-db-daemon binary; nil = auto-probe
 ---@field page_size        integer                 Rows fetched per result page (the pagination band's page)
+---@field browse_limit     integer                 Rows a table/collection browse is bounded to (the template's `{limit}`)
 ---@field cache            LvimDbCache             Cache call results in the log so the open key shows them (no re-run)
 ---@field drawer_width     integer                 Width (columns) of the connections drawer side panel
----@field confirm_destructive boolean              Confirm before running a statement matching `destructive_patterns`
----@field destructive_patterns string[]            Lua patterns (case-insensitive) that trigger the destructive guard
+---@field confirm_destructive boolean              Confirm before running a statement the engine calls destructive
+---@field destructive_patterns string[]            Lua patterns — the fallback answer for an engine too old to ask
 ---@field data_dir         string?                 Base dir for lvim-db's own store (connections/history/queries); nil = stdpath("data")/lvim-db
 ---@field connect_timeout_ms integer               How long a connect / handshake may take before it is abandoned
 ---@field warn_on_missing  boolean                 Notify once (INFO) when the daemon binary is not built
@@ -95,6 +96,12 @@ return {
     -- many exist; the total is counted separately (COUNT / countDocuments). Raise it to see
     -- more per page, lower it for a lighter redraw.
     page_size = 50,
+    -- How many rows a BROWSE reads — the `{limit}` in the driver's own browse template
+    -- (`DriverMeta.browse`). Every engine's template carries one, so a browse is bounded by
+    -- this number rather than by the client's opinion of the dialect; the grid pages inside
+    -- it (page_size at a time) and the object's real total is counted separately. Raise it to
+    -- page deeper into a big table, lower it on a slow link.
+    browse_limit = 1000,
     -- Cache call results in the session call log by keeping their daemon result-buffers ALIVE.
     --   enabled = true (default): the log's OPEN key re-opens a call's result instantly (no re-execution) —
     --     fully pageable and editable, because it re-points at the same live buffer — and a separate "re-run"
@@ -109,12 +116,16 @@ return {
     -- Width (columns) of the connections drawer side panel.
     drawer_width = 36,
     -- Guard destructive statements: prompt via lvim-ui.confirm before executing one
-    -- that matches a pattern below (dbee has no such guard — this is lvim-db's safety add).
+    -- the ENGINE calls destructive, in the engine's own words (`query.classify`).
+    -- false means "do not stop me" on every path.
     confirm_destructive = true,
-    -- Case-insensitive Lua patterns marking a statement as ALWAYS destructive
-    -- (matched against the lowercased statement). DROP / TRUNCATE by default; a
-    -- DELETE / UPDATE without a WHERE clause is detected separately (see
-    -- `require("lvim-db").is_destructive`) because "no WHERE" needs a negative check.
+    -- The FALLBACK answer, for an engine too old to be asked (`query.classify`
+    -- arrived with protocol 4) and for the moment before the handshake.
+    -- Case-insensitive Lua patterns marking a statement as ALWAYS destructive,
+    -- matched against the lowercased statement; DROP / TRUNCATE by default, and a
+    -- DELETE / UPDATE without a WHERE clause is detected separately because "no
+    -- WHERE" needs a negative check. These know ONE dialect's words — which is
+    -- exactly why the engine is asked first.
     destructive_patterns = {
         "^%s*drop%s",
         "^%s*truncate%s",
@@ -164,6 +175,11 @@ return {
             prev_column = "<C-p>", -- jump to the PREVIOUS column (mirror of next_column)
             edit_row = "e", -- LOCK the focused row for editing (its fields then open one at a time)
             edit_popup = "E", -- edit the focused row in a popup — every column at once, full values
+            -- A row is ADDED and REMOVED with capitals, beside `E`. The lower-case letters in the grid are
+            -- motions, `x` is already "cancel the running call" in the log, and `i`/`a` mean "start typing in
+            -- this field" — so a destructive single letter would be one keystroke from a motion.
+            new_row = "A", -- a form for a NEW row, over the OBJECT's columns
+            delete_row = "D", -- remove the focused row, by its key and nothing else
             -- Bound only while a row is LOCKED, and unbound the moment it is not (the footer swap carries
             -- them — see `edit_footer`), so outside an edit they mean whatever they normally would.
             edit_cell = "<CR>", -- open the field under the cursor in a popup ON the cell

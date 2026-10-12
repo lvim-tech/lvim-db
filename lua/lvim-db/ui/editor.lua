@@ -19,7 +19,7 @@
 --   • NORMAL <CR>  — run the STATEMENT UNDER THE CURSOR (the buffer is split into statements on `;`,
 --                    respecting string literals and comments; the one spanning the cursor line runs).
 --   • VISUAL <CR>  — run the current selection verbatim.
---   • run_buffer   — run the WHOLE buffer as one statement.
+--   • run_buffer   — run every statement in the buffer, in order, after saying how many there are.
 -- Every run goes through `result.run_guarded`, so the destructive-statement guard + call-log/history
 -- apply exactly as for any other run.
 --
@@ -377,6 +377,8 @@ function M.set_active(conn_name)
     state.active = conn_name
     M.update_winbar()
     apply_lang()
+    -- The hint is the DRIVER's, so binding another connection changes what an empty editor suggests.
+    M.paint_hint()
 end
 
 -- ── running ───────────────────────────────────────────────────────────────────
@@ -438,7 +440,18 @@ end
 ---@param stmts { sql: string }[]
 local function run_all(stmts)
     local i = 0
-    local function step()
+    local function step(ok)
+        -- STOPS on the first failure (or refusal), rather than attempting the rest: statement three usually
+        -- depends on statement two, so carrying on after a failed `CREATE TABLE` only produces a second error
+        -- about a table that was never going to exist. How far it got is said, because "it stopped" and "it
+        -- ran them all" must not look the same.
+        if ok == false then
+            vim.notify(
+                ("lvim-db: stopped at statement %d of %d"):format(i, #stmts),
+                vim.log.levels.WARN
+            )
+            return
+        end
         i = i + 1
         local s = stmts[i]
         if not s then
@@ -464,18 +477,61 @@ function M.run_statement()
 end
 
 --- Run the current visual selection (VISUAL <CR>) — ONLY what is selected. SQL runs the selection as one;
---- a MongoDB / Redis selection runs each selected document / command in order (they can't be one request).
+--- The statements in `text`, as the ENGINE cuts them (`query.split`, protocol 21).
+---
+--- Asked of the engine for EVERY dialect, because every dialect's boundaries are facts about it: a semicolon
+--- inside a string or a `$$` body is not one, two JSON documents are two commands however they are laid out,
+--- a Redis buffer is one command per line, and a Flux pipeline is not cut at all. This client used to decide
+--- all of that by driver name, and the engine has two clients that would each have had to get it right.
+---
+--- Falls back to the local splitters for an engine too old to be asked, and to "the text as one statement"
+--- when the question fails — never to a guess.
+---@param text string
+---@param driver string?
+---@param cb fun(statements: string[])
+local function statements_of(text, driver, cb)
+    if not (driver and require("lvim-db.proto").has(21)) then
+        local out = {}
+        for _, s in ipairs(split(text, driver)) do
+            out[#out + 1] = s.sql
+        end
+        return cb(out)
+    end
+    require("lvim-db.daemon").request("query.split", { driver = driver, text = text }, function(res, err)
+        local stmts = type(res) == "table" and res.statements or nil
+        vim.schedule(function()
+            if err or type(stmts) ~= "table" or #stmts == 0 then
+                return cb({ text })
+            end
+            cb(stmts)
+        end)
+    end)
+end
+
+--- Run the current visual selection (VISUAL <CR>) — ONLY what is selected, every statement in it, in order.
+---
+--- No "how many?" question here, unlike `run_buffer`: a selection IS the answer to that question. Where the
+--- boundaries are is still the engine's to say.
 function M.run_selection()
     local buf = api.nvim_get_current_buf()
     local s = api.nvim_buf_get_mark(buf, "<")
     local e = api.nvim_buf_get_mark(buf, ">")
     local text = table.concat(api.nvim_buf_get_lines(buf, s[1] - 1, e[1], false), "\n")
-    local driver = active_driver()
-    if driver == "mongodb" or driver == "redis" then
-        run_all(split(text, driver)) -- each SELECTED document / command, in order
+    if vim.trim(text) == "" then
+        vim.notify("lvim-db: nothing selected to run", vim.log.levels.WARN)
         return
     end
-    run(text) -- SQL: the selection as one
+    statements_of(text, active_driver(), function(stmts)
+        if #stmts <= 1 then
+            run(stmts[1] or text)
+            return
+        end
+        local list = {}
+        for _, sql in ipairs(stmts) do
+            list[#list + 1] = { sql = sql }
+        end
+        run_all(list)
+    end)
 end
 
 --- Run the whole buffer. SQL sends it as one batch (the driver runs the `;`-separated statements). A
@@ -484,12 +540,41 @@ end
 function M.run_buffer()
     local buf = M.ensure_buf()
     local text = table.concat(api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-    local driver = active_driver()
-    if driver == "mongodb" or driver == "redis" then
-        run_all(split(text, driver)) -- run every document / command in order
+    if vim.trim(text) == "" then
+        vim.notify("lvim-db: nothing to run", vim.log.levels.WARN)
         return
     end
-    run(text) -- SQL: the whole buffer as one batch
+    statements_of(text, active_driver(), function(stmts)
+        if #stmts <= 1 then
+            run(stmts[1] or text)
+            return
+        end
+        -- MORE THAN ONE. Not run silently: "run buffer" on a file of eight statements is a different act
+        -- from running one, and the count is the thing worth knowing BEFORE it starts. Cancelling runs
+        -- nothing at all, which is the third answer and the reason this is a list and not a yes/no.
+        local items = {
+            { label = ("  run all %d, in order"):format(#stmts), all = true },
+            { label = "  run only the first", all = false },
+        }
+        require("lvim-ui").select({
+            title = ("%d statements in this buffer"):format(#stmts),
+            items = items,
+            callback = function(confirmed, idx)
+                if not (confirmed and items[idx]) then
+                    return
+                end
+                if not items[idx].all then
+                    run(stmts[1])
+                    return
+                end
+                local list = {}
+                for _, sql in ipairs(stmts) do
+                    list[#list + 1] = { sql = sql }
+                end
+                run_all(list)
+            end,
+        })
+    end)
 end
 
 -- ── saving / loading queries ──────────────────────────────────────────────────
@@ -732,8 +817,49 @@ local function set_keys(buf)
     end, { buffer = buf, nowait = true, silent = true, desc = "lvim-db: enter the editor footer bar" })
 end
 
+
+-- ── what an empty editor suggests ────────────────────────────────────────────
+
+---@type integer the namespace for the ghost hint on an empty buffer
+local HINT_NS = api.nvim_create_namespace("lvim_db_editor_hint")
+
+--- Show the active driver's own `hint` on an empty buffer, as GHOST TEXT.
+---
+--- The engine declares what an empty editor should suggest, in the language the connection actually speaks
+--- (`DriverMeta.hint`, protocol 3): `SELECT * FROM table LIMIT 100` for SQL, `{"find": "collection", "limit":
+--- 50}` for MongoDB, `GET key` for Redis. A client that showed SQL for all of them invited SQL into a MongoDB
+--- connection, which answers `statement must be a JSON document: expected value at line 1 column 1`.
+---
+--- Virtual text, NOT buffer content — which is what keeps the old decision ("start empty, the user writes
+--- from scratch") intact: there is nothing to delete, nothing to run by accident, and `run_buffer` on an
+--- untouched editor still has nothing to send. It goes the moment anything is typed, and comes back if the
+--- buffer is emptied again.
+local function paint_hint()
+    local buf = state.buf
+    if not (buf and api.nvim_buf_is_valid(buf)) then
+        return
+    end
+    api.nvim_buf_clear_namespace(buf, HINT_NS, 0, -1)
+    local lines = api.nvim_buf_get_lines(buf, 0, -1, false)
+    if #lines > 1 or vim.trim(lines[1] or "") ~= "" then
+        return
+    end
+    local driver = active_driver()
+    local hint = driver and require("lvim-db.proto").hint(driver) or ""
+    if hint == "" then
+        return -- an engine that said nothing suggests nothing, rather than being guessed for
+    end
+    pcall(api.nvim_buf_set_extmark, buf, HINT_NS, 0, 0, {
+        virt_text = { { hint, "Comment" } },
+        virt_text_pos = "overlay",
+    })
+end
+
+M.paint_hint = paint_hint
+
 --- Ensure the persistent editor scratch buffer exists (creating + configuring it once) and return
---- it. A nofile `sql` scratch marked with `MARK`, seeded with a hint comment and the run/save keys.
+--- it. A nofile `sql` scratch marked with `MARK`, seeded with the run/save keys and, while it is empty, the
+--- active driver's own hint as ghost text.
 ---@return integer
 function M.ensure_buf()
     if state.buf and api.nvim_buf_is_valid(state.buf) then
@@ -748,10 +874,16 @@ function M.ensure_buf()
     -- lvim-cmp skips scratch buffers (they are usually UI); this one is a genuine editor —
     -- opt it in through the buffer-local seam so completion runs like on a real file.
     vim.b[buf].lvim_cmp_enable = true
-    -- Start EMPTY — no starter hint/template (the user writes from scratch, in any dialect).
+    -- Start EMPTY — no starter template in the BUFFER (the user writes from scratch, in any dialect). What
+    -- the engine suggests is drawn over the empty line as ghost text instead; see `paint_hint`.
     api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
     set_keys(buf)
     state.buf = buf
+    api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "BufEnter" }, {
+        buffer = buf,
+        desc = "lvim-db: the empty editor's ghost hint",
+        callback = paint_hint,
+    })
     -- The scratch buffer never triggers lvim-installer's automatic offer, so ask for the sql
     -- tooling (treesitter parser / LSP server) explicitly the one time the editor is created.
     offer_tooling("sql")

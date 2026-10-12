@@ -608,6 +608,31 @@ local function load_schema(conn)
     end)
 end
 
+--- Re-read the schema of a LIVE connection, because a statement changed it.
+---
+--- Called when the engine says so (`query.state.schema_changed`, protocol 26) and never guessed at from the
+--- statement's text: `{"create": …}` is a schema change in mongo and `{"find": …}` is not, a `DROP` inside a
+--- string is neither, and the driver is the only side that can tell. A tree still listing a table that was
+--- dropped a second ago is a tree that lies, and the next click on it opens an error.
+---
+--- No-op for a connection this drawer does not hold open — a statement run from the editor against a
+--- connection the tree never expanded has no nodes to refresh.
+---@param conn_id integer
+function M.reload_schema(conn_id)
+    for _, conn in pairs((state.conns or {})) do
+        if conn.conn_id == conn_id and conn.nodes then
+            require("lvim-db").structure(conn_id, function(nodes, err)
+                if err then
+                    return -- the statement worked; a failed re-read is not its failure
+                end
+                conn.nodes = nodes or {}
+                M.refresh()
+            end)
+            return
+        end
+    end
+end
+
 --- Adopt a connection the EDITOR opened (a query-triggered connect) into the drawer, so the tree reflects
 --- the live link (the Schema gate becomes the real tree) and later runs reuse the one connection instead of
 --- opening a second. Loads the structure once. No-op for an unknown / already-live connection.
@@ -634,11 +659,35 @@ end
 local function helper_action(row)
     local conn, obj = row.conn, row.obj
     if row.helper.id == "data" then
-        -- BROWSE the whole object (no LIMIT): the daemon streams it and the grid pages on demand (n / p), so
-        -- the counter reads `1–<page_size> / <total>` and you can page all the way through — not just the
-        -- first page. Guarded runner for consistency (a SELECT never trips the guard).
-        local q = require("lvim-db.query")
-        local stmt = q.preview_statement(conn.driver, row.schema.name, obj.name, nil)
+        -- BROWSE this object, in the ENGINE'S OWN WORDS: the statement is the driver's `browse` template with
+        -- the name, the schema and the limit put in (`meta.browse`). It is not written here, and that is the
+        -- point — a table is `SELECT *`, a Redis hash is `HGETALL`, a sorted set is `ZRANGE … WITHSCORES`, and
+        -- the driver is also what labelled the node, so `obj.kind` picks the right one of its templates.
+        --
+        -- The template carries `{limit}`, so a browse is BOUNDED by whatever the client puts there
+        -- (`config.browse_limit`) rather than unbounded: the words are the driver's and the number is ours.
+        -- The grid still pages inside that (n / p), and the counter still reads `… / <total>` because the
+        -- total is counted separately, against the object.
+        --
+        -- Guarded runner for consistency (a read never trips the guard — and the engine, not a regex here, is
+        -- what says so).
+        local proto = require("lvim-db.proto")
+        local stmt = proto.render_browse(
+            proto.meta(conn.driver),
+            obj.kind,
+            {},
+            obj.name,
+            row.schema.name,
+            require("lvim-db.config").browse_limit
+        )
+        if stmt == "" then
+            -- The engine declared no browse for this driver: say so instead of running an empty statement.
+            vim.notify(
+                ("lvim-db: %s declares no way to read one object"):format(conn.driver),
+                vim.log.levels.WARN
+            )
+            return
+        end
         -- Pass the ORIGIN: these rows ARE this object's, so the result dock can address them (edit them) AND
         -- count them for the total. An ad-hoc statement from the editor passes none and stays read-only.
         require("lvim-db.ui.result").run_guarded(conn.conn_id, conn.name, conn.driver, stmt, {
@@ -661,114 +710,73 @@ local function helper_action(row)
     end
 end
 
--- ── schema actions: GENERATE a statement, never run one ───────────────────────
+-- ── schema changes: GENERATED, never run ───────────────────────────────────
 --
--- `add` / `edit` / `delete` already mean "act on the thing under the cursor" for connections; on the schema
--- rows they mean the same thing one tier down — add/rename/drop a COLUMN, create/drop an INDEX. The result
--- is a statement dropped in the SQL editor for the user to read and run, NOT an execute:
---
---   • `ALTER` dialects diverge far more than `SELECT`, and some engines cannot do what a tidy form implies —
---     SQLite has no ALTER COLUMN at all, so changing a type means rebuilding the table and copying the data.
---     A generated statement makes that impossible to do silently.
---   • Every real client (DBeaver included) shows the SQL and asks first, for exactly that reason.
---   • The destructive guard still applies when the user runs it.
+-- `a` / `e` / `x` on a schema row mean what they mean everywhere else, one tier down: act on the thing under
+-- the cursor. WHICH acts exist there is the engine's answer now (`DriverMeta.ddl_ops`, each with its
+-- `scope`), and the statement they produce goes into the SQL editor to be read and run by a person — see
+-- `ui/ddl.lua`. The five generators this file used to call are gone with the dialect knowledge in them.
 
---- Put `stmt` in the editor, bound to `conn`, or report why the engine has none.
----@param conn LvimDbDrawerConn
----@param stmt string?
----@param what string   what was being generated (for the message when it cannot be)
-local function to_editor(conn, stmt, what)
-    if not stmt then
-        vim.notify(("lvim-db: %s has no '%s' statement"):format(conn.driver, what), vim.log.levels.WARN)
-        return
+--- WHAT A ROW IS, in the words the declaration uses for it.
+---
+--- Each declared operation says what it is done TO (`DdlOp.scope`, protocol 26), so a row answers with its
+--- scope and the menu is a FILTER. This replaced the client deciding by NAME — `columns_h` offers
+--- `add_column`, an index row offers `drop_index` — which is a guess from the one operation that happened to
+--- exist and is wrong for the next one any dialect declares.
+---
+--- nil for a row that is not part of a schema (a connection, a saved query): those keep the gestures they
+--- always had.
+---@param row table
+---@return string? scope, table? ctx
+local function scope_of(row)
+    local schema = row.schema and row.schema.name or nil
+    local obj = row.obj and row.obj.name or ""
+    if row.kind == "column" then
+        return "column", { schema = schema, table = obj, column = row.col and row.col.name or "" }
     end
-    require("lvim-db.ui.editor").load_text(conn.name, stmt)
+    if row.kind == "index" then
+        return "index", { schema = schema, table = obj, index = row.index and row.index.name or "" }
+    end
+    if row.kind == "helper" then
+        local id = row.helper and row.helper.id
+        if id == "columns" then
+            return "column", { schema = schema, table = obj }
+        end
+        if id == "indexes" then
+            return "index", { schema = schema, table = obj }
+        end
+        return nil
+    end
+    if row.kind == "object" then
+        return "object", { schema = schema, table = obj }
+    end
+    -- A schema node, or the connection itself on an engine with no schemas: this is where something that
+    -- does not exist yet is made, and `{qualified}` comes from the ask called `name` rather than from an
+    -- object there is none of.
+    if row.kind == "schema" then
+        return "new", { schema = schema, table = "" }
+    end
+    if row.kind == "connection" and row.conn and row.conn.conn_id and not require("lvim-db").caps(row.conn.driver).schemas then
+        return "new", { table = "" }
+    end
+    return nil
 end
 
---- Prompt with `lvim-ui.input` (never `vim.ui.input` — the canon), then run `cb(value)` on a non-empty answer.
----@param title string
----@param default string?
----@param cb fun(value: string)
-local function ask(title, default, cb)
-    require("lvim-ui").input({
-        title = title,
-        default = default or "",
-        -- `lvim-ui.input` answers (confirmed, value) — NOT (value): a cancel arrives as `false` and must not
-        -- be read as an empty name.
-        callback = function(ok, value)
-            if ok and value and vim.trim(value) ~= "" then
-                cb(vim.trim(value))
-            end
-        end,
-    })
-end
-
---- `add` on a schema row: a column under `Columns`, an index under `Indexes`.
+--- The declared schema changes for the row under the cursor. True when this row had any to offer, so the
+--- caller can fall through to what the key means elsewhere.
 ---@param row table
 ---@return boolean handled
-local function schema_add(row)
-    local q = require("lvim-db.query")
-    local conn, obj, schema = row.conn, row.obj, row.schema and row.schema.name
-    local branch = (row.kind == "helper" and row.helper.id)
-        or (row.kind == "column" and "columns")
-        or (row.kind == "index" and "indexes")
-    if branch == "columns" then
-        ask("New column (name)", nil, function(name)
-            ask("Type for " .. name, "TEXT", function(ty)
-                to_editor(conn, q.add_column(conn.driver, schema, obj.name, name, ty), "add column")
-            end)
-        end)
-        return true
-    elseif branch == "indexes" then
-        ask("New index (name)", ("idx_%s_"):format(obj.name), function(name)
-            ask("Column(s), comma separated", nil, function(cols)
-                local list = {}
-                for c in cols:gmatch("[^,]+") do
-                    list[#list + 1] = vim.trim(c)
-                end
-                to_editor(conn, q.create_index(conn.driver, schema, obj.name, name, list, false), "create index")
-            end)
-        end)
-        return true
-    end
-    return false
-end
-
---- `edit` on a schema row: rename the column under the cursor. An index is not renamed — most engines have no
---- such statement, and the honest move is to drop and recreate it, which the other two keys already do.
----@param row table
----@return boolean handled
-local function schema_edit(row)
-    if row.kind ~= "column" then
+local function schema_ops(row)
+    local scope, ctx = scope_of(row)
+    if not (scope and ctx and row.conn) then
         return false
     end
-    local q = require("lvim-db.query")
-    local conn, obj = row.conn, row.obj
-    ask("Rename column '" .. row.col.name .. "' to", row.col.name, function(to)
-        to_editor(
-            conn,
-            q.rename_column(conn.driver, row.schema and row.schema.name, obj.name, row.col.name, to),
-            "rename column"
-        )
-    end)
-    return true
-end
-
---- `delete` on a schema row: drop the column / index under the cursor.
----@param row table
----@return boolean handled
-local function schema_delete(row)
-    local q = require("lvim-db.query")
-    local conn, obj = row.conn, row.obj
-    local schema = row.schema and row.schema.name
-    if row.kind == "column" then
-        to_editor(conn, q.drop_column(conn.driver, schema, obj.name, row.col.name), "drop column")
-        return true
-    elseif row.kind == "index" then
-        to_editor(conn, q.drop_index(conn.driver, schema, obj.name, row.index.name), "drop index")
+    if not row.conn.conn_id then
+        vim.notify("lvim-db: connect first — the schema changes come from the engine", vim.log.levels.WARN)
         return true
     end
-    return false
+    require("lvim-db.ui.ddl").menu(row.conn, ctx, scope)
+    return true
 end
 
 --- Toggle expand/collapse (or connect) on the row under the cursor.
@@ -1151,12 +1159,13 @@ local function set_keys(chassis_map)
     end)
     map(k.disconnect, disconnect_row)
     map(k.action, default_action)
+    -- CONTEXT-sensitive, as it always was: on a schema row, `a` / `e` / `x` all open the DECLARED schema
+    -- changes for what that row is (`scope_of`), because the declaration is what says which operations
+    -- exist there — this client no longer knows that a column can be renamed and an index cannot. On a
+    -- connection row they keep their old meanings: add, edit and delete a saved connection.
     map(k.add, function()
-        -- CONTEXT-sensitive, the same way it already was for a connection: `a` adds "the kind of thing this
-        -- row is a list of" — a column under Columns, an index under Indexes, and (anywhere else) a
-        -- connection, which is what it has always done.
         local row = current_row()
-        if row and schema_add(row) then
+        if row and row.kind ~= "connection" and schema_ops(row) then
             return
         end
         require("lvim-db.ui.form").open()
@@ -1166,13 +1175,12 @@ local function set_keys(chassis_map)
         if row and row.kind == "connection" then
             require("lvim-db.ui.form").open(row.conn.name)
         elseif row then
-            schema_edit(row)
+            schema_ops(row)
         end
     end)
     map(k.delete, function()
         local row = current_row()
-        if row and (row.kind == "column" or row.kind == "index") then
-            schema_delete(row)
+        if row and row.kind ~= "connection" and schema_ops(row) then
             return
         end
         if row and row.kind == "connection" then

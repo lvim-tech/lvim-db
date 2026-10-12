@@ -740,6 +740,32 @@ end
 --- Resolve the current origin's KEY columns, then call `cb(key|nil)`. Cached on the origin: it is a property
 --- of the object, and re-asking on every keystroke would put a round-trip in the edit path.
 ---@param cb fun(key: string[]?)
+--- The OBJECT's columns — `schema.columns`, cached on the origin — or nil when they cannot be had.
+---
+--- NOT the result's columns, and the difference is load-bearing: `SELECT a, b` does not mean the table has
+--- two columns, so a form for a new row built from a result would silently drop the other eight. It is also
+--- where `primary` and `kind` come from, which is why one request answers three questions.
+---
+--- Not cached on an RPC error: an empty list remembered would read as "this object has no columns" forever.
+---@param cb fun(columns: table[]?)
+local function resolve_columns(cb)
+    local o = state.origin
+    if not (o and o.object and state.conn_id) then
+        return cb(nil)
+    end
+    if o.meta_columns then
+        return cb(o.meta_columns)
+    end
+    require("lvim-db").columns(state.conn_id, { name = o.object, schema = o.schema }, function(cols, err)
+        if err then
+            vim.notify("lvim-db: could not read the object's columns: " .. tostring(err), vim.log.levels.WARN)
+            return cb(nil)
+        end
+        o.meta_columns = cols or {}
+        cb(o.meta_columns)
+    end)
+end
+
 local function resolve_key(cb)
     local o = state.origin
     if not (o and state.conn_id) then
@@ -748,15 +774,12 @@ local function resolve_key(cb)
     if o.key then
         return cb(#o.key > 0 and o.key or nil)
     end
-    require("lvim-db").columns(state.conn_id, { name = o.object, schema = o.schema }, function(cols, err)
-        -- Do NOT cache a key on an RPC error — an empty result would remember the object as keyless
-        -- (read-only) forever. Surface the reason and leave `o.key` nil so the next attempt retries.
-        if err then
-            vim.notify("lvim-db: could not resolve key: " .. tostring(err), vim.log.levels.WARN)
+    resolve_columns(function(cols)
+        if not cols then
             return cb(nil)
         end
         local key = {}
-        for _, c in ipairs(cols or {}) do
+        for _, c in ipairs(cols) do
             if c.primary then
                 key[#key + 1] = c.name
             end
@@ -774,11 +797,17 @@ local function readonly_reason()
     if not o then
         return "this result is not one object's rows — open a table's Data facet to edit"
     end
-    -- Ask the DIALECT before the data: an engine that cannot express "update this one row" makes the key
-    -- question moot, and saying so up front beats letting the user type an edit that could never be sent.
-    local ok, why = require("lvim-db.query").can_update_row(state.driver)
-    if not ok then
-        return why
+    -- Ask the ENGINE before the data. `caps.edit` is the DRIVER'S OWN claim that it can write one row
+    -- safely — bind every value, and roll the write back if it turned out to match more than one row — and a
+    -- driver that can merely build an UPDATE does not make it. This used to be a list of driver names in this
+    -- file, and the list was wrong: it said Redis had no addressable row to update while the engine's Redis
+    -- driver was editing hash fields.
+    local proto = require("lvim-db.proto")
+    if not proto.has(5) then
+        return "this engine cannot write single rows (it is older than protocol 5)"
+    end
+    if not proto.caps(state.driver).edit then
+        return ("the %s driver does not write single rows"):format(state.driver)
     end
     if o.key and #o.key == 0 then
         return ("'%s' has no primary key — a row cannot be addressed uniquely"):format(o.object)
@@ -786,22 +815,33 @@ local function readonly_reason()
     return nil
 end
 
---- Count the origin object's TOTAL rows (COUNT(*) / mongo `count`) and stash it on the origin, then rebuild
---- the header so the counter reads `1–N / <total>` right away instead of `?` (the daemon only learns the
---- total by streaming to the END, which for a big table never happens on the first page). Runs through the
---- LOW-LEVEL `db.execute` — NOT `M.run` — so this background count never appears in the call log or replaces
---- the visible result. Cached on the origin (a property of the object); a driver with no cheap count (redis)
---- returns no statement and the counter stays `?`.
+--- Count the origin object's TOTAL rows with the DRIVER'S OWN count template and stash it on the origin, then
+--- rebuild the header so the counter reads `1–N / <total>` right away instead of `?`.
+---
+--- The total cannot come from the browse: a browse is BOUNDED (`config.browse_limit`), so it knows how much
+--- it read and never how much there is. It cannot come from the daemon's own row count either — that is only
+--- known once a result has streamed to the END, which for a big table never happens on the first page.
+---
+--- The statement is `DriverMeta.count` filled in, not written here: CQL's COUNT takes no alias, a document
+--- store counts with a command, and several engines have no cheap count at all and declare an empty template.
+--- Runs through the LOW-LEVEL `db.execute` — NOT `M.run` — so this background count never appears in the call
+--- log or replaces the visible result. Cached on the origin, because it is a property of the object.
 ---@param origin table  the SAME table set on `state.origin` (identity-checked before it is used, so a later
 ---       run's count cannot land on this one)
 local function fetch_total(origin)
     if not (state.conn_id and state.driver) then
         return
     end
-    local stmt = require("lvim-db.query").count_statement(state.driver, origin.schema, origin.object)
-    if not stmt then
+    -- The ENGINE'S count template (protocol 28), filled in here. An empty one is
+    -- an answer — "do not ask me" — from an engine that has no cheap count: a
+    -- Redis key, an object listing, a log stream, a time series. The counter then
+    -- stays `?`, which is true, instead of a number paid for with a full scan.
+    local proto = require("lvim-db.proto")
+    local meta = proto.meta(state.driver)
+    if (meta.count or "") == "" then
         return
     end
+    local stmt = proto.render_full(meta.count, { name = origin.object, schema = origin.schema })
     local db = require("lvim-db")
     local cid
     db.execute(state.conn_id, stmt, function(st)
@@ -1150,29 +1190,47 @@ end
 ---@param ri integer      the result row (== the buffer line)
 ---@param row table       the row's RAW values (not the display strings)
 ---@param key string[]    its key columns
-local function start_edit(ri, row, key)
+--- The focused row's ADDRESS: its key columns paired with the values the row carries NOW, which is what the
+--- engine matches on. nil (having said why) when a key column is not in this result.
+---
+--- That refusal is the point: a projection (`SELECT a, b`) may not carry the key at all, and a row that
+--- cannot be addressed must not be guessed at — an invented address is a write to some OTHER row.
+---@param row any[]       the result row, raw values
+---@param key string[]    the object's key column names
+---@return { name: string, value: any }[]?
+local function address_of(row, key)
     local g = state.grid
-    if not (g and g.rows[ri]) then
-        return
+    if not g then
+        return nil
     end
     local index = {}
     for ci, c in ipairs(g.cols) do
         index[c.name] = ci
     end
-    -- Capture the key's ORIGINAL values now — this is the "locked by its key" part.
     local where = {}
     for _, name in ipairs(key) do
         local ci = index[name]
         if not ci then
-            -- The key is not in this result (a projection, not `SELECT *`): there is nothing to address the
-            -- row by, and guessing one would be a rewrite of some other row.
             vim.notify(
                 ("lvim-db: key column '%s' is not in this result — cannot address the row"):format(name),
                 vim.log.levels.WARN
             )
-            return
+            return nil
         end
         where[#where + 1] = { name = name, value = row[ci] }
+    end
+    return where
+end
+
+local function start_edit(ri, row, key)
+    local g = state.grid
+    if not (g and g.rows[ri]) then
+        return
+    end
+    -- Capture the key's ORIGINAL values now — this is the "locked by its key" part.
+    local where = address_of(row, key)
+    if not where then
+        return
     end
     -- `pending[ci] = { value = … }` — a BOX, not the bare value: setting a field to NULL means a pending
     -- `nil`, and a bare nil in a Lua table is indistinguishable from "never touched", so the NULL would be
@@ -1448,13 +1506,8 @@ local function save_edit()
         cancel_edit()
         return
     end
-    local stmt, why = require("lvim-db.query").update_row(state.driver, o.schema, o.object, set, e.where)
-    if not stmt then
-        vim.notify("lvim-db: " .. tostring(why), vim.log.levels.WARN)
-        return
-    end
     cancel_edit()
-    M.write(stmt)
+    M.write_row(set, e.where)
 end
 
 -- ── editing a row in a POPUP (every column at once) ──────────────────────────
@@ -1612,19 +1665,8 @@ local function open_row_popup(_, row, key, readonly)
                                             st.close()
                                             return
                                         end
-                                        local stmt, err = require("lvim-db.query").update_row(
-                                            state.driver,
-                                            o.schema,
-                                            o.object,
-                                            set,
-                                            where
-                                        )
-                                        if not stmt then
-                                            vim.notify("lvim-db: " .. tostring(err), vim.log.levels.WARN)
-                                            return
-                                        end
                                         st.close()
-                                        M.write(stmt)
+                                        M.write_row(set, where)
                                     end,
                                 }
                             or nil,
@@ -1656,6 +1698,145 @@ local function edit_popup()
     end)
 end
 
+-- ── adding and removing a row ────────────────────────────────────────────────
+--
+-- Both go through the engine's `row.write`, the same door an edit goes through:
+-- values, never a statement, nothing written before the statement it would run has been shown. What differs
+-- between the three is one flag — which is why a client cannot get one of them right and the others wrong.
+
+--- `delete_row`: remove the focused row, addressed by its key and nothing else.
+local function delete_row()
+    if state.view ~= "result" or state.edit then
+        return
+    end
+    local why = readonly_reason()
+    if why then
+        vim.notify("lvim-db: cannot remove a row here — " .. why, vim.log.levels.WARN)
+        return
+    end
+    local ri = api.nvim_win_get_cursor(0)[1]
+    local row = state.page and state.page.rows and state.page.rows[ri]
+    if not (row and state.grid and state.grid.rows[ri]) then
+        return
+    end
+    resolve_key(function(key)
+        if not key then
+            vim.notify("lvim-db: cannot remove a row here — " .. (readonly_reason() or "no key"), vim.log.levels.WARN)
+            return
+        end
+        local where = address_of(row, key)
+        if where then
+            -- NO confirm of our own in front of this. `write_row` asks the engine what it WOULD run, shows
+            -- that statement, and writes nothing until it is answered — a dialog of ours before it would be
+            -- this client asking a question whose answer it does not have.
+            M.write_row({}, where, { delete = true })
+        end
+    end)
+end
+
+--- The form for a new row: one box per column of the OBJECT, then one insert.
+---
+--- The columns are the object's, not the result's: `SELECT a, b` does not mean the table has two columns, and
+--- a form built from a projection would quietly leave the other eight out of the row.
+---
+--- Key columns are MARKED (`pk`) and not withheld. A table whose key is a counter wants them left empty; one
+--- whose key is a code wants them typed in — and only the person at the keyboard knows which this is.
+---@param cols table[]  the object's columns (`schema.columns`)
+local function open_insert_form(cols)
+    local o = state.origin
+    local fk = config.keys.result
+    -- The rule of the form, as its first line: the two things an empty box could mean are different, and this
+    -- says which is which before anybody types.
+    local rows = {
+        { type = "spacer", flat = true, tight = true, label = "empty = the column's default · null = NULL" },
+    }
+    for _, c in ipairs(cols) do
+        local note = c.type or c.kind or ""
+        if c.primary then
+            note = note ~= "" and (note .. " · pk") or "pk"
+        end
+        rows[#rows + 1] = {
+            type = "string",
+            name = c.name,
+            label = c.name,
+            value = "",
+            suffix = note ~= "" and ("(" .. note .. ")") or nil,
+        }
+    end
+    require("lvim-ui").tabs({
+        title = ("New row — %s"):format(o.object),
+        title_pos = "center",
+        layout = "float",
+        tabs = {
+            {
+                label = "Row",
+                rows = rows,
+                footer = {
+                    fk.save_edit and {
+                        key = fk.save_edit,
+                        label = "add",
+                        run = function(st)
+                            -- The row tables are mutated IN PLACE by the form, so what is read here is what
+                            -- is on screen.
+                            local typed = {}
+                            for _, r in ipairs(rows) do
+                                if r.name then
+                                    typed[r.name] = tostring(r.value or "")
+                                end
+                            end
+                            local set = require("lvim-db.rules").insert_set(cols, typed)
+                            if #set == 0 then
+                                vim.notify(
+                                    "lvim-db: nothing to add — a new row with no values in it is not a row",
+                                    vim.log.levels.INFO
+                                )
+                                return
+                            end
+                            st.close()
+                            M.write_row(set, {}, { insert = true })
+                        end,
+                    } or nil,
+                    fk.close and { key = fk.close, label = "close", no_hotkey = true } or nil,
+                },
+            },
+        },
+    })
+end
+
+--- `new_row`: the three refusals, then the form.
+local function new_row()
+    if state.view ~= "result" or state.edit then
+        return
+    end
+    local proto = require("lvim-db.proto")
+    local o = state.origin
+    if not (o and o.object) then
+        vim.notify(
+            "lvim-db: this result is not one object's rows — open a table's Data facet to add one",
+            vim.log.levels.WARN
+        )
+        return
+    end
+    -- Protocol 27 is where `row.write` learned to ADD. An older engine would ignore the flag and read the
+    -- empty key as "this is not the object's key", refusing with a reason about addressing a row that was
+    -- never meant to be addressed — so it is not asked.
+    if not proto.has(27) then
+        vim.notify("lvim-db: this engine cannot add rows (it is older than protocol 27)", vim.log.levels.WARN)
+        return
+    end
+    if not proto.caps(state.driver).edit then
+        vim.notify(("lvim-db: the %s driver does not write single rows"):format(state.driver), vim.log.levels.WARN)
+        return
+    end
+    resolve_columns(function(cols)
+        if not cols or #cols == 0 then
+            vim.notify("lvim-db: no columns to fill in yet", vim.log.levels.WARN)
+            return
+        end
+        open_insert_form(cols)
+    end)
+end
+
 -- ── the help window (the canonical cheatsheet) ───────────────────────────────
 
 -- Key id → description, in display order. Built from the LIVE `config.keys.result`, so a rebind shows up
@@ -1675,6 +1856,8 @@ local HELP = {
     { "prev_column", "result: jump to the previous column" },
     { "edit_row", "result: lock the focused row for editing" },
     { "edit_popup", "result: edit the focused row in a popup (every field)" },
+    { "new_row", "result: add a row (a form over the object's columns)" },
+    { "delete_row", "result: remove the focused row" },
     { "edit_cell", "editing: open the field under the cursor" },
     { "insert_cell", "result: start editing the field under the cursor" },
     { "save_edit", "editing: write every changed field back (one UPDATE)" },
@@ -1799,7 +1982,16 @@ local function browse_footer()
     local k = config.keys.result
     return {
         bars = {
-            surface.bar({ { "prev", "next" }, { "edit", "edit_popup" }, { "yank", "export" }, { "help", "close" } }, {
+            surface.bar({
+                { "prev", "next" },
+                { "edit", "edit_popup" },
+                -- Adding and removing sit in their own group, beside editing but not inside it: they are
+                -- writes of a different KIND, and a chip that reads `add  remove` next to `edit  edit row`
+                -- says that without a word.
+                { "new_row", "delete_row" },
+                { "yank", "export" },
+                { "help", "close" },
+            }, {
                 prev = {
                     name = "prev",
                     key = k.prev_page or nil,
@@ -1831,6 +2023,20 @@ local function browse_footer()
                     key = k.edit_popup or nil,
                     run = function()
                         edit_popup()
+                    end,
+                },
+                new_row = {
+                    name = "add row",
+                    key = k.new_row or nil,
+                    run = function()
+                        new_row()
+                    end,
+                },
+                delete_row = {
+                    name = "remove row",
+                    key = k.delete_row or nil,
+                    run = function()
+                        delete_row()
                     end,
                 },
                 yank = { name = "yank", key = k.yank or nil, run = yank_page },
@@ -2042,6 +2248,8 @@ local function open_dock()
             edit_row()
         end)
         map(k.edit_popup, edit_popup)
+        map(k.new_row, new_row)
+        map(k.delete_row, delete_row)
         -- "start typing here", the way i/a mean it everywhere else: open the field under the cursor, taking
         -- the row lock first if it is not held. Bound rather than left alone BECAUSE the grid is read-only —
         -- an unbound `i` falls through to the builtin insert and raises E21 on every press.
@@ -2172,7 +2380,7 @@ end
 ---       passes it; an ad-hoc statement passes nothing and its result stays read-only.
 ---@param offset? integer  which page to land on (default 0). The refresh after a row is written passes the
 ---       page the user was ON, so saving an edit does not throw them back to the top of a long table.
----@param on_done fun()?  fired when the statement resolves (success OR failure) — lets a caller run the NEXT
+---@param on_done fun(ok: boolean)?  fired when the statement resolves, with whether it WORKED — lets a caller run the NEXT
 ---                       statement of a multi-statement buffer only after this one finished (see the editor).
 function M.run(conn_id, conn_name, driver, statement, origin, offset, on_done)
     local db = require("lvim-db")
@@ -2232,6 +2440,13 @@ function M.run(conn_id, conn_name, driver, statement, origin, offset, on_done)
             rows = st.affected,
         })
         relog()
+        -- DID THE SCHEMA MOVE? The driver says (protocol 26), because a client cannot tell from the text:
+        -- `{"create": …}` is a schema change in mongo and `{"find": …}` is not, and `DROP` inside a string is
+        -- not one at all. A tree that still lists a table somebody just dropped is a tree that lies, and the
+        -- next click on it opens an error.
+        if st.schema_changed then
+            require("lvim-db.ui.drawer").reload_schema(conn_id)
+        end
         if st.state ~= "done" then
             vim.schedule(function()
                 vim.notify(
@@ -2239,7 +2454,10 @@ function M.run(conn_id, conn_name, driver, statement, origin, offset, on_done)
                     st.state == "failed" and vim.log.levels.ERROR or vim.log.levels.WARN
                 )
                 if on_done then
-                    on_done() -- chain on even after a failure, so `run buffer` attempts every statement
+                    -- `false`: this one FAILED. A caller running a buffer stops there — statement three
+                    -- usually depends on statement two, and carrying on after a failed `CREATE TABLE`
+                    -- produces a second error about something that was never going to exist.
+                    on_done(false)
                 end
             end)
             return
@@ -2249,7 +2467,7 @@ function M.run(conn_id, conn_name, driver, statement, origin, offset, on_done)
             open_dock()
             goto_page(offset or 0)
             if on_done then
-                on_done()
+                on_done(true)
             end
         end)
     end, function(call_id, err)
@@ -2293,8 +2511,8 @@ end
 --- screen are the rows in the table.
 ---
 --- The destructive guard is not applied here and does not need to be: the statement is generated, always
---- carries a key WHERE, and touches exactly one row (`is_destructive` exists for free-text statements — see
---- `M.run_guarded`).
+--- carries a key WHERE, and touches exactly one row (the guard is for the free-text statements a person
+--- types — see `M.run_guarded`).
 ---@param statement string
 function M.write(statement)
     local db = require("lvim-db")
@@ -2354,34 +2572,175 @@ function M.write(statement)
     end)
 end
 
---- Execute `statement`, first applying the destructive-statement guard: a DROP /
---- TRUNCATE / unqualified DELETE|UPDATE prompts a confirm (config
---- `confirm_destructive`) before it runs. This is THE entry point for free-text
---- statements (the SQL editor, ad-hoc runs); the drawer preview (a SELECT) may use it too.
+--- Ordered `{ name, value }` fields as the wire's ordered PAIRS. A Lua nil in a
+--- list would end the list, so an absent value is the JSON null the engine reads
+--- as "write NULL here".
+---@param list { name: string, value: any }[]?
+---@return table[]
+local function row_pairs(list)
+    local out = {}
+    for _, f in ipairs(list or {}) do
+        out[#out + 1] = { f.name, f.value == nil and vim.NIL or f.value }
+    end
+    return out
+end
+
+--- STEP TWO of a row write: perform it, log it, and re-read the page from the table.
+---@param plan table        the same plan step one was shown for
+---@param statement string  what the engine said it would run (for the call log)
+local function apply_row(plan, statement)
+    local db = require("lvim-db")
+    local conn_id, conn_name, driver = state.conn_id, state.conn, state.driver
+    if not (conn_id and conn_name and driver) then
+        return
+    end
+    local entry = {
+        conn_id = conn_id,
+        conn = conn_name,
+        driver = driver,
+        statement = statement,
+        state = "running",
+    }
+    state.calls[#state.calls + 1] = entry
+    if #state.calls > 200 then
+        table.remove(state.calls, 1)
+    end
+    db.row_write(conn_id, plan, true, function(res, err)
+        entry.state = err and "failed" or "done"
+        entry.rows = type(res) == "table" and res.affected or nil
+        db.store.record({
+            conn = conn_name,
+            driver = driver,
+            statement = statement,
+            state = entry.state,
+            rows = entry.rows,
+        })
+        vim.schedule(function()
+            if err then
+                -- The engine's refusals are SENTENCES — "the key must be exactly (id)", "that key matched 3
+                -- rows, so nothing was written" — and they are shown as they arrived. A client that
+                -- summarised them to "write failed" would be throwing away the only part that tells somebody
+                -- what to do next.
+                vim.notify("lvim-db: " .. tostring(err), vim.log.levels.ERROR)
+                return
+            end
+            vim.notify(("lvim-db: %d row(s) written"):format((type(res) == "table" and res.affected) or 0))
+            -- Re-READ rather than repaint: a trigger, a default or the engine's own coercion can all make the
+            -- stored row differ from what was sent, and painting our version over it would make the grid
+            -- quietly lie about the database.
+            if state.statement then
+                local o = state.origin
+                M.run(
+                    conn_id,
+                    conn_name,
+                    driver,
+                    state.statement,
+                    o and { schema = o.schema, object = o.object } or nil,
+                    state.offset
+                )
+            end
+        end)
+    end)
+end
+
+--- Add, change or remove ONE row through the ENGINE — values, never a statement.
+---
+--- This is the whole of what used to be a generated `UPDATE` with the values
+--- quoted into it. Now the client sends the columns and what should be in them;
+--- the driver writes the statement in its own dialect and binds every value, so
+--- there is no quoting on this side to get wrong and no way for a value to become
+--- syntax. The engine also refuses what a client must not be trusted to refuse —
+--- a key that is not exactly the object's key, a change to a key column, a write
+--- that turns out to match more than one row.
+---
+--- TWO STEPS, because nothing is written without a `confirm` and the statement is
+--- shown first: step one asks what WOULD run and writes nothing, the confirm
+--- shows exactly that text, and only the answer performs it.
+---@param set { name: string, value: any }[]      the columns to write (the whole new row, for an insert)
+---@param where { name: string, value: any }[]    the key columns and their ORIGINAL values (none for an insert)
+---@param opts { delete: boolean?, insert: boolean? }?
+function M.write_row(set, where, opts)
+    local db = require("lvim-db")
+    local o = state.origin
+    if not (state.conn_id and state.conn and state.driver and o and o.object) then
+        return
+    end
+    opts = opts or {}
+    local plan = {
+        obj = { name = o.object, schema = o.schema },
+        key = row_pairs(where),
+        set = row_pairs(set),
+        delete = opts.delete == true,
+        insert = opts.insert == true,
+    }
+    db.row_write(state.conn_id, plan, false, function(res, err)
+        if err or type(res) ~= "table" then
+            vim.schedule(function()
+                vim.notify("lvim-db: " .. tostring(err or "the engine said nothing"), vim.log.levels.WARN)
+            end)
+            return
+        end
+        local statement = tostring(res.statement or "")
+        vim.schedule(function()
+            require("lvim-ui").confirm({
+                title = opts.delete and "Delete row" or (opts.insert and "Add row") or "Write row",
+                message = statement
+                    .. (type(res.reason) == "string" and ("\n\n" .. res.reason) or "")
+                    .. "\n\nWrite it?",
+                callback = function(yes)
+                    if yes then
+                        apply_row(plan, statement)
+                    end
+                end,
+            })
+        end)
+    end)
+end
+
+--- Execute `statement`, first asking the ENGINE whether it is destructive and
+--- confirming in the engine's own words if it is (`db.classify`, config
+--- `confirm_destructive`). This is THE entry point for free-text statements (the
+--- SQL editor, ad-hoc runs); the drawer's browse may use it too.
+---
+--- The question costs a round trip, which is why it is asked here and not at
+--- every call site: one place asks, one place prompts, and nothing runs in
+--- between. The reason comes back as PROSE and is shown as it arrived — the
+--- engine naming what the statement does to which rows is the whole of what
+--- makes somebody stop, and paraphrasing it in a client would lose it.
 ---@param conn_id integer
 ---@param conn_name string
 ---@param driver string
 ---@param statement string
----@param on_done fun()?  forwarded to `M.run` (fired when the statement resolves) — for multi-statement runs.
+---@param on_done fun(ok: boolean)?  forwarded to `M.run`, and called with `false` when the statement is
+---       DECLINED — a multi-statement run stops on both.
 function M.run_guarded(conn_id, conn_name, driver, statement, origin, on_done)
     local db = require("lvim-db")
-    if db.is_destructive(statement) then
-        require("lvim-ui").confirm({
-            title = "Destructive statement",
-            message = "This looks destructive (DROP / TRUNCATE / DELETE|UPDATE without WHERE):\n\n"
-                .. statement:sub(1, 200)
-                .. "\n\nRun it anyway?",
-            callback = function(yes)
-                if yes then
-                    M.run(conn_id, conn_name, driver, statement, origin, nil, on_done)
-                elseif on_done then
-                    on_done() -- declined: still advance the chain so the rest of the buffer runs
-                end
-            end,
-        })
-    else
-        M.run(conn_id, conn_name, driver, statement, origin, nil, on_done)
-    end
+    db.classify(driver, statement, function(dangerous, reason)
+        if not dangerous then
+            vim.schedule(function()
+                M.run(conn_id, conn_name, driver, statement, origin, nil, on_done)
+            end)
+            return
+        end
+        vim.schedule(function()
+            require("lvim-ui").confirm({
+                title = "Destructive statement",
+                message = (reason or "This looks destructive.")
+                    .. "\n\n"
+                    .. statement:sub(1, 200)
+                    .. "\n\nRun it anyway?",
+                callback = function(yes)
+                    if yes then
+                        M.run(conn_id, conn_name, driver, statement, origin, nil, on_done)
+                    elseif on_done then
+                        -- Declined, so the chain STOPS here too. The statement did not happen, and
+                        -- everything after it in the buffer was written for a database in which it had.
+                        on_done(false)
+                    end
+                end,
+            })
+        end)
+    end)
 end
 
 --- Open the call-log tab (creating the dock if needed).
