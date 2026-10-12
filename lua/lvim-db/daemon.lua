@@ -32,6 +32,7 @@
 --   • require("lvim-db.daemon").proto()             the negotiated protocol version
 --   • require("lvim-db.daemon").engine()            which engine/version is running
 --   • require("lvim-db.daemon").is_running()        whether the process is up
+--   • require("lvim-db.daemon").dispatching()       whether a message is being handled now
 --
 ---@module "lvim-db.daemon"
 
@@ -150,24 +151,51 @@ end
 
 -- ─── stdout parsing ──────────────────────────────────────────────────────────
 
+---@type integer how deep we are inside a message handler (nested dispatch is possible: a
+--- handler that sends a request whose answer is already in the same stdout burst)
+local dispatch_depth = 0
+
+--- Whether a daemon message is being handled RIGHT NOW.
+---
+--- The one fact a caller needs to know before it waits for an answer: while a
+--- handler runs, nvim cannot deliver the next message on this channel, so an
+--- answer sent from in here cannot arrive until we return. Code that waits
+--- anyway does not wait — it hangs until its own timeout, every time. The store
+--- asks this before it blocks (see `store.rpc`), and so must anything else that
+--- means to.
+---@return boolean
+function M.dispatching()
+    return dispatch_depth > 0
+end
+
 --- Handle one decoded message line from the daemon.
 ---@param msg table
 local function on_message(msg)
-    if msg.id ~= nil then
-        local cb = pending[msg.id]
-        pending[msg.id] = nil
-        if cb then
-            if msg.ok then
-                cb(msg.result, nil)
-            else
-                cb(nil, msg.error or "unknown error")
+    dispatch_depth = dispatch_depth + 1
+    local ok, err = pcall(function()
+        if msg.id ~= nil then
+            local cb = pending[msg.id]
+            pending[msg.id] = nil
+            if cb then
+                if msg.ok then
+                    cb(msg.result, nil)
+                else
+                    cb(nil, msg.error or "unknown error")
+                end
+            end
+        elseif msg.method then
+            local h = handlers[msg.method]
+            if h then
+                pcall(h, msg.params)
             end
         end
-    elseif msg.method then
-        local h = handlers[msg.method]
-        if h then
-            pcall(h, msg.params)
-        end
+    end)
+    dispatch_depth = dispatch_depth - 1
+    -- The depth must come back down even when a callback throws — otherwise one
+    -- error would leave the client believing it is dispatching forever, and every
+    -- synchronous store call after it would refuse.
+    if not ok then
+        error(err, 0)
     end
 end
 

@@ -115,12 +115,26 @@ function _G.fake_daemon(proto, drivers)
         is_running = function()
             return false
         end,
+        -- Nothing is being dispatched in a spec that fakes the handshake: there
+        -- is no channel. The store asks before it waits (see store_spec).
+        dispatching = function()
+            return false
+        end,
     }
     package.loaded["lvim-db.proto"] = nil
     return require("lvim-db.proto")
 end
 
-for _, spec in ipairs({ "load_spec.lua", "proto_spec.lua", "rules_spec.lua", "ddl_spec.lua", "keys_spec.lua", "engine_spec.lua" }) do
+for _, spec in ipairs({
+    "load_spec.lua",
+    "proto_spec.lua",
+    "rules_spec.lua",
+    "ddl_spec.lua",
+    "keys_spec.lua",
+    "store_spec.lua",
+    "form_spec.lua",
+    "engine_spec.lua",
+}) do
     dofile(root .. "/tests/" .. spec)
 end
 

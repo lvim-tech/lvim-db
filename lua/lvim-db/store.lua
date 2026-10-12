@@ -293,6 +293,22 @@ end
 ---@return table?, string?
 local function rpc(method, params)
     local daemon = require("lvim-db.daemon")
+    -- A SYNCHRONOUS call cannot be made from inside a daemon message handler.
+    -- nvim delivers one message at a time per channel, so the answer to this
+    -- request cannot arrive until the handler returns — and the handler is
+    -- waiting for it. `vim.wait` then pumps the loop for nothing and gives up
+    -- after RPC_TIMEOUT_MS, EVERY TIME. (Measured: five seconds on every single
+    -- query, because the history write sits in the query's own state callback.)
+    --
+    -- Refusing immediately is the honest answer and the loud one: five seconds
+    -- of nothing reads as "the database is slow", while this says what it is and
+    -- where. A caller that does not need the answer uses `fire` instead.
+    if daemon.dispatching() then
+        return nil,
+            ("store: '%s' cannot be waited for from inside a daemon callback — it would hang until it timed out"):format(
+                method
+            )
+    end
     local done, result, err = false, nil, nil
     daemon.request(method, params, function(r, e)
         done, result, err = true, r, e
@@ -320,6 +336,22 @@ local function warn_once(err)
     warned = true
     vim.schedule(function()
         vim.notify("lvim-db: saved state is unavailable — " .. tostring(err), vim.log.levels.WARN)
+    end)
+end
+
+--- One store RPC that is NOT waited for. The answer only reports a failure, so
+--- it is warned about and dropped.
+---
+--- For writes nobody reads back: a history row is written and the person carries
+--- on. It is also the only shape that is safe from inside a daemon callback,
+--- which is exactly where the history write happens.
+---@param method string
+---@param params table?
+local function fire(method, params)
+    require("lvim-db.daemon").request(method, params, function(_, err)
+        if err then
+            warn_once(err)
+        end
     end)
 end
 
@@ -577,19 +609,68 @@ function M.delete_query(conn, name)
     return r ~= nil and r.removed == true
 end
 
+-- ─── network profiles (tunnels, proxies, access providers) ───────────────────
+--
+-- A PROFILE is a reusable piece of network kept by NAME in the engine: an SSH
+-- tunnel, a proxy, an access provider. Several connections point at one, and the
+-- engine resolves it at connect time — a connection that names a missing profile
+-- FAILS rather than quietly going direct.
+--
+-- They live in the engine and are shared with every other lode client, so this
+-- is a reader, not a second home for them. Writing one is the desktop client's
+-- job for now; what this client must not do is pretend they do not exist, which
+-- is what it did before: the form showed "SSH tunnel: none" for a connection
+-- tunnelled through a profile, and saving it threw the profile away.
+
+---@class LvimDbProfile
+---@field name string
+---@field kind string   "tunnel" | "proxy" | "access" | "driver"
+---@field spec table    the profile's own fields (an SSH tunnel's host/user/port/auth, …)
+
+--- The saved profiles of one kind, as the ENGINE holds them.
+---
+--- Empty on a legacy store or no store at all: profiles have never lived
+--- anywhere but the engine, so there is nothing to fall back to and an empty
+--- list is the honest answer.
+---@param kind "tunnel"|"proxy"|"access"|"driver"
+---@return LvimDbProfile[]
+function M.list_profiles(kind)
+    if resolve() ~= "engine" then
+        return {}
+    end
+    local r = call("store.profiles.list", { kind = kind })
+    return (r and r.profiles) or {}
+end
+
 -- ─── history ─────────────────────────────────────────────────────────────────
 
---- Record one executed statement in the call log.
+--- Record one executed statement in the call log. FIRE-AND-FORGET.
+---
+--- The one store write nobody waits for, and the only one that is made from
+--- inside a daemon callback: it is the query's own state callback that records
+--- the query. So it does not wait — it cannot, from in there (see `rpc`), and it
+--- has no reason to: nothing on screen depends on the answer, and a failure is
+--- reported by `fire` like any other.
+---
+--- The backend is resolved OUTSIDE the callback when it is not known yet
+--- (`vim.schedule`), because resolving it is itself a synchronous call. That
+--- defers the record by one loop turn and never by five seconds.
 ---@param entry { conn: string?, driver: string?, statement: string, state: string?, ms: integer?, rows: integer? }
----@return boolean
+---@return boolean  whether the record was handed on (not whether it was stored)
 function M.record(entry)
+    if mode == nil and require("lvim-db.daemon").dispatching() then
+        vim.schedule(function()
+            M.record(entry)
+        end)
+        return true
+    end
     local m = resolve()
     if m == "legacy" then
         return legacy.record(entry)
     elseif m == "none" then
         return false
     end
-    local r = call("store.history.record", {
+    fire("store.history.record", {
         conn = entry.conn,
         driver = entry.driver,
         statement = entry.statement,
@@ -597,7 +678,7 @@ function M.record(entry)
         ms = entry.ms,
         rows = entry.rows,
     })
-    return r ~= nil and r.recorded == true
+    return true
 end
 
 --- The most recent history entries, newest first (capped at `limit`, default 200).

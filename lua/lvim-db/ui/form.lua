@@ -23,6 +23,12 @@ local ui = require("lvim-ui")
 
 local M = {}
 
+-- What the profile row shows when the engine holds no saved tunnel. It is an
+-- option rather than an empty select because a select with no options cannot be
+-- rendered, and it is checked for by name on save so it can never be stored as
+-- the name of a profile.
+local NO_PROFILES = "(no saved tunnels)"
+
 --- Coerce a value to a display string, treating nil / JSON-null (vim.NIL) as "".
 ---@param v any
 ---@return string
@@ -52,6 +58,89 @@ local function tunnel_secret(tun)
         return ""
     end
     return str(a.passphrase ~= nil and a.passphrase ~= vim.NIL and a.passphrase or a.password)
+end
+
+--- The connection spec a set of form values means — a PURE function, so the one
+--- rule that cost a person their tunnel can be tested without opening anything.
+---
+--- `seed` is the spec as stored (empty for a new connection) and is where the
+--- answer STARTS: a connection carries fields this form does not show — the
+--- write `policy`, `hooks`, a proxy, a tunnel PROFILE — and a spec assembled
+--- from the visible rows alone deletes every one of them. (Measured on a real
+--- connection: saving it from here dropped `tunnel_profile` and `policy`,
+--- leaving it dialling 127.0.0.1 locally, where nothing answers.) What the form
+--- owns it overwrites; the rest it carries.
+---@param meta table   the driver's declaration (its params)
+---@param network boolean  false for a file engine: no TLS, no tunnel
+---@param seed table?  the stored spec being edited
+---@param result table<string, any>  the live row values
+---@return table
+function M.spec_of(meta, network, seed, result)
+    local params = {}
+    for _, p in ipairs(meta.params) do
+        local v = result["p_" .. p.key]
+        if v and v ~= "" then
+            params[p.key] = v
+        end
+    end
+
+    -- Auth: only the selected method's fields.
+    local kind = result.a_kind or "none"
+    local auth = { kind = kind }
+    if kind == "password" then
+        auth.user, auth.password = result.a_user or "", result.a_password or ""
+    elseif kind == "client_cert" then
+        auth.cert, auth.key, auth.user = result.a_cert or "", result.a_key or "", result.a_user or ""
+    elseif kind == "provider" then
+        auth.provider, auth.token, auth.user = result.a_provider or "", result.a_token or "", result.a_user or ""
+    elseif kind == "kerberos" then
+        auth.principal = (result.a_user and result.a_user ~= "") and result.a_user or nil
+    end
+
+    local spec = vim.deepcopy(seed or {})
+    spec.params, spec.auth = params, auth
+
+    if network then
+        local tls = { mode = result.t_mode or "prefer" }
+        if result.t_ca and result.t_ca ~= "" then
+            tls.ca = result.t_ca
+        end
+        if result.t_cc and result.t_cc ~= "" then
+            tls.client_cert = result.t_cc
+        end
+        if result.t_ck and result.t_ck ~= "" then
+            tls.client_key = result.t_ck
+        end
+        spec.tls = tls
+
+        -- The three answers are exclusive, and the engine refuses a spec that
+        -- gives two (a tunnel AND a profile), so exactly one of the two fields
+        -- survives a save.
+        local tmode = result.k_mode or "none"
+        spec.tunnel, spec.tunnel_profile = nil, nil
+        if tmode == "profile" then
+            local chosen = str(result.k_profile)
+            if chosen ~= "" and chosen ~= NO_PROFILES then
+                spec.tunnel_profile = chosen
+            end
+        elseif tmode ~= "none" then
+            local tauth = { kind = tmode }
+            if tmode == "key" then
+                tauth.path = result.k_path or ""
+                tauth.passphrase = result.k_secret or ""
+            else
+                tauth.password = result.k_secret or ""
+            end
+            spec.tunnel = {
+                host = result.k_host or "",
+                port = tonumber(result.k_port) or 22,
+                user = result.k_user or "",
+                auth = tauth,
+            }
+        end
+    end
+
+    return spec
 end
 
 --- Build and open the tabs panel for `meta`, seeded from an existing connection.
@@ -113,6 +202,20 @@ local function open_tabs(meta, existing)
                 srow("t_ck", "TLS client key", stls.client_key),
             },
         }
+        -- The SAVED TUNNELS the engine holds, by name. A connection can point at
+        -- one instead of carrying its own copy of a host, a user and a key — and
+        -- several of them usually do, which is the whole point of a profile. This
+        -- client used to show none of that: a connection tunnelled through a
+        -- profile read "SSH tunnel: none", and saving it dropped the profile.
+        local profiles = {}
+        for _, pr in ipairs(require("lvim-db").store.list_profiles("tunnel")) do
+            profiles[#profiles + 1] = pr.name
+        end
+        table.sort(profiles)
+        -- "profile" is offered even with nothing saved, so the choice is
+        -- discoverable; choosing it then says what is missing rather than
+        -- silently saving a tunnel that names nothing (see `save`).
+        local tunnel_modes = { "none", "profile", "key", "password" }
         tabs[#tabs + 1] = {
             label = "Tunnel",
             stage = "tunnel",
@@ -121,9 +224,17 @@ local function open_tabs(meta, existing)
                     type = "select",
                     name = "k_mode",
                     label = "SSH tunnel",
-                    value = (stun and stun.auth and stun.auth.kind) or "none",
-                    options = { "none", "key", "password" },
+                    value = (seed.tunnel_profile and "profile") or (stun and stun.auth and stun.auth.kind) or "none",
+                    options = tunnel_modes,
                 },
+                {
+                    type = "select",
+                    name = "k_profile",
+                    label = "Saved tunnel (profile)",
+                    value = str(seed.tunnel_profile) ~= "" and str(seed.tunnel_profile) or (profiles[1] or NO_PROFILES),
+                    options = #profiles > 0 and profiles or { NO_PROFILES },
+                },
+                { type = "spacer_line" },
                 srow("k_host", "SSH host", stun and stun.host),
                 srow("k_port", "SSH port", stun and stun.port and tostring(stun.port) or "22"),
                 srow("k_user", "SSH user", stun and stun.user),
@@ -152,63 +263,7 @@ local function open_tabs(meta, existing)
     --- Assemble the connection spec (the store template) from the live values.
     ---@return table
     local function build_spec()
-        local result = values()
-
-        local params = {}
-        for _, p in ipairs(meta.params) do
-            local v = result["p_" .. p.key]
-            if v and v ~= "" then
-                params[p.key] = v
-            end
-        end
-
-        -- Auth: only the selected method's fields.
-        local kind = result.a_kind or "none"
-        local auth = { kind = kind }
-        if kind == "password" then
-            auth.user, auth.password = result.a_user or "", result.a_password or ""
-        elseif kind == "client_cert" then
-            auth.cert, auth.key, auth.user = result.a_cert or "", result.a_key or "", result.a_user or ""
-        elseif kind == "provider" then
-            auth.provider, auth.token, auth.user = result.a_provider or "", result.a_token or "", result.a_user or ""
-        elseif kind == "kerberos" then
-            auth.principal = (result.a_user and result.a_user ~= "") and result.a_user or nil
-        end
-
-        local spec = { params = params, auth = auth }
-
-        if network then
-            local tls = { mode = result.t_mode or "prefer" }
-            if result.t_ca and result.t_ca ~= "" then
-                tls.ca = result.t_ca
-            end
-            if result.t_cc and result.t_cc ~= "" then
-                tls.client_cert = result.t_cc
-            end
-            if result.t_ck and result.t_ck ~= "" then
-                tls.client_key = result.t_ck
-            end
-            spec.tls = tls
-
-            local tmode = result.k_mode or "none"
-            if tmode ~= "none" then
-                local tauth = { kind = tmode }
-                if tmode == "key" then
-                    tauth.path = result.k_path or ""
-                    tauth.passphrase = result.k_secret or ""
-                else
-                    tauth.password = result.k_secret or ""
-                end
-                spec.tunnel = {
-                    host = result.k_host or "",
-                    port = tonumber(result.k_port) or 22,
-                    user = result.k_user or "",
-                    auth = tauth,
-                }
-            end
-        end
-
-        return spec
+        return M.spec_of(meta, network, seed, values())
     end
 
     --- Dry-run one layer of the spec in the daemon and report the verdict. The
@@ -239,6 +294,14 @@ local function open_tabs(meta, existing)
             return false
         end
         local spec = build_spec()
+        if (values().k_mode or "none") == "profile" and not spec.tunnel_profile then
+            vim.notify(
+                "lvim-db: this connection says it tunnels through a saved profile, but none is chosen "
+                    .. "— pick one, or set the tunnel to none",
+                vim.log.levels.WARN
+            )
+            return false
+        end
         local store = require("lvim-db").store
         -- A failed write must never masquerade as a save: the store degrades to
         -- `false` when sqlite is absent (or the insert is rejected), and claiming

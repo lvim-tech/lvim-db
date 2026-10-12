@@ -231,6 +231,34 @@ it("writes NULL where the plan carries one", function()
     eq(1, read_one("SELECT count(*) FROM people WHERE id = 1 AND note IS NULL;"))
 end)
 
+describe("the engine: the history a query writes")
+
+-- The one store write made from INSIDE a daemon callback, and the reason the
+-- client stopped waiting for it (a wait in there can only time out — see
+-- store_spec). Fire-and-forget is only honest if the row actually lands, so this
+-- fires one and reads it back.
+it("takes a fired history record without the client waiting for the answer", function()
+    local store = require("lvim-db.store")
+    if store.backend() ~= "engine" then
+        return -- a machine without the engine's store has nothing to prove here
+    end
+    local marker = ("SELECT 'fired-%d-%d';"):format(os.time(), math.random(1000, 9999))
+    local t = vim.uv.hrtime()
+    store.record({ conn = "lvim-db tests", driver = "sqlite", statement = marker, state = "done", ms = 1, rows = 0 })
+    local ms = (vim.uv.hrtime() - t) / 1e6
+    truthy(ms < 500, ("the record blocked for %.0f ms"):format(ms))
+    local landed = false
+    vim.wait(2000, function()
+        for _, r in ipairs(store.history(50)) do
+            if r.statement == marker then
+                landed = true
+            end
+        end
+        return landed
+    end, 50)
+    truthy(landed, "the fired row reached the engine's history")
+end)
+
 call("conn.disconnect", { conn_id = conn_id })
 daemon.stop()
 vim.fn.delete(DB)
