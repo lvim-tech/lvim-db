@@ -6,6 +6,25 @@
 -- or, from the plugin root, `make test`. Point $LODE_DAEMON at a built `loded`
 -- and the engine specs run against it as well; without it they skip.
 
+-- A spec may open a store, write a cache or persist state. None of that may reach the real
+-- editor's data, so `make test` redirects the XDG homes into a throwaway directory and this is
+-- the guard that the redirection actually happened: refuse to run rather than write into
+-- ~/.local/share/nvim. (This suite once wrote into the real store twice; a guard is cheaper than
+-- remembering.)
+local sandbox = vim.env.LVIM_TEST_HOME
+local data_dir = vim.fn.stdpath("data")
+if not sandbox or sandbox == "" or not vim.startswith(vim.fs.normalize(data_dir), vim.fs.normalize(sandbox)) then
+    io.write(
+        "refusing to run: the data directory is not a sandbox\n",
+        "  stdpath('data') = ",
+        data_dir,
+        "\n  LVIM_TEST_HOME  = ",
+        tostring(sandbox),
+        "\nRun the suite through `make test`, which redirects the XDG homes.\n"
+    )
+    os.exit(2)
+end
+
 local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
 vim.opt.runtimepath:prepend(root)
 package.path = table.concat({
@@ -126,6 +145,7 @@ function _G.fake_daemon(proto, drivers)
 end
 
 for _, spec in ipairs({
+    "baseline_spec.lua",
     "load_spec.lua",
     "proto_spec.lua",
     "rules_spec.lua",
