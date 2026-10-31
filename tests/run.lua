@@ -160,6 +160,7 @@ for _, spec in ipairs({
     "rules_spec.lua",
     "ddl_spec.lua",
     "keys_spec.lua",
+    "drawer_spec.lua",
     "store_spec.lua",
     "form_spec.lua",
     "engine_spec.lua",

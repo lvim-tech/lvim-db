@@ -1261,6 +1261,12 @@ function M.open(enter)
         -- instead of the plain CursorLine bar (and never doubles a bg with the stripes).
         cursorline = false,
         filetype = "lvim-db-drawer",
+        -- The tree is read with the cursor and never typed into, so the chassis nops the builtin EDIT
+        -- operators while keeping the motions. Without it they reach the `nomodifiable` buffer itself:
+        -- `s`, `o`, `p`, `dd` are not mappings, so no binding here can intercept them, and each one
+        -- answers with `E21: Cannot make changes, 'modifiable' is off`. The result grid declares this
+        -- for the same reason; the drawer was the one panel that did not, and the E21 reached a log.
+        readonly = true,
         size = function()
             local width = config.drawer_width or 36
             return math.max(24, width), 1
